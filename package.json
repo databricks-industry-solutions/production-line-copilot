@@ -43,7 +43,7 @@
     "node": ">=22"
   },
   "dependencies": {
-    "@databricks/appkit": "0.11.1",
+    "@databricks/appkit": "0.48.0",
     "@databricks/appkit-ui": "0.11.1",
     "@databricks/sdk-experimental": "^0.14.2",
     "@tailwindcss/typography": "^0.5.19",
