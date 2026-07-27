@@ -1,0 +1,12 @@
+{"inputs": {"query": "The labeller stopped, label misalignment due to adhesive failure", "shift_id": "shift_1", "timestamp": "2025-01-01T14:00:00"}, "expectations": {"expected_specialist": "downtime_analyst"}}
+{"inputs": {"query": "Quality checks are failing on the checkweigher, weights are off", "shift_id": "shift_1", "timestamp": "2025-01-01T14:00:00"}, "expectations": {"expected_specialist": "quality_specialist"}}
+{"inputs": {"query": "We're running low on crown caps, when will we run out?", "shift_id": "shift_1", "timestamp": "2025-01-01T14:00:00"}, "expectations": {"expected_specialist": "supply_chain_advisor"}}
+{"inputs": {"query": "What is the current OEE and how can we improve it?", "shift_id": "shift_1", "timestamp": "2025-01-01T14:00:00"}, "expectations": {"expected_specialist": "oee_coach"}}
+{"inputs": {"query": "Can we still meet the shift target? How much overtime do we need?", "shift_id": "shift_1", "timestamp": "2025-01-01T14:00:00"}, "expectations": {"expected_specialist": "schedule_optimizer"}}
+{"inputs": {"query": "The filler motor current is trending up, should we schedule maintenance?", "shift_id": "shift_1", "timestamp": "2025-01-01T14:00:00"}, "expectations": {"expected_specialist": "maintenance_predictor"}}
+{"inputs": {"query": "Quarterly OEE roadmap and capex priorities for the next year", "shift_id": "shift_1", "timestamp": "2025-01-01T14:00:00"}, "expectations": {"expected_specialist": "strategic_advisor"}}
+{"inputs": {"query": "Give me a pre-shift briefing for the crew coming on now", "shift_id": "shift_1", "timestamp": "2025-01-01T14:00:00"}, "expectations": {"expected_specialist": "shift_briefing"}}
+{"inputs": {"query": "Wrap up this shift and prep the handover note for the next crew", "shift_id": "shift_1", "timestamp": "2025-01-01T14:00:00"}, "expectations": {"expected_specialist": "shift_briefing"}}
+{"inputs": {"query": "Hello, how are you?", "shift_id": "shift_1", "timestamp": "2025-01-01T14:00:00"}, "expectations": {"expected_specialist": "general"}}
+{"inputs": {"query": "Analyze the labeller downtime root cause and impact", "shift_id": "shift_2", "timestamp": "2025-01-01T14:00:00"}, "expectations": {"expected_facts": ["labeller", "downtime", "impact"], "must_not_contain": ["I don't know", "no data available"]}}
+{"inputs": {"query": "Crown caps are running low, what should I do?", "shift_id": "shift_5", "timestamp": "2025-01-01T14:00:00"}, "expectations": {"expected_facts": ["crown", "material", "supply"], "must_not_contain": []}}

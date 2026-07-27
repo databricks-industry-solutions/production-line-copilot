@@ -1,0 +1,850 @@
+#!/usr/bin/env bash
+# Unified dev/prod deploy script for the streaming workspace.
+#
+# Usage:
+#   ./scripts/deploy.sh dev            # deploy to line_manager_dev (production-line-copilot-dev)
+#   ./scripts/deploy.sh prod           # deploy to line_manager_prod (production-line-copilot-prod)
+#   ./scripts/deploy.sh dev --skip-app # bundle deploy only, skip ``databricks apps deploy``
+#
+# Layered deploy:
+#   1. ``python3 scripts/sync_project_settings.py``  → bundle-targets.yaml
+#   2. ``databricks bundle deploy --target <target>`` → jobs / dashboard
+#   3. ``python3 scripts/refresh_app_yaml_ids.py``  → write fresh OPS_* IDs into app.<env>.yaml
+#   4. ``cp app.<env>.yaml app.yaml`` (back up & restore on EXIT trap)
+#   5. ``databricks apps deploy <app-name>`` → push the new env vars / build
+#
+# Profile: defaults to ``DEFAULT`` (Databricks CLI profile pointing at the
+# workspace selected for the bundle target). Override with DATABRICKS_PROFILE.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT_DIR="$(dirname "$SCRIPT_DIR")"
+cd "$ROOT_DIR"
+
+ENV="${1:-}"
+shift || true
+
+case "$ENV" in
+  dev|prod)
+    : ;;
+  *)
+    cat >&2 <<EOF
+Usage: $0 <dev|prod> [--skip-app]
+  dev   → bundle target line_manager_dev,  app production-line-copilot-dev
+  prod  → bundle target line_manager_prod, app production-line-copilot-prod
+
+Profile: \$DATABRICKS_PROFILE (default: DEFAULT)
+EOF
+    exit 2 ;;
+esac
+
+SKIP_APP=0
+EXTRA=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --skip-app) SKIP_APP=1; shift ;;
+    --) shift; EXTRA+=("$@"); break ;;
+    *)  EXTRA+=("$1"); shift ;;
+  esac
+done
+
+PROFILE="${DATABRICKS_PROFILE:-DEFAULT}"
+
+# Resolve the app source yaml. Operator-local values (real UC catalog, PG
+# host, app SP UUID, refreshed OPS_* IDs) live in app.local.yaml /
+# app.dev.local.yaml — both gitignored. The committed app.yaml /
+# app.dev.yaml ship as SET_ME placeholders. If a .local.yaml sibling
+# exists, prefer it; otherwise fall back to the committed file and let the
+# SET_ME guard below fail the deploy with a clear message.
+if [[ "$ENV" == "dev" ]]; then
+  BUNDLE_TARGET="line_manager_dev"
+  APP_NAME="production-line-copilot-dev"
+  if [[ -f "$ROOT_DIR/app.dev.local.yaml" ]]; then
+    APP_SOURCE_YAML="app.dev.local.yaml"
+  else
+    APP_SOURCE_YAML="app.dev.yaml"
+  fi
+else
+  BUNDLE_TARGET="line_manager_prod"
+  APP_NAME="production-line-copilot-prod"
+  if [[ -f "$ROOT_DIR/app.local.yaml" ]]; then
+    APP_SOURCE_YAML="app.local.yaml"
+  else
+    APP_SOURCE_YAML="app.yaml"  # already prod-shaped
+  fi
+fi
+echo "=== APP_SOURCE_YAML=$APP_SOURCE_YAML ==="
+
+# Single source of truth: shared app env (UC catalog/schema, Lakebase host +
+# endpoint, shift id, Genie) is DERIVED from project-settings by
+# render_app_yaml.py below. Ensure we edit a gitignored app.<env>.local.yaml so
+# the committed template stays clean on forks; from here on APP_SOURCE_YAML
+# always points at the local file.
+if [[ "$APP_SOURCE_YAML" != *".local.yaml" ]]; then
+  APP_LOCAL_YAML="${APP_SOURCE_YAML%.yaml}.local.yaml"
+  if [[ ! -f "$ROOT_DIR/$APP_LOCAL_YAML" ]]; then
+    cp "$ROOT_DIR/$APP_SOURCE_YAML" "$ROOT_DIR/$APP_LOCAL_YAML"
+    echo "=== Created $APP_LOCAL_YAML from template ==="
+  fi
+  APP_SOURCE_YAML="$APP_LOCAL_YAML"
+fi
+
+# Resolve the project-settings.yaml that drives bundle-targets + lakebase
+# wiring. Same pattern: prefer the gitignored .local.yaml when present.
+if [[ -f "$ROOT_DIR/config/project-settings.local.yaml" ]]; then
+  PROJECT_SETTINGS_YAML="config/project-settings.local.yaml"
+else
+  PROJECT_SETTINGS_YAML="config/project-settings.yaml"
+fi
+echo "=== PROJECT_SETTINGS_YAML=$PROJECT_SETTINGS_YAML ==="
+
+# Optional preflight: set RUN_PREFLIGHT=1 to run scripts/preflight.py before deploy.
+if [[ "${RUN_PREFLIGHT:-0}" == "1" ]]; then
+  echo "=== preflight.py (RUN_PREFLIGHT=1) ==="
+  python3 scripts/preflight.py "$ENV" --profile "$PROFILE" || {
+    echo "ERROR: preflight failed — fix the issues above or deploy with RUN_PREFLIGHT=0." >&2
+    exit 1
+  }
+fi
+
+# ── Guard: normalize uv.lock to public PyPI ────────────────────────────
+# The Databricks Apps build sandbox can only reach public PyPI. Some corporate
+# environments inject a private PyPI mirror (via ~/.config/uv/uv.toml or
+# pip.conf), so a local ``uv lock`` bakes that mirror's index/file URLs into
+# uv.lock and the app build then hangs/fails downloading dependencies. Rewrite
+# any non-public mirror host back to public PyPI in place — package versions and
+# hashes are preserved, so this is safe and idempotent.
+if [[ -f "$ROOT_DIR/uv.lock" ]]; then
+  python3 - "$ROOT_DIR/uv.lock" <<'PY'
+import re, sys
+path = sys.argv[1]
+with open(path, encoding="utf-8") as f:
+    original = f.read()
+text = re.sub(r"https://[A-Za-z0-9.\-]+/simple/", "https://pypi.org/simple/", original)
+text = re.sub(r'(url = "https://)[A-Za-z0-9.\-]+(/packages/)', r"\1files.pythonhosted.org\2", text)
+if text != original:
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    print("WARN: rewrote private PyPI mirror URLs in uv.lock → public PyPI (commit this).", file=sys.stderr)
+PY
+fi
+
+# ── Guard: normalize package-lock.json to public npm ───────────────────
+# Same failure mode as uv.lock, one layer up: if a developer's global npm
+# registry points at a private/internal mirror (e.g. an npm-proxy host), a
+# local ``npm install`` bakes that host into package-lock.json's ``resolved``
+# URLs. The Databricks Apps build sandbox can only reach public npm, so it
+# times out fetching from the unreachable mirror and the app never starts.
+# Internal mirrors proxy npmjs path-for-path, so a bare host swap is safe:
+# tarball paths are preserved and integrity hashes are content-based. Idempotent.
+if [[ -f "$ROOT_DIR/package-lock.json" ]]; then
+  python3 - "$ROOT_DIR/package-lock.json" <<'PY'
+import re, sys
+path = sys.argv[1]
+with open(path, encoding="utf-8") as f:
+    original = f.read()
+# Only rewrite the HOST of npm *tarball* resolved URLs (path contains "/-/" and
+# ends in ".tgz"), and only when the host isn't already public npm. This leaves
+# git/github "resolved" URLs (different path shape) untouched.
+def _swap(m):
+    host = m.group(1)
+    if host == "registry.npmjs.org":
+        return m.group(0)
+    return f'"resolved": "https://registry.npmjs.org/{m.group(2)}'
+text = re.sub(r'"resolved":\s*"https://([A-Za-z0-9.\-]+)/([^"]*/-/[^"]*\.tgz")', _swap, original)
+if text != original:
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    print("WARN: rewrote private npm mirror URLs in package-lock.json → public npm (commit this).", file=sys.stderr)
+PY
+fi
+
+# ── Safety: branch must match deploy target ─────────────────────────────
+# Convention (set 2026-06-22): feature work commits to ``dev``, then merges
+# to ``main`` when promoting to prod. So:
+#   ./scripts/deploy.sh dev   → must be on branch ``dev``
+#   ./scripts/deploy.sh prod  → must be on branch ``main``
+# This guard prevents the most common footgun (deploying ``dev`` work to the
+# prod app because you forgot to ``git checkout main`` after merging).
+# Override for CI tag-deploys, detached-HEAD checks, or genuine hotfixes:
+#   DEPLOY_IGNORE_BRANCH=1 ./scripts/deploy.sh prod
+if command -v git >/dev/null 2>&1 && git -C "$ROOT_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+  CURRENT_BRANCH="$(git -C "$ROOT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "HEAD")"
+  if [[ "$ENV" == "prod" ]]; then
+    EXPECTED_BRANCH="main"
+  else
+    EXPECTED_BRANCH="dev"
+  fi
+  # Fork-friendly: only apply the convention when the expected branch actually
+  # exists locally. Forks that don't use the dev/main split (e.g. a single
+  # ``main`` branch) are never blocked. Prod is still a hard stop (deploying
+  # unreviewed code to prod is the costly mistake); dev is a soft warning.
+  if git -C "$ROOT_DIR" rev-parse --verify --quiet "$EXPECTED_BRANCH" >/dev/null 2>&1 \
+     && [[ "$CURRENT_BRANCH" != "$EXPECTED_BRANCH" && "${DEPLOY_IGNORE_BRANCH:-0}" != "1" ]]; then
+    if [[ "$ENV" == "prod" ]]; then
+      echo >&2
+      echo "ERROR: ./scripts/deploy.sh prod expects git branch '$EXPECTED_BRANCH', but you are on '$CURRENT_BRANCH'." >&2
+      echo "       Convention: feature work → 'dev', merge to 'main' before prod deploy." >&2
+      echo "       Override (CI / detached HEAD / hotfix): DEPLOY_IGNORE_BRANCH=1 ./scripts/deploy.sh prod" >&2
+      exit 1
+    else
+      echo "WARN: deploying 'dev' from branch '$CURRENT_BRANCH' (convention is '$EXPECTED_BRANCH'). Continuing." >&2
+    fi
+  fi
+fi
+
+# ── Safety: prod requires explicit confirmation ─────────────────────────
+if [[ "$ENV" == "prod" ]]; then
+  echo
+  echo "════════════════════════════════════════════════════════════════"
+  echo "  PROD DEPLOY — line_manager_prod / production-line-copilot-prod"
+  echo "  Profile:        $PROFILE"
+  echo "  Bundle target:  $BUNDLE_TARGET"
+  echo "  App:            $APP_NAME"
+  echo "════════════════════════════════════════════════════════════════"
+  echo
+  read -r -p "Type 'deploy prod' to continue: " confirm
+  if [[ "$confirm" != "deploy prod" ]]; then
+    echo "Aborted." >&2
+    exit 1
+  fi
+fi
+
+# Resolve the deployer email FIRST so it can be threaded into both
+# sync_project_settings.py and the app.yaml templating step below.
+# `databricks current-user me` for the active CLI profile is the source of
+# truth; override with DEPLOYER_EMAIL=… when deploying as a service principal.
+DEPLOY_USER=$(databricks current-user me --profile "$PROFILE" --output json 2>/dev/null | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d.get("userName") or d.get("emails",[{}])[0].get("value",""))' 2>/dev/null || echo "")
+DEPLOY_USER="${DEPLOYER_EMAIL:-$DEPLOY_USER}"
+if [[ -z "$DEPLOY_USER" ]]; then
+  echo "ERROR: could not resolve deployer email (databricks current-user me failed and DEPLOYER_EMAIL is unset)." >&2
+  echo "       Set DEPLOYER_EMAIL=you@company.com or fix the CLI profile and retry." >&2
+  exit 1
+fi
+export DEPLOYER_EMAIL="$DEPLOY_USER"
+
+# Trap setup: working copies of app.yaml + bundle-targets.yaml get the
+# resolved deployer email substituted in before bundle/apps deploy. The
+# committed copies ship with `${DEPLOYER_EMAIL}` literal so the repo is
+# forkable without baking in the original author's identity. On exit
+# (success or failure), the cleanup trap restores both files from their
+# backups so `git status` stays clean.
+APP_YAML_BACKUP=""
+BUNDLE_TARGETS_BACKUP=""
+DASHBOARD_BACKUP=""
+cleanup() {
+  if [[ -n "$APP_YAML_BACKUP" && -f "$APP_YAML_BACKUP" ]]; then
+    cp "$APP_YAML_BACKUP" "$ROOT_DIR/app.yaml"
+    rm -f "$APP_YAML_BACKUP"
+  fi
+  if [[ -n "$BUNDLE_TARGETS_BACKUP" && -f "$BUNDLE_TARGETS_BACKUP" ]]; then
+    cp "$BUNDLE_TARGETS_BACKUP" "$ROOT_DIR/config/bundle-targets.yaml"
+    rm -f "$BUNDLE_TARGETS_BACKUP"
+  fi
+  if [[ -n "$DASHBOARD_BACKUP" && -f "$DASHBOARD_BACKUP" ]]; then
+    cp "$DASHBOARD_BACKUP" "$ROOT_DIR/dashboards/data_quality.lvdash.json"
+    rm -f "$DASHBOARD_BACKUP"
+  fi
+}
+trap cleanup EXIT
+
+# ── 1. Sync project-settings → bundle-targets + render dashboards ──────────
+# Back up the committed (placeholder-carrying) bundle-targets.yaml AND the
+# data_quality dashboard JSON first so the trap can restore both after the
+# substitution-enabled regen below. The committed dashboard ships with
+# {{UC_CATALOG}} / {{UC_SCHEMA}} placeholders so the same file works across
+# every target; sync_project_settings.py --target <bt> renders it in place
+# before bundle deploy uploads it to Lakeview.
+if [[ -f "$ROOT_DIR/config/bundle-targets.yaml" ]]; then
+  BUNDLE_TARGETS_BACKUP="$(mktemp -t bundle_targets_bak.XXXXXX)"
+  cp "$ROOT_DIR/config/bundle-targets.yaml" "$BUNDLE_TARGETS_BACKUP"
+fi
+if [[ -f "$ROOT_DIR/dashboards/data_quality.lvdash.json" ]]; then
+  DASHBOARD_BACKUP="$(mktemp -t data_quality_lvdash_bak.XXXXXX)"
+  cp "$ROOT_DIR/dashboards/data_quality.lvdash.json" "$DASHBOARD_BACKUP"
+fi
+echo "=== sync_project_settings.py (deployer=${DEPLOYER_EMAIL}, target=${BUNDLE_TARGET}) ==="
+python3 scripts/sync_project_settings.py --deployer-email "$DEPLOYER_EMAIL" --target "$BUNDLE_TARGET"
+
+# ── 1b. Fail fast on any remaining SET_ME values for the target profile ──
+# The committed config/project-settings.yaml ships as a placeholder template.
+# Operators copy it to project-settings.local.yaml and fill in real values
+# for the profile(s) they deploy. This guard surfaces an unfilled SET_ME
+# before bundle deploy starts uploading resources against ``SET_ME`` hosts
+# or trying to register service principals named ``SET_ME`` — at that point
+# you'd get cryptic auth errors deep in the stack.
+echo "=== SET_ME guard: $PROJECT_SETTINGS_YAML profile for $BUNDLE_TARGET ==="
+python3 - "$ROOT_DIR/$PROJECT_SETTINGS_YAML" "$BUNDLE_TARGET" <<'PY'
+import sys
+import yaml
+
+path, bundle_target = sys.argv[1], sys.argv[2]
+with open(path, encoding="utf-8") as f:
+    settings = yaml.safe_load(f) or {}
+
+# Find the profile for this bundle_target.
+matching = []
+for profile_name, prof in (settings.get("profiles") or {}).items():
+    if (prof or {}).get("bundle_target") == bundle_target:
+        matching.append((profile_name, prof))
+if not matching:
+    sys.stderr.write(
+        f"ERROR: no profile in {path} has bundle_target={bundle_target!r}\n"
+    )
+    sys.exit(2)
+
+# Fields that are REQUIRED to be non-SET_ME for a working deploy.
+# We deliberately skip fields that are optional (lakebase_catalog,
+# genie_space_id) or commonly empty (lakebase_schema).
+# NOTE: app_client_id is intentionally NOT required here — it is auto-captured
+# from ``databricks apps get`` after the first bundle deploy creates the app SP
+# (chicken-and-egg: the SP does not exist until the app is created). Same for
+# lakebase_pg_user (defaults to the app SP; the runtime resolves it from the
+# injected DATABRICKS_CLIENT_ID anyway).
+REQUIRED = {
+    "workspace_host",
+    "sql_warehouse_id",
+    "uc_catalog",
+    "uc_schema",
+    "producer_client_id",
+    "lakebase_pg_host",
+    "lakebase_endpoint",
+    "zerobus_server_endpoint",
+}
+
+unfilled: list[str] = []
+for profile_name, prof in matching:
+    for key in sorted(REQUIRED):
+        value = (prof or {}).get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text == "SET_ME" or text.startswith("<") and text.endswith(">"):
+            unfilled.append(f"  {profile_name}.{key} = {text!r}")
+
+if unfilled:
+    sys.stderr.write(
+        f"ERROR: {len(unfilled)} required field(s) still carry placeholders\n"
+        f"       in {path} for bundle_target={bundle_target!r}:\n"
+    )
+    sys.stderr.write("\n".join(unfilled) + "\n")
+    sys.stderr.write(
+        "\nFix: copy config/project-settings.yaml to\n"
+        "     config/project-settings.local.yaml and fill in your values.\n"
+    )
+    sys.exit(2)
+
+print(f"SET_ME guard passed: all required fields filled for {bundle_target!r}.")
+PY
+
+# ── 1c. Derive shared app env from project-settings (single source of truth) ──
+# UC catalog/schema, Lakebase host + endpoint, shift id, and Genie space id live
+# in project-settings; render them into app.<env>.local.yaml so users never keep
+# two files in sync by hand. Runs before the swap/bundle deploy below.
+echo "=== render_app_yaml.py $ENV (single source of truth) ==="
+python3 scripts/render_app_yaml.py "$ENV" --settings "$ROOT_DIR/$PROJECT_SETTINGS_YAML" || {
+  echo "WARN: render_app_yaml.py failed — app.yaml may carry stale/duplicated values." >&2
+}
+
+# ── Helpers: Lakebase role registration + app SP capture ────────────────
+# Reusable pieces invoked AFTER the first bundle deploy (below). Chicken-and-egg
+# fix: the App's service principal is created by the FIRST ``databricks bundle
+# deploy`` (the bundle's ``apps:`` resource), so external users can't paste
+# ``app_client_id`` up front. We capture it from ``databricks apps get`` after
+# that deploy and thread it back into project-settings.local.yaml so a second
+# deploy can apply the SP's CAN_MANAGE_RUN job grants. The app runtime resolves
+# its own SP from the injected DATABRICKS_CLIENT_ID (agent_server/memory/pg_pool.py),
+# so PGUSER in app.yaml is not needed at runtime.
+LAKEBASE_PG_HOST=$(awk '/^  - name: PGHOST/{getline; gsub(/[ '"'"'"]/,""); sub(/^value:/,""); print; exit}' "$ROOT_DIR/$APP_SOURCE_YAML")
+
+# init_lakebase_role.py needs psycopg2 (a project dependency). The system
+# python3 used for the lightweight YAML steps above usually lacks it, so pick an
+# interpreter that has it: prefer the project venv, then uv, then system python3.
+if [[ -x "$ROOT_DIR/.venv/bin/python" ]]; then
+  LAKEBASE_PY=("$ROOT_DIR/.venv/bin/python")
+elif command -v uv >/dev/null 2>&1; then
+  LAKEBASE_PY=(uv run --quiet python)
+else
+  LAKEBASE_PY=(python3)
+fi
+
+_profile_field() {
+  # Echo a field from the deploy target's profile in project-settings.
+  python3 -c "
+import yaml
+with open('$ROOT_DIR/$PROJECT_SETTINGS_YAML') as f:
+    d = yaml.safe_load(f)
+for prof in (d.get('profiles') or {}).values():
+    if prof.get('bundle_target') == '$BUNDLE_TARGET':
+        print((prof.get('$1') or '').strip())
+        break
+" 2>/dev/null || echo ""
+}
+
+PRODUCER_SP_ID=$(_profile_field producer_client_id)
+
+register_sp() {
+  local sp_id="$1"
+  local label="$2"
+  if [[ -z "$sp_id" || "$sp_id" == "SET_ME" ]]; then
+    echo "WARN: skipping $label — not configured."
+    return 0
+  fi
+  local ep LAKEBASE_PROJECT LAKEBASE_BRANCH
+  ep=$(_profile_field lakebase_endpoint)
+  LAKEBASE_PROJECT=$(printf '%s' "$ep" | awk -F/ '$1=="projects"{print $2}')
+  LAKEBASE_BRANCH=$(printf '%s' "$ep" | awk -F/ '$3=="branches"{print $4}')
+  [[ -z "$LAKEBASE_BRANCH" ]] && LAKEBASE_BRANCH="production"
+  if [[ -z "$LAKEBASE_PROJECT" || "$LAKEBASE_PROJECT" == "SET_ME" ]]; then
+    echo "WARN: skipping $label — lakebase_endpoint in project-settings.yaml is missing or SET_ME." >&2
+    return 0
+  fi
+  echo "=== init_lakebase_role.py — register $label ($sp_id) on project $LAKEBASE_PROJECT/$LAKEBASE_BRANCH ==="
+  "${LAKEBASE_PY[@]}" scripts/init_lakebase_role.py \
+    --profile "$PROFILE" \
+    --project "$LAKEBASE_PROJECT" \
+    --branch "$LAKEBASE_BRANCH" \
+    --pg-host "$LAKEBASE_PG_HOST" \
+    --pg-database databricks_postgres \
+    --pg-admin-user "$DEPLOY_USER" \
+    --sp-client-id "$sp_id" || {
+      echo "WARN: init_lakebase_role failed for $label — Lakebase auth may not work." >&2
+  }
+}
+
+# Write app_client_id + lakebase_pg_user for the deploy target's profile into
+# project-settings.local.yaml, preserving comments/formatting (line-based,
+# indentation-scoped to the target profile block). Creates the .local.yaml
+# from the committed template on first use so external forks never edit the
+# tracked placeholder file.
+write_app_client_id() {
+  local sp="$1"
+  local local_settings="$ROOT_DIR/config/project-settings.local.yaml"
+  if [[ ! -f "$local_settings" ]]; then
+    cp "$ROOT_DIR/config/project-settings.yaml" "$local_settings"
+    echo "=== Created config/project-settings.local.yaml from template ==="
+  fi
+  python3 - "$local_settings" "$BUNDLE_TARGET" "$sp" <<'PY'
+import re, sys, yaml
+path, target, sp = sys.argv[1], sys.argv[2], sys.argv[3]
+lines = open(path, encoding="utf-8").read().split("\n")
+doc = yaml.safe_load("\n".join(lines)) or {}
+pname = None
+for name, prof in (doc.get("profiles") or {}).items():
+    if (prof or {}).get("bundle_target") == target:
+        pname = name
+        break
+if not pname:
+    sys.exit(0)
+out, in_block, block_indent = [], False, None
+for line in lines:
+    hm = re.match(r"^(\s+)([A-Za-z0-9_.-]+):\s*$", line)
+    if hm and hm.group(2) == pname:
+        in_block = True
+        block_indent = len(hm.group(1))
+        out.append(line)
+        continue
+    if in_block:
+        cur = re.match(r"^(\s*)\S", line)
+        cur_indent = len(cur.group(1)) if cur else 999
+        if line.strip() and cur_indent <= block_indent:
+            in_block = False
+        else:
+            pk = re.match(r"^(\s+)(app_client_id|lakebase_pg_user):\s*.*$", line)
+            if pk:
+                out.append(f'{pk.group(1)}{pk.group(2)}: "{sp}"')
+                continue
+    out.append(line)
+open(path, "w", encoding="utf-8").write("\n".join(out))
+print(f"Wrote app_client_id/lakebase_pg_user for profile {pname!r}.")
+PY
+}
+
+# Write genie_space_id for the deploy target's profile into
+# project-settings.local.yaml (same line-based, profile-scoped rewrite as
+# write_app_client_id). Used after auto-creating a Genie space on a fresh env.
+write_genie_space_id() {
+  local space_id="$1"
+  local local_settings="$ROOT_DIR/config/project-settings.local.yaml"
+  if [[ ! -f "$local_settings" ]]; then
+    cp "$ROOT_DIR/config/project-settings.yaml" "$local_settings"
+    echo "=== Created config/project-settings.local.yaml from template ==="
+  fi
+  python3 - "$local_settings" "$BUNDLE_TARGET" "$space_id" <<'PY'
+import re, sys, yaml
+path, target, space_id = sys.argv[1], sys.argv[2], sys.argv[3]
+lines = open(path, encoding="utf-8").read().split("\n")
+doc = yaml.safe_load("\n".join(lines)) or {}
+pname = None
+for name, prof in (doc.get("profiles") or {}).items():
+    if (prof or {}).get("bundle_target") == target:
+        pname = name
+        break
+if not pname:
+    sys.exit(0)
+out, in_block, block_indent, wrote = [], False, None, False
+for line in lines:
+    hm = re.match(r"^(\s+)([A-Za-z0-9_.-]+):\s*$", line)
+    if hm and hm.group(2) == pname:
+        in_block = True
+        block_indent = len(hm.group(1))
+        out.append(line)
+        continue
+    if in_block:
+        cur = re.match(r"^(\s*)\S", line)
+        cur_indent = len(cur.group(1)) if cur else 999
+        if line.strip() and cur_indent <= block_indent:
+            in_block = False
+        else:
+            pk = re.match(r"^(\s+)(genie_space_id):\s*.*$", line)
+            if pk:
+                out.append(f'{pk.group(1)}{pk.group(2)}: "{space_id}"')
+                wrote = True
+                continue
+    out.append(line)
+open(path, "w", encoding="utf-8").write("\n".join(out))
+print(f"Wrote genie_space_id for profile {pname!r}." if wrote
+      else f"WARN: no genie_space_id key found in profile {pname!r} to update.")
+PY
+}
+
+# Swap app.<env>.(local.)yaml → app.yaml and substitute ${DEPLOYER_EMAIL}.
+# The bundle's ``apps:`` resource has ``source_code_path: ./``, so bundle
+# deploy uploads ./app.yaml to the workspace and the app spec is read from
+# THERE — the swap MUST happen before each bundle deploy.
+do_app_yaml_swap() {
+  if [[ "$APP_SOURCE_YAML" != "app.yaml" ]]; then
+    cp "$ROOT_DIR/$APP_SOURCE_YAML" "$ROOT_DIR/app.yaml"
+    echo "=== Swapped $APP_SOURCE_YAML → app.yaml (will restore on exit) ==="
+  fi
+  if grep -q '\${DEPLOYER_EMAIL}' "$ROOT_DIR/app.yaml"; then
+    echo "=== Substituting \${DEPLOYER_EMAIL} → $DEPLOYER_EMAIL in app.yaml ==="
+    python3 - "$ROOT_DIR/app.yaml" "$DEPLOYER_EMAIL" <<'PY'
+import sys
+path, email = sys.argv[1], sys.argv[2]
+with open(path, "r", encoding="utf-8") as f:
+    text = f.read()
+with open(path, "w", encoding="utf-8") as f:
+    f.write(text.replace("${DEPLOYER_EMAIL}", email))
+PY
+  fi
+}
+
+run_bundle_deploy() {
+  echo "=== databricks bundle deploy --target $BUNDLE_TARGET --profile $PROFILE ==="
+  local deploy_args=(bundle deploy --target "$BUNDLE_TARGET" --profile "$PROFILE")
+  if ((${#EXTRA[@]} > 0)); then
+    deploy_args+=("${EXTRA[@]}")
+  fi
+  # Auto-recover from a STALE deployment lock. If a previous ``bundle deploy``
+  # was interrupted (Ctrl-C, killed shell, dropped connection) the lock it took
+  # is left behind, and the next run fails with "Failed to acquire deployment
+  # lock". For a single-operator accelerator deploy that's virtually always a
+  # stale lock (not a genuine concurrent deploy), so retry ONCE with
+  # --force-lock. We skip the auto-retry if the caller already passed
+  # --force-lock (then the first attempt already had it and any lock error is
+  # real). Output is tee'd so the operator still sees it live.
+  local logf rc=0
+  logf="$(mktemp -t bundle_deploy.XXXXXX)"
+  if databricks "${deploy_args[@]}" 2>&1 | tee "$logf"; then rc=0; else rc=${PIPESTATUS[0]}; fi
+  if (( rc != 0 )) && grep -q "Failed to acquire deployment lock" "$logf" \
+     && ! printf '%s\n' "${EXTRA[@]:-}" | grep -qx -- "--force-lock"; then
+    echo "WARN: stale deployment lock detected — a previous deploy was likely interrupted." >&2
+    echo "=== Retrying bundle deploy once with --force-lock ===" >&2
+    rm -f "$logf"
+    databricks "${deploy_args[@]}" --force-lock
+    return $?
+  fi
+  rm -f "$logf"
+  return $rc
+}
+
+# ── 2. Optional pre-deploy MLflow GenAI eval gate ───────────────────────
+# Runs the seed eval slice against the current agent code and blocks the
+# deploy if any threshold is breached (see evaluations/run_eval.py). Opt-in:
+# set RUN_EVAL_GATE=1 to enable.
+if [[ "${RUN_EVAL_GATE:-0}" == "1" ]]; then
+  echo "=== MLflow GenAI eval gate (RUN_EVAL_GATE=1) ==="
+  DATABRICKS_PROFILE="$PROFILE" bash "$SCRIPT_DIR/run_eval_gate.sh" || {
+    echo "ERROR: eval gate failed — aborting deploy. Fix the regression or" >&2
+    echo "       re-run with RUN_EVAL_GATE=0 to bypass (record the reason)." >&2
+    exit 1
+  }
+fi
+
+# ── 3. First bundle deploy: creates jobs + dashboard + app (+ SP) ────────
+# Uploads the best-known app.yaml first. On a first external deploy where
+# app_client_id is still SET_ME, sync_project_settings emits NO SP job grants
+# (see _app_sp_permissions_block), so this deploy creates the app + SP cleanly;
+# the second deploy below applies the grants once we've captured the SP.
+APP_YAML_BACKUP="$(mktemp -t app_yaml_bak.XXXXXX)"
+cp "$ROOT_DIR/app.yaml" "$APP_YAML_BACKUP"
+do_app_yaml_swap
+run_bundle_deploy
+
+if [[ "$SKIP_APP" -eq 1 ]]; then
+  echo "=== --skip-app set — first bundle deploy complete, app deploy skipped ==="
+  exit 0
+fi
+
+# ── 4. Capture the app SP (chicken-and-egg fix) ─────────────────────────
+NEEDS_REDEPLOY=0
+CURRENT_APP_SP=$(_profile_field app_client_id)
+if [[ -z "$CURRENT_APP_SP" || "$CURRENT_APP_SP" == "SET_ME" ]]; then
+  echo "=== Capturing app SP from 'databricks apps get $APP_NAME' ==="
+  CAPTURED_SP=$(databricks apps get "$APP_NAME" --profile "$PROFILE" --output json 2>/dev/null \
+    | python3 -c 'import json,sys
+try:
+    print(json.load(sys.stdin).get("service_principal_client_id") or "")
+except Exception:
+    print("")' 2>/dev/null || echo "")
+  if [[ -n "$CAPTURED_SP" ]]; then
+    echo "=== Captured app SP: $CAPTURED_SP — writing to project-settings.local.yaml ==="
+    write_app_client_id "$CAPTURED_SP"
+    APP_SP_ID="$CAPTURED_SP"
+    NEEDS_REDEPLOY=1
+    # Ensure refresh_app_yaml_ids + subsequent swaps target a gitignored
+    # .local.yaml so the committed app.<env>.yaml template stays clean on forks.
+    if [[ "$APP_SOURCE_YAML" != *".local.yaml" ]]; then
+      APP_LOCAL_YAML="${APP_SOURCE_YAML%.yaml}.local.yaml"
+      if [[ ! -f "$ROOT_DIR/$APP_LOCAL_YAML" ]]; then
+        cp "$ROOT_DIR/$APP_SOURCE_YAML" "$ROOT_DIR/$APP_LOCAL_YAML"
+        echo "=== Created $APP_LOCAL_YAML from template ==="
+      fi
+      APP_SOURCE_YAML="$APP_LOCAL_YAML"
+    fi
+    # Regenerate bundle-targets so the SP's CAN_MANAGE_RUN grants are emitted,
+    # and re-resolve PROJECT_SETTINGS_YAML to the freshly-created local file.
+    PROJECT_SETTINGS_YAML="config/project-settings.local.yaml"
+    echo "=== Re-sync bundle-targets with captured app SP ==="
+    python3 scripts/sync_project_settings.py --deployer-email "$DEPLOYER_EMAIL" --target "$BUNDLE_TARGET"
+  else
+    echo "WARN: could not capture app SP from apps get — SP job grants + Lakebase role skipped." >&2
+  fi
+else
+  APP_SP_ID="$CURRENT_APP_SP"
+fi
+
+# ── 4a. Register App + Producer SPs as Lakebase roles (idempotent) ──────
+if [[ -n "$LAKEBASE_PG_HOST" && -n "$DEPLOY_USER" ]]; then
+  register_sp "${APP_SP_ID:-}" "App SP"
+  register_sp "$PRODUCER_SP_ID" "Producer SP"
+else
+  echo "WARN: could not parse PGHOST or detect deploy user — skipping Lakebase role registration."
+fi
+
+# ── 4b. Refresh OPS_* IDs AFTER resources exist ─────────────────────────
+# CRITICAL ordering: the jobs + Data Quality dashboard only exist after the
+# bundle deploy above, so refreshing here (not before) is what fills real IDs
+# into app.<env>.local.yaml. Previously this ran before the first deploy, so a
+# fresh workspace shipped OPS_DATA_QUALITY_DASHBOARD_ID='SET_ME' and the
+# Quality tab 404'd. If any ID changes, a second bundle deploy re-uploads the
+# corrected app.yaml.
+echo "=== refresh_app_yaml_ids.py $ENV (after bundle deploy) ==="
+REFRESH_OUT=$(python3 scripts/refresh_app_yaml_ids.py "$ENV" --profile "$PROFILE" 2>&1) || true
+echo "$REFRESH_OUT"
+if echo "$REFRESH_OUT" | grep -qE '^Patched [1-9]'; then
+  NEEDS_REDEPLOY=1
+fi
+
+# ── 4c. Second bundle deploy (only if SP captured or IDs changed) ───────
+if [[ "$NEEDS_REDEPLOY" -eq 1 ]]; then
+  echo "=== Re-deploy: app env / SP grants changed on first pass ==="
+  do_app_yaml_swap
+  run_bundle_deploy
+fi
+
+# ── 5. App deploy ────────────────────────────────────────────────────────
+# Two first-deploy footguns handled here:
+#   (a) A freshly bundle-created app is STOPPED; ``apps deploy`` requires the
+#       compute to be RUNNING, so start it (and wait) if needed.
+#   (b) The first-ever ``apps deploy`` needs an explicit ``--source-code-path``
+#       (there is no prior active deployment to reuse). The bundle already
+#       uploaded the repo to its workspace files path, so we pass that. It is
+#       also valid on subsequent deploys, so we always pass it when known.
+APP_STATE=$(databricks apps get "$APP_NAME" --profile "$PROFILE" --output json 2>/dev/null \
+  | python3 -c 'import json,sys
+try: print((json.load(sys.stdin).get("compute_status") or {}).get("state") or "")
+except Exception: print("")' 2>/dev/null || echo "")
+if [[ "$APP_STATE" != "ACTIVE" && "$APP_STATE" != "RUNNING" ]]; then
+  echo "=== app compute is '${APP_STATE:-unknown}' — starting $APP_NAME (waits for RUNNING) ==="
+  databricks apps start "$APP_NAME" --profile "$PROFILE" || {
+    echo "ERROR: apps start failed for $APP_NAME." >&2
+    exit 1
+  }
+fi
+
+APP_SRC_PATH=$(databricks bundle summary --target "$BUNDLE_TARGET" --profile "$PROFILE" --output json 2>/dev/null \
+  | python3 -c 'import json,sys
+try: print((json.load(sys.stdin).get("workspace") or {}).get("file_path") or "")
+except Exception: print("")' 2>/dev/null || echo "")
+
+echo "=== databricks apps deploy $APP_NAME (source=${APP_SRC_PATH:-<default>}) --profile $PROFILE ==="
+APP_DEPLOY_ARGS=(apps deploy "$APP_NAME" --profile "$PROFILE")
+if [[ -n "$APP_SRC_PATH" ]]; then
+  APP_DEPLOY_ARGS+=(--source-code-path "$APP_SRC_PATH")
+fi
+
+# The Apps build sandbox is occasionally flaky on the FIRST attempt, and the
+# failure modes all clear the same way — with a stop → start (fresh container
+# filesystem) → redeploy:
+#   * "App process did not start within 10 minutes" — a slow build ran into the
+#     health-check window.
+#   * "Error installing packages" / npm "ENOTEMPTY" — a corrupted node_modules
+#     left in the build cache by a previous failed build.
+#   * "active deployment in progress" — a prior attempt is still settling.
+# So instead of forcing the operator to diagnose and hand-run the recovery (as
+# was needed during bring-up), we retry ONCE automatically after a stop/start.
+app_deploy_attempt() { databricks "${APP_DEPLOY_ARGS[@]}"; }
+
+if ! app_deploy_attempt; then
+  echo "WARN: apps deploy failed. This is usually a transient build-sandbox issue" >&2
+  echo "      (npm/registry blip, OOM, 10-min start timeout, or a stale build cache)." >&2
+  echo "=== Recovery: stop → start → redeploy (forces a fresh build container) ===" >&2
+  databricks apps stop "$APP_NAME" --profile "$PROFILE" || true
+  databricks apps start "$APP_NAME" --profile "$PROFILE" || {
+    echo "ERROR: apps start failed during recovery — aborting." >&2
+    exit 1
+  }
+  if ! app_deploy_attempt; then
+    echo "ERROR: apps deploy failed again after stop/start recovery." >&2
+    echo "       Inspect the build + runtime logs:" >&2
+    echo "         databricks apps logs $APP_NAME --tail-lines 200 --profile $PROFILE" >&2
+    echo "       Restore app.yaml from $APP_YAML_BACKUP if needed." >&2
+    exit 1
+  fi
+fi
+
+# ── 6. Data Quality dashboard grants + publish ──────────────────────────
+# The Lakeview dashboard ships in the bundle but its CAN_READ grant for the
+# app SP, the workspace-folder traversal grants, and the
+# embed_credentials=true publish are not expressible declaratively in DAB
+# yet. Without this step the Quality tab iframe loads but every widget
+# renders "Unable to render visualization." (See SKIP message in
+# scripts/grant_app_jobs_view.sh for the underlying API calls.)
+DASHBOARD_ID=$(awk '/^  - name: OPS_DATA_QUALITY_DASHBOARD_ID/{getline; gsub(/[ '"'"'"]/,""); sub(/^value:/,""); print; exit}' "$ROOT_DIR/$APP_SOURCE_YAML")
+# Resolve the bundle target's SQL warehouse from project-settings.yaml. The
+# app's DATABRICKS_WAREHOUSE_ID env is injected via valueFrom: sql-warehouse,
+# so it isn't a literal in app.<env>.yaml — go to the source instead.
+WAREHOUSE_ID=$(python3 -c "
+import yaml
+with open('$ROOT_DIR/$PROJECT_SETTINGS_YAML') as f:
+    d = yaml.safe_load(f)
+for prof in d.get('profiles', {}).values():
+    if prof.get('bundle_target') == '$BUNDLE_TARGET':
+        print((prof.get('sql_warehouse_id') or '').strip())
+        break
+" 2>/dev/null || echo "")
+
+if [[ -n "$DASHBOARD_ID" && -n "$WAREHOUSE_ID" && -n "$DEPLOY_USER" ]]; then
+  echo "=== grant_app_jobs_view.sh — Data Quality dashboard ==="
+  # The dashboard is uploaded under the BUNDLE TARGET name (not the CLI
+  # profile name), so override the script's default parent path to match.
+  PROFILE="$PROFILE" \
+  APP_NAME="$APP_NAME" \
+  USER_EMAIL="$DEPLOY_USER" \
+  DASHBOARD_ID="$DASHBOARD_ID" \
+  WAREHOUSE_ID="$WAREHOUSE_ID" \
+  DASHBOARD_PARENT_PATH="/Users/$DEPLOY_USER/.bundle/production-line-copilot/$BUNDLE_TARGET/resources" \
+  bash "$SCRIPT_DIR/grant_app_jobs_view.sh" || {
+    echo "WARN: grant_app_jobs_view.sh failed — Data Quality tab may show empty widgets." >&2
+    echo "      Re-run manually with the env block printed above." >&2
+  }
+else
+  echo "WARN: skipping Data Quality dashboard grants (DASHBOARD_ID='$DASHBOARD_ID', WAREHOUSE_ID='$WAREHOUSE_ID')." >&2
+  echo "      The Quality tab iframe will likely show 'Unable to render visualization.'" >&2
+fi
+
+# ── 6b. Auto-detect a fresh environment ─────────────────────────────────
+# Operators shouldn't have to remember RUN_SETUP=1 on a first deploy. If
+# RUN_SETUP is unset, probe UC for the schema's marker bronze table: missing →
+# fresh env → auto-provision (schema + reference data + Genie); present →
+# code-only redeploy, skip. An explicit RUN_SETUP=0/1 always wins.
+if [[ -z "${RUN_SETUP:-}" ]]; then
+  UC_CATALOG_PROBE=$(_profile_field uc_catalog)
+  UC_SCHEMA_PROBE=$(_profile_field uc_schema)
+  MARKER_TABLE="$UC_CATALOG_PROBE.$UC_SCHEMA_PROBE.machine_state_bronze"
+  if [[ -n "$UC_CATALOG_PROBE" && "$UC_CATALOG_PROBE" != "SET_ME" ]] \
+     && databricks api get "/api/2.1/unity-catalog/tables/$MARKER_TABLE" --profile "$PROFILE" >/dev/null 2>&1; then
+    RUN_SETUP=0
+    echo "=== Fresh-env check: $MARKER_TABLE exists → RUN_SETUP=0 (code-only redeploy) ==="
+  else
+    RUN_SETUP=1
+    echo "=== Fresh-env check: $MARKER_TABLE missing → RUN_SETUP=1 (auto-provision schema + data + Genie) ==="
+  fi
+fi
+
+# ── 7. One-time data provisioning + Genie space ──────────────────────────
+# A code-only redeploy to an existing env does NOT need this. But a FRESH env
+# has an empty UC schema, so the app/agents have no data until the setup job
+# runs (creates the schema + bronze/live/reference tables, bootstraps ref data,
+# and wires the Continuous Synced Tables to Lakebase). This step also
+# auto-creates the curated Genie space (step 7a) once the tables exist — so a
+# truly fresh workspace (external fork) gets one without any manual UI step.
+# Auto-enabled by the fresh-env check above; force with RUN_SETUP=1, or opt out
+# with RUN_SETUP=0. ``bundle run`` triggers run-now and blocks until the job
+# finishes. The continuous producer + quality-sync jobs deploy UNPAUSED, so
+# they start on their own once the schema exists — no manual start needed.
+if [[ "${RUN_SETUP:-0}" == "1" ]]; then
+  echo "=== RUN_SETUP=1: running one-time setup job (schema + reference data + synced tables) ==="
+  databricks bundle run solution_accelerator_setup --target "$BUNDLE_TARGET" --profile "$PROFILE" || {
+    echo "ERROR: setup job failed — inspect the run in the Databricks Jobs UI." >&2
+    exit 1
+  }
+  echo "=== Setup job complete — UC schema provisioned for $BUNDLE_TARGET ==="
+
+  # ── 7a. Genie space auto-provisioning ─────────────────────────────────
+  # The curated space references catalog.schema.<table>, which only exist
+  # AFTER the setup job above — so create/refresh it here (not earlier).
+  # Fresh env (genie_space_id=SET_ME): POST-create via the public
+  # /api/2.0/genie/spaces API, capture the new id, write it back, grant the
+  # app SP CAN_RUN, then re-wire GENIE_SPACE_ID into the app + redeploy.
+  # Existing env: PATCH the space so the curated config stays fresh.
+  GENIE_ID=$(_profile_field genie_space_id)
+  UC_CATALOG=$(_profile_field uc_catalog)
+  UC_SCHEMA=$(_profile_field uc_schema)
+  if [[ -z "$WAREHOUSE_ID" || -z "$UC_CATALOG" || "$UC_CATALOG" == "SET_ME" ]]; then
+    echo "WARN: skipping Genie provisioning (warehouse='$WAREHOUSE_ID', catalog='$UC_CATALOG')." >&2
+  else
+    GENIE_ARGS=(--profile "$PROFILE" --warehouse-id "$WAREHOUSE_ID" --catalog "$UC_CATALOG" --schema "$UC_SCHEMA")
+    if [[ -z "$GENIE_ID" || "$GENIE_ID" == "SET_ME" ]]; then
+      echo "=== Creating Genie space (fresh env) ==="
+      GENIE_OUT=$(python3 scripts/genie_space_config_streaming.py "${GENIE_ARGS[@]}" \
+        --parent-path "/Users/$DEPLOY_USER" 2>&1) || {
+        echo "$GENIE_OUT" >&2
+        echo "WARN: Genie space create failed — briefing features unavailable until fixed." >&2
+        GENIE_OUT=""
+      }
+      [[ -n "$GENIE_OUT" ]] && echo "$GENIE_OUT"
+      NEW_GENIE_ID=$(printf '%s\n' "$GENIE_OUT" | awk -F= '/^GENIE_SPACE_ID=/{print $2; exit}')
+      if [[ -n "$NEW_GENIE_ID" ]]; then
+        write_genie_space_id "$NEW_GENIE_ID"
+        GENIE_ID="$NEW_GENIE_ID"
+        if [[ -n "${APP_SP_ID:-}" ]]; then
+          echo "=== Granting app SP $APP_SP_ID CAN_RUN on Genie space $GENIE_ID ==="
+          GENIE_PERMS_JSON=$(printf '{"access_control_list":[{"service_principal_name":"%s","permission_level":"CAN_RUN"}]}' "$APP_SP_ID")
+          databricks api patch "/api/2.0/permissions/genie/$GENIE_ID" --profile "$PROFILE" \
+            --json "$GENIE_PERMS_JSON" >/dev/null \
+            || echo "WARN: could not grant app SP CAN_RUN on Genie space — grant manually." >&2
+        fi
+        echo "=== Re-wiring GENIE_SPACE_ID into the app + redeploying ==="
+        python3 scripts/render_app_yaml.py "$ENV" --settings "$ROOT_DIR/$PROJECT_SETTINGS_YAML" || true
+        do_app_yaml_swap
+        run_bundle_deploy
+        databricks apps deploy "$APP_NAME" --profile "$PROFILE" \
+          ${APP_SRC_PATH:+--source-code-path "$APP_SRC_PATH"} \
+          || echo "WARN: app redeploy after Genie wiring failed — re-run deploy to pick up GENIE_SPACE_ID." >&2
+      fi
+    else
+      echo "=== Refreshing existing Genie space $GENIE_ID (curated config) ==="
+      python3 scripts/genie_space_config_streaming.py "${GENIE_ARGS[@]}" --space-id "$GENIE_ID" \
+        || echo "WARN: Genie space refresh failed — space kept its previous config." >&2
+    fi
+  fi
+fi
+
+echo
+echo "=== Deploy complete (env=$ENV target=$BUNDLE_TARGET app=$APP_NAME) ==="
+if [[ "${RUN_SETUP:-0}" != "1" ]]; then
+  echo "    (Existing env — skipped one-time setup. Force re-provision with: RUN_SETUP=1 $0 $ENV)"
+fi
