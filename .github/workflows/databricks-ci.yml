@@ -1,0 +1,66 @@
+name: Databricks Asset Bundles CI
+
+# Fork-safe adaptation of the databricks-industry-solutions CI template.
+#
+# This accelerator deploys a live Databricks App (App + jobs + dashboard +
+# experiment) via `scripts/deploy.sh`, not a notebook-only demo workflow. A full
+# deploy needs per-workspace values (SQL warehouse, Lakebase host/user, service
+# principals) that the public tree intentionally ships as SET_ME placeholders in
+# config/project-settings.yaml. So CI is scoped to `databricks bundle validate`
+# (schema/reference check) rather than deploy/run — the deploy path is exercised
+# by operators against their own workspace per README.md / docs/solution-accelerator.
+#
+# Required repository configuration (Settings → Secrets and variables → Actions):
+#   - Variable  CI_DATABRICKS_HOST   e.g. https://<workspace>.cloud.databricks.com
+#   - Secret    DEPLOY_NOTEBOOK_TOKEN  a PAT for that workspace
+# No internal hostname is committed to the repo; if the variable is unset the
+# validate step is skipped so forks don't see a failing check.
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+jobs:
+  validate:
+    runs-on: html_publisher
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set up Databricks CLI
+        uses: databricks/setup-cli@main
+
+      - name: Configure Databricks CLI authentication
+        if: ${{ vars.CI_DATABRICKS_HOST != '' }}
+        run: |
+          echo "[DEFAULT]" > ~/.databrickscfg
+          echo "host = ${{ vars.CI_DATABRICKS_HOST }}" >> ~/.databrickscfg
+          echo "token = ${{ secrets.DEPLOY_NOTEBOOK_TOKEN }}" >> ~/.databrickscfg
+
+      - name: Generate bundle targets from committed defaults
+        if: ${{ vars.CI_DATABRICKS_HOST != '' }}
+        run: |
+          python -m pip install --upgrade pip pyyaml
+          # Produces config/bundle-targets.yaml (gitignored) from the committed
+          # config/project-settings.yaml, carrying SET_ME placeholders.
+          python scripts/sync_project_settings.py
+          # Point the placeholder workspace host at the CI workspace so validate
+          # authenticates with the CI token (real values stay in operators' local config).
+          sed -i "s#https://<your-workspace>.cloud.databricks.com#${{ vars.CI_DATABRICKS_HOST }}#g" config/bundle-targets.yaml
+
+      - name: Validate bundle
+        if: ${{ vars.CI_DATABRICKS_HOST != '' }}
+        env:
+          DATABRICKS_HOST: ${{ vars.CI_DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DEPLOY_NOTEBOOK_TOKEN }}
+        run: databricks bundle validate -t line_manager_dev

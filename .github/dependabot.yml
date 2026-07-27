@@ -1,0 +1,24 @@
+# Dependabot configuration
+#
+# This public repository is a squashed, effectively read-only MIRROR: development
+# happens in a separate source repo and each release is re-published as a fresh
+# baseline. Pull requests opened here would be discarded on the next refresh, so
+# we intentionally run NO Dependabot *version* updates (open-pull-requests-limit
+# is 0 for every ecosystem below).
+#
+# NOTE: Dependabot *security* updates are a repository SETTING, not controlled by
+# this file. To fully stop automated security PRs, also turn off
+# "Dependabot security updates" under Settings -> Code security. Dependencies are
+# instead reviewed and patched upstream in the source repo, then re-mirrored.
+version: 2
+updates:
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 0
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 0

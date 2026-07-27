@@ -1,0 +1,133 @@
+# Project UC / workspace settings (single place to edit for your environments).
+# Run:  python scripts/sync_project_settings.py
+# to regenerate config/bundle-targets.yaml for Databricks Asset Bundles.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+#  PUBLIC TEMPLATE — fill values in config/project-settings.local.yaml
+#
+#  This committed file ships with `SET_ME` / `<your-*>` placeholders for every
+#  workspace-specific value. The deploy pipeline (scripts/deploy.sh,
+#  scripts/sync_project_settings.py, scripts/refresh_app_yaml_ids.py) prefers
+#  config/project-settings.local.yaml when present — that file is gitignored,
+#  so your real workspace hosts, SP UUIDs, and Lakebase endpoints never land
+#  in version control.
+#
+#  Bootstrap a new environment:
+#    cp config/project-settings.yaml config/project-settings.local.yaml
+#    # …edit the .local.yaml to point at your workspace…
+#    ./scripts/deploy.sh dev
+#
+#  Required per profile you intend to deploy:
+#    - workspace_host
+#    - sql_warehouse_id
+#    - uc_catalog / uc_schema  (catalogs you own; setup job will populate them)
+#    - producer_client_id / app_client_id (service principals)
+#    - lakebase_pg_host / lakebase_endpoint / lakebase_pg_user
+#    - zerobus_server_endpoint (region-specific Zerobus URL)
+#
+#  ${DEPLOYER_EMAIL} is auto-substituted by sync_project_settings.py from
+#  `databricks current-user me` (override with DEPLOYER_EMAIL env var).
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Unity Catalog: catalog + schema are the live streaming target unless noted.
+# src_* : reference tables copied by bootstrap_reference_data into uc_*.
+#
+# zerobus_ingest_enabled — drives bundle resources (see docs/solution-accelerator/DEPLOY.md):
+#   true  → setup job + Zerobus streaming producer job + streaming_quality_sync job. REQUIRED
+#           for a live dashboard: the producer is the sole writer of live telemetry (Producer →
+#           Zerobus → bronze → streaming sync → Lakebase ai_serving.* → App SSE).
+#   false → UC setup job only; no live data plane (there is no in-app simulation engine). Use
+#           only for a schema/reference-data-only deploy.
+
+version: 1
+
+profiles:
+  line_manager_prod:
+    description: 'Prod streaming workspace (streaming + producer + quality-gate)'
+    zerobus_ingest_enabled: true
+    bundle_target: line_manager_prod
+    workspace_host: 'https://<your-workspace>.cloud.databricks.com'
+    sql_warehouse_id: 'SET_ME'
+    # Databricks App *resource* name (per-env). Intentionally distinct from the
+    # package slug `productionline-copilot` (package.json / repo) — the deployed
+    # app carries an environment suffix. Rename freely for your own workspace.
+    app_name: 'production-line-copilot-prod'
+    uc_catalog: 'SET_ME'
+    uc_schema: 'line_manager_streaming'
+    sim_shift_id: 'shift_1'
+    # Empty → the setup job GENERATES reference data in-workspace (recommended;
+    # no external seed needed). Set both to copy dimension tables from an
+    # existing seed schema instead (e.g. "main" / "line_manager_ai_kit").
+    src_catalog: ''
+    src_schema: ''
+    lakebase_catalog: ''
+    lakebase_schema: 'public'
+    genie_space_id: 'SET_ME'
+    zerobus_server_endpoint: 'SET_ME'
+    producer_client_id: 'SET_ME'
+    producer_client_secret_ref: '{{secrets/line-manager/zerobus-client-secret}}'
+    app_client_id: 'SET_ME'
+    lakebase_pg_host: 'SET_ME'
+    lakebase_pg_user: 'SET_ME'
+    lakebase_syncer_pg_user: '${DEPLOYER_EMAIL}'
+    lakebase_pg_database: 'databricks_postgres'
+    lakebase_endpoint: 'projects/<your-lakebase-project>/branches/production/endpoints/primary'
+    lakebase_checkpoint_volume: '/Volumes/<your_catalog>/line_manager_streaming/_checkpoints'
+    mlflow_experiment_path: '/Shared/production-line-copilot-experiment'
+    # LLM serving endpoints the agents call. Defaults target the Databricks
+    # Foundation Model APIs (pay-per-token), which exist in most workspaces.
+    # Override ONLY if your workspace exposes these models under different
+    # endpoint names (check Serving → Endpoints). preflight.py validates them.
+    #   specialist  → 6 specialists + the router (fast / cheap)
+    #   advanced    → oee_coach + strategic_advisor (deeper reasoning)
+    #   orchestrator→ optional; empty reuses the specialist endpoint
+    model_specialist_endpoint: 'databricks-gpt-5-mini'
+    model_advanced_endpoint: 'databricks-gpt-5'
+    model_orchestrator_endpoint: ''
+
+  line_manager_dev:
+    description: |
+      Dev sibling of line_manager_prod — same workspace, suffixed resource
+      names. Two-deployment isolation:
+        • Distinct ``sim_shift_id`` (shift_1_dev) keeps dev rows out of
+          prod's SSE cursor scan, and vice versa. Lakebase
+          ``MAX(ts) WHERE shift_id IN (...)`` cursors won't see the wrong env.
+        • Distinct ``uc_schema`` (line_manager_streaming_dev) so the
+          producer and quality-gate job write into a dev UC schema and sync
+          into Lakebase under the dev-suffixed targets.
+        • Distinct ``app_client_id`` (one SP per app) so it needs its own
+          UC + Lakebase grants. Producer SP can be reused from prod if you
+          only have one.
+    zerobus_ingest_enabled: true
+    bundle_target: line_manager_dev
+    resource_name_suffix: '-dev'
+    workspace_host: 'https://<your-workspace>.cloud.databricks.com'
+    sql_warehouse_id: 'SET_ME'
+    app_name: 'production-line-copilot-dev'
+    uc_catalog: 'SET_ME'
+    uc_schema: 'line_manager_streaming_dev'
+    sim_shift_id: 'shift_1_dev'
+    # Empty → the setup job GENERATES reference data in-workspace (recommended;
+    # no external seed needed). Set both to copy dimension tables from an
+    # existing seed schema instead (e.g. "main" / "line_manager_ai_kit").
+    src_catalog: ''
+    src_schema: ''
+    lakebase_catalog: ''
+    lakebase_schema: 'public'
+    genie_space_id: ''
+    zerobus_server_endpoint: 'SET_ME'
+    producer_client_id: 'SET_ME'
+    producer_client_secret_ref: '{{secrets/line-manager/zerobus-client-secret}}'
+    app_client_id: 'SET_ME'
+    lakebase_pg_host: 'SET_ME'
+    lakebase_pg_user: 'SET_ME'
+    lakebase_syncer_pg_user: '${DEPLOYER_EMAIL}'
+    lakebase_pg_database: 'databricks_postgres'
+    lakebase_endpoint: 'projects/<your-lakebase-project>/branches/production/endpoints/primary'
+    lakebase_checkpoint_volume: '/Volumes/<your_catalog>/line_manager_streaming_dev/_checkpoints'
+    mlflow_experiment_path: '/Shared/production-line-copilot-dev-experiment'
+    # See line_manager_prod above for what these control. Override only if your
+    # workspace serves the models under different endpoint names.
+    model_specialist_endpoint: 'databricks-gpt-5-mini'
+    model_advanced_endpoint: 'databricks-gpt-5'
+    model_orchestrator_endpoint: ''
