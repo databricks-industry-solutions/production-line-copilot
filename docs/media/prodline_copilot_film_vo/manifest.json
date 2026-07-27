@@ -1,0 +1,85 @@
+{
+  "version": 8,
+  "persistKey": "prodline-copilot",
+  "voice": "en-US-JennyNeural",
+  "audioExt": "mp3",
+  "segments": [
+    {
+      "id": "01",
+      "start": 0.2,
+      "end": 9.4,
+      "text": "This is Maya, who runs Packaging Line Four: nineteen machines moving toward one shift target, with plenty that can change along the way.",
+      "audioDuration": 9.168
+    },
+    {
+      "id": "02",
+      "start": 9.5,
+      "end": 22.1,
+      "text": "Her real challenge isn't more data; it's that alarms, production, quality, and maintenance sit in different systems — so answers used to arrive in the next-morning report, long after the recovery call.",
+      "audioDuration": 12.528
+    },
+    {
+      "id": "03",
+      "start": 22.3,
+      "end": 35.6,
+      "text": "That is why her day starts in the control tower, where those systems come together on Databricks, in one governed live view — letting her follow the line as a whole instead of piecing the shift together screen by screen.",
+      "audioDuration": 12.936
+    },
+    {
+      "id": "04",
+      "start": 36.3,
+      "end": 48.8,
+      "text": "At eleven forty-seven, Filler Three stops and downstream machines begin to starve; each OEE point is worth about three hundred thousand euros a year, so Maya has minutes to make the recovery call.",
+      "audioDuration": 12.192
+    },
+    {
+      "id": "05",
+      "start": 50.2,
+      "end": 57.4,
+      "text": "Maya asks exactly that, in the same language she would use with her team: can we still hit the shift target?",
+      "audioDuration": 7.08
+    },
+    {
+      "id": "06",
+      "start": 57.8,
+      "end": 67.4,
+      "text": "The copilot reads the live line state, carries that context forward, and hands the problem to the right specialist from a whole roster built for the line.",
+      "audioDuration": 9.312
+    },
+    {
+      "id": "07",
+      "start": 67.7,
+      "end": 78.4,
+      "text": "Behind the scenes, it runs real solvers, testing the plan against a thousand scenarios of speed, overtime, and CIP timing — not just guessing.",
+      "audioDuration": 10.272
+    },
+    {
+      "id": "08",
+      "start": 78.6,
+      "end": 86.2,
+      "text": "The recommendation returns with assumptions, cost, and trade-offs in view, so Maya can review the plan \u2014 and approve it.",
+      "audioDuration": 8.16
+    },
+    {
+      "id": "08mcp",
+      "start": 86.2,
+      "end": 94.4,
+      "text": "On the roadmap, MCP connections carry approved work orders, holds, and schedule updates into the systems that own them.",
+      "audioDuration": 8.136
+    },
+    {
+      "id": "09",
+      "start": 94.4,
+      "end": 101.7,
+      "text": "As the filler comes back online, the control tower closes the loop, showing the line recover in real time.",
+      "audioDuration": 7.2
+    },
+    {
+      "id": "10",
+      "start": 102.3,
+      "end": 109.9,
+      "text": "That is ProdLine CoPilot: one connected picture, clearer options, and Maya still firmly in control.",
+      "audioDuration": 7.416
+    }
+  ]
+}
