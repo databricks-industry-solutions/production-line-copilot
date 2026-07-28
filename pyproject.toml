@@ -1,0 +1,74 @@
+[project]
+name = "productionline-copilot-agent-server"
+version = "0.2.1"
+description = "LangGraph agent server for ProdLine CoPilot — multi-specialist GenAI system for brewery packaging line operations"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.11"
+dependencies = [
+    "databricks-langchain>=0.14",
+    "databricks-agents>=1.9",
+    "databricks-sdk>=0.81.0",
+    "langgraph>=1.0",
+    "mlflow>=3.9",
+    "databricks-sql-connector>=4.2",
+    "databricks-zerobus-ingest-sdk>=1.0.0",
+    "databricks-vectorsearch<0.74",
+    "psycopg2-binary",
+    "ortools>=9.14",
+    "pandas>=2.3",
+    "pydantic>=2.0",
+    "python-dotenv>=1.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "pyspark",
+    "ruff",
+    "pyyaml",
+]
+# DQX augmentation for the streaming quality path. Optional because DQX
+# only runs when DQX_ENABLED=1 (see pipelines/dqx_augment.py); the base
+# streaming job continues to work with the hand-rolled QC_RULES alone.
+# Include this extra in the streaming-job cluster init only.
+dqx = [
+    "databricks-labs-dqx>=0.10",
+    "pyyaml",
+]
+
+[project.scripts]
+start-server = "agent_server.start_server:main"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+# E501 (line-length) is not a hard gate — long SQL/prompt/comment lines are
+# intentional and the pyflakes (F*) bug checks below are what actually matter.
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+# Databricks notebooks run with runtime-injected globals (dbutils/spark/display)
+# and use `# COMMAND ----------` cells, so imports legitimately appear mid-file.
+"notebooks/*" = ["F821", "E402"]
+# Producer entrypoints prepend sys.path before importing local packages.
+"src/streaming_sim/*" = ["E402"]
+# Tests import modules after env/patch setup.
+"tests/*" = ["E402"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "integration: opt-in tests that hit real Databricks / LLM endpoints. Skipped by default; run with `pytest -m integration` and the appropriate env vars set (e.g. RUN_EVAL_GATE=1).",
+]
+
+[tool.setuptools.packages.find]
+include = ["agent_server*", "src*"]
+
+[build-system]
+requires = ["setuptools>=75.0"]
+build-backend = "setuptools.build_meta"

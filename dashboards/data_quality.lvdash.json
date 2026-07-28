@@ -1,0 +1,425 @@
+{
+  "datasets": [
+    {
+      "name": "summary_kpis",
+      "displayName": "Summary KPIs (last 24h)",
+      "queryLines": [
+        "WITH bronze AS ( SELECT COUNT(*) AS cnt, MAX(ts) AS latest_ts FROM {{UC_CATALOG}}.{{UC_SCHEMA}}.machine_state_bronze WHERE ts >= dateadd(hour, -24, current_timestamp()) UNION ALL SELECT COUNT(*), MAX(ts) FROM {{UC_CATALOG}}.{{UC_SCHEMA}}.line_kpi_bronze WHERE ts >= dateadd(hour, -24, current_timestamp()) UNION ALL SELECT COUNT(*), MAX(timestamp_start) FROM {{UC_CATALOG}}.{{UC_SCHEMA}}.event_log_bronze WHERE timestamp_start >= dateadd(hour, -24, current_timestamp()) UNION ALL SELECT COUNT(*), MAX(ts) FROM {{UC_CATALOG}}.{{UC_SCHEMA}}.inventory_status_bronze WHERE ts >= dateadd(hour, -24, current_timestamp()) ), rejects AS ( SELECT COUNT(*) AS cnt FROM {{UC_CATALOG}}.{{UC_SCHEMA}}.quality_rejects WHERE rejected_at >= dateadd(hour, -24, current_timestamp()) ) SELECT CAST(SUM(b.cnt) AS BIGINT) AS bronze_rows_24h, CAST((SELECT cnt FROM rejects) AS BIGINT) AS dropped_rows_24h, CASE WHEN SUM(b.cnt) > 0 THEN CAST(SUM(b.cnt) - (SELECT cnt FROM rejects) AS DOUBLE) / SUM(b.cnt) ELSE 1.0 END AS pass_rate, MAX(b.latest_ts) AS latest_gold_ts FROM bronze b"
+      ]
+    },
+    {
+      "name": "table_health_24h",
+      "displayName": "Per-table health (last 24h)",
+      "queryLines": [
+        "WITH bronze AS ( SELECT 'machine_state' AS table_name, COUNT(*) AS cnt, MAX(ts) AS latest_ts FROM {{UC_CATALOG}}.{{UC_SCHEMA}}.machine_state_bronze WHERE ts >= dateadd(hour, -24, current_timestamp()) UNION ALL SELECT 'line_kpi', COUNT(*), MAX(ts) FROM {{UC_CATALOG}}.{{UC_SCHEMA}}.line_kpi_bronze WHERE ts >= dateadd(hour, -24, current_timestamp()) UNION ALL SELECT 'event_log', COUNT(*), MAX(timestamp_start) FROM {{UC_CATALOG}}.{{UC_SCHEMA}}.event_log_bronze WHERE timestamp_start >= dateadd(hour, -24, current_timestamp()) UNION ALL SELECT 'inventory_status', COUNT(*), MAX(ts) FROM {{UC_CATALOG}}.{{UC_SCHEMA}}.inventory_status_bronze WHERE ts >= dateadd(hour, -24, current_timestamp()) ), rejects AS ( SELECT bronze_table AS table_name, COUNT(*) AS cnt FROM {{UC_CATALOG}}.{{UC_SCHEMA}}.quality_rejects WHERE rejected_at >= dateadd(hour, -24, current_timestamp()) GROUP BY bronze_table ) SELECT b.table_name, CAST(b.cnt AS BIGINT) AS bronze_rows, CAST(coalesce(r.cnt, 0) AS BIGINT) AS dropped_rows, CASE WHEN b.cnt > 0 THEN CAST(b.cnt - coalesce(r.cnt, 0) AS DOUBLE) / b.cnt ELSE 1.0 END AS pass_rate, b.latest_ts, CAST((unix_timestamp(current_timestamp()) - unix_timestamp(b.latest_ts)) / 60.0 AS DOUBLE) AS lag_minutes FROM bronze b LEFT JOIN rejects r ON b.table_name = r.table_name ORDER BY b.table_name"
+      ]
+    },
+    {
+      "name": "hourly_throughput",
+      "displayName": "Hourly bronze-row throughput (machine_state, last 24h)",
+      "queryLines": [
+        "SELECT date_trunc('HOUR', ts) AS hour, CAST(COUNT(*) AS BIGINT) AS row_count FROM {{UC_CATALOG}}.{{UC_SCHEMA}}.machine_state_bronze WHERE ts >= dateadd(hour, -24, current_timestamp()) GROUP BY 1 ORDER BY 1"
+      ]
+    },
+    {
+      "name": "status_dist_5m",
+      "displayName": "Current status distribution (last 5 min)",
+      "queryLines": [
+        "WITH latest AS ( SELECT machine_id, status, ts, ROW_NUMBER() OVER (PARTITION BY machine_id ORDER BY ts DESC) AS rn FROM {{UC_CATALOG}}.{{UC_SCHEMA}}.machine_state_bronze WHERE ts >= dateadd(minute, -5, current_timestamp()) ) SELECT status, CAST(COUNT(DISTINCT machine_id) AS BIGINT) AS machines FROM latest WHERE rn = 1 GROUP BY status ORDER BY machines DESC"
+      ]
+    },
+    {
+      "name": "rejects_by_reason_24h",
+      "displayName": "Rejects by reason (last 24h)",
+      "queryLines": [
+        "SELECT bronze_table, rejected_reason, CAST(COUNT(*) AS BIGINT) AS rejected_rows FROM {{UC_CATALOG}}.{{UC_SCHEMA}}.quality_rejects WHERE rejected_at >= dateadd(hour, -24, current_timestamp()) GROUP BY bronze_table, rejected_reason ORDER BY rejected_rows DESC LIMIT 50"
+      ]
+    },
+    {
+      "name": "qc_failures_24h",
+      "displayName": "QC failures (last 24h)",
+      "queryLines": [
+        "SELECT timestamp AS ts, machine_id, parameter, value, spec_min, spec_max, result FROM {{UC_CATALOG}}.{{UC_SCHEMA}}.quality_checks WHERE result = 'FAIL' AND timestamp >= dateadd(hour, -24, current_timestamp()) ORDER BY timestamp DESC LIMIT 50"
+      ]
+    }
+  ],
+  "pages": [
+    {
+      "name": "overview",
+      "displayName": "Overview",
+      "pageType": "PAGE_TYPE_CANVAS",
+      "layout": [
+        {
+          "widget": {
+            "name": "title",
+            "multilineTextboxSpec": {
+              "lines": ["## Line Manager — Data Quality"]
+            }
+          },
+          "position": { "x": 0, "y": 0, "width": 6, "height": 1 }
+        },
+        {
+          "widget": {
+            "name": "subtitle",
+            "multilineTextboxSpec": {
+              "lines": [
+                "RTM-validated bronze ingest vs rejected rows from `quality_rejects`. Window: last 24 hours. All timestamps are UTC."
+              ]
+            }
+          },
+          "position": { "x": 0, "y": 1, "width": 6, "height": 1 }
+        },
+        {
+          "widget": {
+            "name": "kpi-pass-rate",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "summary_kpis",
+                  "fields": [{ "name": "pass_rate", "expression": "`pass_rate`" }],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "pass_rate",
+                  "displayName": "Quality-gate pass rate",
+                  "format": { "type": "number-percent", "decimalPlaces": { "type": "exact", "places": 1 } }
+                }
+              },
+              "frame": { "showTitle": true, "title": "Pass rate (24h)" }
+            }
+          },
+          "position": { "x": 0, "y": 2, "width": 2, "height": 3 }
+        },
+        {
+          "widget": {
+            "name": "kpi-dropped-rows",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "summary_kpis",
+                  "fields": [{ "name": "dropped_rows_24h", "expression": "`dropped_rows_24h`" }],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": { "fieldName": "dropped_rows_24h", "displayName": "Rows dropped" }
+              },
+              "frame": { "showTitle": true, "title": "Dropped rows (24h)" }
+            }
+          },
+          "position": { "x": 2, "y": 2, "width": 2, "height": 3 }
+        },
+        {
+          "widget": {
+            "name": "kpi-latest-ts",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "summary_kpis",
+                  "fields": [{ "name": "latest_gold_ts", "expression": "`latest_gold_ts`" }],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": { "fieldName": "latest_gold_ts", "displayName": "Latest bronze ts (UTC)" }
+              },
+              "frame": { "showTitle": true, "title": "Freshness (latest bronze ts, UTC)" }
+            }
+          },
+          "position": { "x": 4, "y": 2, "width": 2, "height": 3 }
+        },
+        {
+          "widget": {
+            "name": "section-throughput",
+            "multilineTextboxSpec": {
+              "lines": ["### Throughput & quality (last 24h)"]
+            }
+          },
+          "position": { "x": 0, "y": 5, "width": 6, "height": 1 }
+        },
+        {
+          "widget": {
+            "name": "bar-bronze-vs-rejected",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "table_health_24h",
+                  "fields": [
+                    { "name": "table_name", "expression": "`table_name`" },
+                    { "name": "bronze_rows", "expression": "`bronze_rows`" },
+                    { "name": "dropped_rows", "expression": "`dropped_rows`" }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": { "fieldName": "table_name", "scale": { "type": "categorical" }, "displayName": "Table" },
+                "y": {
+                  "scale": { "type": "quantitative" },
+                  "fields": [
+                    { "fieldName": "bronze_rows", "displayName": "Bronze (ingested)" },
+                    { "fieldName": "dropped_rows", "displayName": "Rejected (QC drop)" }
+                  ]
+                }
+              },
+              "mark": { "layout": "group" },
+              "frame": { "showTitle": true, "title": "Bronze vs Rejected by table (24h)" }
+            }
+          },
+          "position": { "x": 0, "y": 6, "width": 3, "height": 6 }
+        },
+        {
+          "widget": {
+            "name": "line-throughput-machine-state",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "hourly_throughput",
+                  "fields": [
+                    { "name": "hour", "expression": "`hour`" },
+                    { "name": "row_count", "expression": "`row_count`" }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "line",
+              "encodings": {
+                "x": { "fieldName": "hour", "scale": { "type": "temporal" }, "displayName": "Hour" },
+                "y": { "fieldName": "row_count", "scale": { "type": "quantitative" }, "displayName": "Bronze rows" }
+              },
+              "frame": { "showTitle": true, "title": "machine_state hourly throughput (24h)" }
+            }
+          },
+          "position": { "x": 3, "y": 6, "width": 3, "height": 6 }
+        },
+        {
+          "widget": {
+            "name": "section-table-health",
+            "multilineTextboxSpec": {
+              "lines": ["### Per-table health"]
+            }
+          },
+          "position": { "x": 0, "y": 12, "width": 6, "height": 1 }
+        },
+        {
+          "widget": {
+            "name": "table-health",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "table_health_24h",
+                  "fields": [
+                    { "name": "table_name", "expression": "`table_name`" },
+                    { "name": "bronze_rows", "expression": "`bronze_rows`" },
+                    { "name": "dropped_rows", "expression": "`dropped_rows`" },
+                    { "name": "pass_rate", "expression": "`pass_rate`" },
+                    { "name": "latest_ts", "expression": "`latest_ts`" },
+                    { "name": "lag_minutes", "expression": "`lag_minutes`" }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "table",
+              "encodings": {
+                "columns": [
+                  { "fieldName": "table_name", "displayName": "Table" },
+                  { "fieldName": "bronze_rows", "displayName": "Bronze" },
+                  { "fieldName": "dropped_rows", "displayName": "Dropped" },
+                  { "fieldName": "pass_rate", "displayName": "Pass rate" },
+                  { "fieldName": "latest_ts", "displayName": "Latest bronze ts (UTC)" },
+                  { "fieldName": "lag_minutes", "displayName": "Lag (min)" }
+                ]
+              },
+              "frame": { "showTitle": true, "title": "Per-table health (24h)" }
+            }
+          },
+          "position": { "x": 0, "y": 13, "width": 6, "height": 6 }
+        },
+        {
+          "widget": {
+            "name": "section-rejects-by-reason",
+            "multilineTextboxSpec": {
+              "lines": ["### Rejects by reason (last 24h)"]
+            }
+          },
+          "position": { "x": 0, "y": 19, "width": 6, "height": 1 }
+        },
+        {
+          "widget": {
+            "name": "table-rejects-by-reason",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "rejects_by_reason_24h",
+                  "fields": [
+                    { "name": "bronze_table", "expression": "`bronze_table`" },
+                    { "name": "rejected_reason", "expression": "`rejected_reason`" },
+                    { "name": "rejected_rows", "expression": "`rejected_rows`" }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "table",
+              "encodings": {
+                "columns": [
+                  { "fieldName": "bronze_table", "displayName": "Source table" },
+                  { "fieldName": "rejected_reason", "displayName": "Reason (failed rule)" },
+                  { "fieldName": "rejected_rows", "displayName": "Rows rejected" }
+                ]
+              },
+              "frame": { "showTitle": true, "title": "QC drops grouped by failing rule (24h)" }
+            }
+          },
+          "position": { "x": 0, "y": 20, "width": 6, "height": 6 }
+        },
+        {
+          "widget": {
+            "name": "section-status",
+            "multilineTextboxSpec": {
+              "lines": ["### Current line status (last 5 min)"]
+            }
+          },
+          "position": { "x": 0, "y": 26, "width": 6, "height": 1 }
+        },
+        {
+          "widget": {
+            "name": "pie-status",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "status_dist_5m",
+                  "fields": [
+                    { "name": "status", "expression": "`status`" },
+                    { "name": "machines", "expression": "`machines`" }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "pie",
+              "encodings": {
+                "angle": { "fieldName": "machines", "scale": { "type": "quantitative" }, "displayName": "Machines" },
+                "color": { "fieldName": "status", "scale": { "type": "categorical" }, "displayName": "Status" }
+              },
+              "frame": { "showTitle": true, "title": "Machines by status (last 5 min)" }
+            }
+          },
+          "position": { "x": 0, "y": 27, "width": 3, "height": 6 }
+        },
+        {
+          "widget": {
+            "name": "notes",
+            "multilineTextboxSpec": {
+              "lines": [
+                "**Pass rate** = (bronze rows − rejected rows) / bronze rows in the last 24h.\n\n**Rejected rows** are written to `quality_rejects` by the `streaming_quality_sync` RTM job when a row fails one of the QC predicates (e.g. `valid_status`, `valid_speed`, `non_negative_qty`).\n\n**Lag (min)** = `current_time − MAX(latest bronze ts)`. A growing lag indicates the producer or Zerobus is behind.\n\nSwitch to **QC failures** for the producer-emitted process QC results (`quality_checks` table)."
+              ]
+            }
+          },
+          "position": { "x": 3, "y": 27, "width": 3, "height": 6 }
+        }
+      ]
+    },
+    {
+      "name": "qc",
+      "displayName": "QC failures",
+      "pageType": "PAGE_TYPE_CANVAS",
+      "layout": [
+        {
+          "widget": {
+            "name": "qc-title",
+            "multilineTextboxSpec": {
+              "lines": ["## QC failures (last 24h)"]
+            }
+          },
+          "position": { "x": 0, "y": 0, "width": 6, "height": 1 }
+        },
+        {
+          "widget": {
+            "name": "qc-subtitle",
+            "multilineTextboxSpec": {
+              "lines": ["Inline quality-check failures from `quality_checks` (top 50)."]
+            }
+          },
+          "position": { "x": 0, "y": 1, "width": 6, "height": 1 }
+        },
+        {
+          "widget": {
+            "name": "qc-failures-table",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "qc_failures_24h",
+                  "fields": [
+                    { "name": "ts", "expression": "`ts`" },
+                    { "name": "machine_id", "expression": "`machine_id`" },
+                    { "name": "parameter", "expression": "`parameter`" },
+                    { "name": "value", "expression": "`value`" },
+                    { "name": "spec_min", "expression": "`spec_min`" },
+                    { "name": "spec_max", "expression": "`spec_max`" },
+                    { "name": "result", "expression": "`result`" }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "table",
+              "encodings": {
+                "columns": [
+                  { "fieldName": "ts", "displayName": "Timestamp (UTC)" },
+                  { "fieldName": "machine_id", "displayName": "Machine" },
+                  { "fieldName": "parameter", "displayName": "Parameter" },
+                  { "fieldName": "value", "displayName": "Value" },
+                  { "fieldName": "spec_min", "displayName": "Spec min" },
+                  { "fieldName": "spec_max", "displayName": "Spec max" },
+                  { "fieldName": "result", "displayName": "Result" }
+                ]
+              },
+              "frame": { "showTitle": true, "title": "QC failures (24h, top 50)" }
+            }
+          },
+          "position": { "x": 0, "y": 2, "width": 6, "height": 10 }
+        }
+      ]
+    }
+  ]
+}

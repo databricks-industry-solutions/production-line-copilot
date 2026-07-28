@@ -1,0 +1,155 @@
+bundle:
+  name: production-line-copilot
+
+# Keep documentation media (film HTML, voiceover audio, zips) out of the app
+# deploy bundle. The app's ``source_code_path: ./`` uploads the whole repo to
+# Workspace Files; large binaries under docs/media aren't app code and can break
+# the workspace upload. Excluding them shrinks the bundle and avoids upload errors.
+sync:
+  exclude:
+    - docs/media/**
+
+# Default UC targets. Per-deploy values come from config/project-settings.yaml
+# (copy to config/project-settings.local.yaml and edit); the generated
+# config/bundle-targets.yaml (gitignored) overrides these at deploy time.
+# Regenerate targets:  python scripts/sync_project_settings.py
+#
+# Two DISTINCT schemas are in play — don't conflate them:
+#   * schema      (default: line_manager_streaming) — the LIVE runtime schema
+#     where the pipeline writes bronze/gold streaming tables. This is what the
+#     app reads.
+#   * src_schema  (default: line_manager_ai_kit)    — an OPTIONAL *source* schema
+#     the setup job copies seed dimension tables FROM. Leave src_catalog/
+#     src_schema empty to generate synthetic seed data in-process instead of
+#     copying (the self-contained path most forkers want).
+variables:
+  sql_warehouse_id:
+    description: SQL Warehouse ID
+  app_name:
+    description: Databricks App name
+    default: production-line-copilot
+  catalog:
+    description: Unity Catalog — live streaming tables (bronze/gold)
+    default: main
+  schema:
+    description: Live runtime UC schema for streaming tables (bronze/gold) the app reads
+    default: line_manager_streaming
+  src_catalog:
+    description: Optional UC catalog to copy seed dimension tables FROM (empty = generate in-process)
+    default: main
+  src_schema:
+    description: Optional UC schema to copy seed dimension tables FROM (empty = generate in-process)
+    default: line_manager_ai_kit
+  genie_space_id:
+    description: Genie Space ID for natural language data querying
+    default: ''
+  lakebase_catalog:
+    description: Lakebase catalog name (for Synced Tables)
+    default: ''
+  lakebase_schema:
+    description: Lakebase schema name (for Synced Tables)
+    default: 'public'
+  zerobus_server_endpoint:
+    description: Zerobus server endpoint URL for ingest (non-secret)
+    default: 'SET_ME'
+  producer_client_id:
+    description: Service principal client id for Zerobus ingest (non-secret)
+    default: 'SET_ME'
+  app_client_id:
+    description: App service principal client id — gets USE CATALOG/SCHEMA + UC scenario_commands MODIFY
+    default: 'SET_ME'
+  producer_client_secret_ref:
+    description: 'Secret reference for Zerobus client secret (example: {{secrets/scope/key}})'
+    default: '{{secrets/line-manager/zerobus-client-secret}}'
+  # ── Lakebase Syncer wiring (gold → ai_serving Postgres) ──
+  lakebase_pg_host:
+    description: Lakebase Postgres host (PGHOST)
+    default: ''
+  lakebase_pg_user:
+    description: Lakebase Postgres user for the APP — typically the app SP client id (PGUSER)
+    default: ''
+  lakebase_syncer_pg_user:
+    description: Lakebase Postgres user for the SYNCER job — defaults to the deploying user's email
+    default: ''
+  lakebase_pg_database:
+    description: Lakebase Postgres database name (PGDATABASE)
+    default: 'databricks_postgres'
+  lakebase_endpoint:
+    description: Lakebase Autoscale OAuth endpoint (LAKEBASE_ENDPOINT)
+    default: ''
+  lakebase_checkpoint_volume:
+    description: UC Volume path for Spark checkpoints (e.g. /Volumes/main/line_manager_streaming/_checkpoints)
+    default: ''
+  mlflow_experiment_path:
+    description: MLflow experiment path. One per env (dev/prod) so traces don't intermix.
+    default: /Shared/production-line-copilot-experiment
+  sim_shift_id:
+    description: |
+      Shift ID written by the producer + read by the App. Per-environment
+      so dev's rows can't appear in prod's SSE cursor scan, since the
+      Lakebase ai_serving.* namespace is shared across envs.
+    default: shift_1
+  remove_after:
+    description: |
+      Optional "RemoveAfter" cleanup tag value (YYYYMMDD). Empty string
+      disables the tag. Set this only if your workspace enforces a retention
+      policy that auto-deletes untagged resources; otherwise leave it empty.
+    default: ''
+
+resources:
+  experiments:
+    production-line-copilot-experiment:
+      # Per-target via var.mlflow_experiment_path — prod and dev use separate
+      # experiment paths so dev runs don't pollute prod's observability. The
+      # resource key on the line above is a bundle-internal identifier (not
+      # user-facing); the actual experiment name comes from the variable.
+      name: ${var.mlflow_experiment_path}
+
+  dashboards:
+    # Data quality dashboard — embedded in the app under the "Data Quality" tab.
+    # The committed ./dashboards/data_quality.lvdash.json is a TEMPLATE using
+    # {{UC_CATALOG}}/{{UC_SCHEMA}} tokens; scripts/deploy.sh renders them to this
+    # target's catalog/schema before `bundle deploy` (and restores the template
+    # afterward). A raw `databricks bundle deploy` (without deploy.sh) would ship
+    # the unrendered tokens, so widgets would show "table not found" — use
+    # deploy.sh. Redeploy after editing the template.
+    line_manager_data_quality:
+      display_name: '${var.app_name} — Data Quality'
+      file_path: ./dashboards/data_quality.lvdash.json
+      warehouse_id: ${var.sql_warehouse_id}
+      # Publish with the deploy identity's credentials so the app's embedded
+      # iframe renders widgets for viewers (otherwise every widget shows
+      # "Unable to render visualization."). This makes a plain
+      # `databricks bundle deploy` self-sufficient for the embed — no
+      # post-deploy publish step required. The App SP CAN_READ grant it needs
+      # to *resolve* the dashboard (/ops/dashboard-info) is added per-target in
+      # config/bundle-targets.yaml once the App SP client id is known (see
+      # scripts/sync_project_settings.py :: _data_quality_dashboard_permissions_block).
+      embed_credentials: true
+
+  apps:
+    app:
+      name: ${var.app_name}
+      description: 'A Databricks App powered by AppKit'
+      source_code_path: ./
+
+      resources:
+        - name: sql-warehouse
+          sql_warehouse:
+            id: ${var.sql_warehouse_id}
+            permission: CAN_USE
+        - name: experiment
+          experiment:
+            experiment_id: ${resources.experiments.production-line-copilot-experiment.id}
+            permission: CAN_EDIT
+
+include:
+  # Committed, non-sensitive example target so `databricks bundle validate
+  # --target example` works on a fresh clone (see the file header). Safe to
+  # keep alongside your real, generated targets.
+  - ./config/bundle-targets.example.yaml
+  # Real per-deploy targets, generated by scripts/sync_project_settings.py and
+  # gitignored. The character-class glob (.[y]aml) matches only
+  # bundle-targets.yaml but, being a glob, tolerates its absence on a fresh
+  # clone (a literal path would error with "does not match any files").
+  - ./config/bundle-targets.[y]aml

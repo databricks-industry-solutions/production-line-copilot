@@ -1,0 +1,83 @@
+# DQX (Databricks Labs Data Quality eXtended) rule definitions for the
+# streaming_quality_sync job. Loaded by ``pipelines.dqx_augment.load_checks``
+# and applied via ``DQEngine.apply_checks_by_metadata`` in WARNING mode so
+# rows are flagged but not dropped (the existing hand-rolled ``QC_RULES``
+# in streaming_quality_sync.py continues to own the drop decision).
+#
+# Coverage split, deliberate:
+#   * Null / enum / range / non-negative on primary keys → QC_RULES
+#     (already implemented; well-covered by SQL predicates).
+#   * Freshness (row is older than SLA) → DQX (built-in ``is_older_than_n_seconds``)
+#   * Cross-table referential → DQX (built-in ``foreign_key``), reserved
+#     for after step 3 lands the Industry Data Model silver layer with
+#     ``equipment_register``. Do not enable until then — foreign_key against
+#     a nonexistent table just no-ops with a WARN log.
+#   * Non-negative throughput → DQX (missing from QC_RULES today for
+#     line_kpi.throughput_per_min).
+#
+# Naming: ``<table>__<check>`` so the DQ dashboard can group by prefix.
+
+checks:
+  # machine_state — freshness
+  # Bronze row's ts (event time) must be within 60 s of processing time.
+  # Rows older than 60 s indicate producer lag, Zerobus backup, or a stalled
+  # driver. Threshold matches the "Live · waiting for new value" gap the SSE
+  # cursor treats as user-visible latency.
+  - criticality: warn
+    check:
+      function: is_not_null_and_not_empty
+      arguments:
+        column: ts
+    name: machine_state__ts_present
+    filter: 'true'
+
+  - criticality: warn
+    check:
+      function: is_older_than_n_seconds
+      arguments:
+        column: ts
+        seconds: 60
+    name: machine_state__stale_60s
+    filter: 'true'
+
+  # line_kpi — throughput must be non-negative
+  # QC_RULES covers this for inventory (``on_hand_qty >= 0``) but not for
+  # KPIs. A negative throughput_per_min points at a producer bug we want
+  # to catch in dev before it lands in gold_history.
+  - criticality: warn
+    check:
+      function: is_not_less_than
+      arguments:
+        column: throughput_per_min
+        limit: 0
+    name: line_kpi__throughput_non_negative
+    filter: 'true'
+
+  # line_kpi — oee_pct plausible range (0..1)
+  # We ship oee_pct as a fraction (0..1) but a subtle producer bug could
+  # emit percent-values (0..100) and downstream aggregations would silently
+  # produce nonsense. Belt-and-suspenders on top of the producer schema.
+  - criticality: warn
+    check:
+      function: is_in_range
+      arguments:
+        column: oee_pct
+        min_limit: 0
+        max_limit: 1
+    name: line_kpi__oee_in_unit_range
+    filter: 'true'
+
+  # ── Reserved for step 3 (Industry Data Model silver layer) ────────
+  # Uncomment after ``line_manager_silver_mvm.asset.equipment_register`` is
+  # installed and the silver mapper is populating machine_id from that table.
+  # Until then DQX would log a WARN and skip the check.
+  #
+  # - criticality: warn
+  #   check:
+  #     function: foreign_key
+  #     arguments:
+  #       columns: [machine_id]
+  #       ref_columns: [machine_id]
+  #       ref_table: line_manager_silver_mvm.asset.equipment_register
+  #   name: machine_state__machine_id_referential
+  #   filter: "true"
