@@ -1,0 +1,19 @@
+{
+  // Emit build for the Node server bundle (dist/server/server.js).
+  //
+  // AppKit 0.48's `generate-types` (run by the postinstall `typegen`) rewrites
+  // tsconfig.server.json into noEmit mode, which it uses for typecheck/typegen.
+  // Our production start path (scripts/start-app.sh -> build:server -> `npm start`
+  // -> node dist/server/server.js) needs real JS emit, so we keep emit settings
+  // in this dedicated config that typegen never rewrites.
+  "extends": "./tsconfig.server.json",
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.server.build.tsbuildinfo",
+    "noEmit": false,
+    "outDir": "./dist",
+    "rootDir": "./",
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true
+  }
+}

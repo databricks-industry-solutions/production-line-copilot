@@ -1,0 +1,43 @@
+# Committed, NON-SENSITIVE example bundle target.
+#
+# Purpose: let `databricks bundle validate --target example` succeed on a fresh
+# clone, before you have filled config/project-settings.local.yaml and run
+# scripts/deploy.sh (which generates the real, gitignored config/bundle-targets.yaml).
+#
+# All values below are placeholders. Do NOT deploy this target as-is — it points
+# at a non-existent workspace. To deploy for real:
+#   1. cp config/project-settings.yaml config/project-settings.local.yaml
+#   2. fill in your workspace values
+#   3. ./scripts/deploy.sh dev   (regenerates config/bundle-targets.yaml)
+#
+# This file is safe to keep alongside the generated targets; the `example`
+# target name never collides with line_manager_dev / line_manager_prod.
+#
+# Validate it against your own workspace with your CLI profile (the target
+# intentionally does NOT hardcode a host, so it inherits the profile/env host):
+#   databricks bundle validate --target example --profile <your-profile>
+targets:
+  example:
+    variables:
+      sql_warehouse_id: "0000000000000000"
+      app_name: "production-line-copilot-example"
+      catalog: "main"
+      schema: "line_manager_streaming"
+      src_catalog: ""
+      src_schema: ""
+      lakebase_catalog: "__SKIP__"
+      lakebase_schema: "public"
+      genie_space_id: ""
+      zerobus_server_endpoint: "https://example.zerobus.cloud.databricks.com"
+      producer_client_id: "00000000-0000-0000-0000-000000000000"
+      producer_client_secret_ref: "{{secrets/line-manager/zerobus-client-secret}}"
+      app_client_id: "00000000-0000-0000-0000-000000000000"
+      lakebase_pg_host: "example.database.cloud.databricks.com"
+      lakebase_pg_user: "00000000-0000-0000-0000-000000000000"
+      lakebase_syncer_pg_user: "you@example.com"
+      lakebase_pg_database: "databricks_postgres"
+      lakebase_endpoint: "projects/example/branches/production/endpoints/primary"
+      lakebase_checkpoint_volume: "/Volumes/main/line_manager_streaming/_checkpoints"
+      mlflow_experiment_path: "/Shared/production-line-copilot-experiment-example"
+      sim_shift_id: "shift_1"
+      remove_after: ""

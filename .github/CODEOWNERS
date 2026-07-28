@@ -1,0 +1,4 @@
+# Code owners for ProdLine CoPilot. These owners are requested for review on
+# every pull request. Ownership by verified email; if GitHub cannot resolve it,
+# replace with a @handle or a @databricks-industry-solutions/<team> group.
+* mohammad.khelghati@databricks.com
