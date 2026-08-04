@@ -368,6 +368,36 @@ def _unit_to_bytes(unit: str, qty: float) -> float:
     return 0.0
 
 
+# Ordered (category, keywords) rules for bucketing a system.billing.usage row.
+# First rule whose keyword appears in "<billing_origin_product> <sku_name>" wins.
+#
+# Both the SQL `CASE` used by the components rollup and the Python classifier
+# used by the verification panel are generated from this one table. They used
+# to be written out by hand in two places and had drifted: the SQL checked only
+# some field/keyword pairs (`sku_name` for MODEL but not `billing_origin_product`,
+# `billing_origin_product` for SQL but not `sku_name`), so a
+# FOUNDATION_MODEL_TRAINING row was priced as "Other" at $0.55/DBU in the
+# components table and as "Model Serving" at $0.07/DBU in the verification
+# figure directly beneath it — a 7.9x disagreement between two numbers on the
+# same screen. Generating both from one list makes that class of drift
+# impossible rather than merely fixed.
+_USAGE_CATEGORY_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("Zerobus", ("ZEROBUS",)),
+    ("Lakebase", ("LAKEBASE",)),
+    ("Pipelines", ("LAKEFLOW", "PIPELINE", "DLT")),
+    ("Model Serving", ("SERVING", "FOUNDATION", "LLM", "MODEL")),
+    ("SQL Warehouse", ("SQL", "WAREHOUSE")),
+    ("Jobs", ("JOBS",)),
+    ("Apps", ("APP",)),
+)
+_UNCATEGORISED = "Other"
+
+# The same "<origin> <sku>" haystack the Python classifier builds, in SQL.
+_USAGE_TEXT_SQL = (
+    "upper(concat_ws(' ', coalesce(billing_origin_product, ''), coalesce(sku_name, '')))"
+)
+
+
 def _usage_category(origin: str, sku: str) -> str:
     """Bucket a system.billing.usage row into one of the dashboard cost categories.
 
@@ -376,21 +406,26 @@ def _usage_category(origin: str, sku: str) -> str:
     exact SKU codes.
     """
     text = f"{origin} {sku}".upper()
-    if "ZEROBUS" in text:
-        return "Zerobus"
-    if "LAKEBASE" in text:
-        return "Lakebase"
-    if "PIPELINE" in text or "DLT" in text or "LAKEFLOW" in text:
-        return "Pipelines"
-    if "SERVING" in text or "FOUNDATION" in text or " LLM" in text or "MODEL" in text:
-        return "Model Serving"
-    if "SQL" in text or "WAREHOUSE" in text:
-        return "SQL Warehouse"
-    if "JOBS" in text:
-        return "Jobs"
-    if "APP" in text:
-        return "Apps"
-    return "Other"
+    for category, keywords in _USAGE_CATEGORY_RULES:
+        if any(keyword in text for keyword in keywords):
+            return category
+    return _UNCATEGORISED
+
+
+def _usage_category_sql() -> str:
+    """The `CASE` expression equivalent of :func:`_usage_category`.
+
+    Kept generated rather than hand-written so the two classifications cannot
+    disagree; ``test_usage_category_sql_matches_python`` pins them together.
+    """
+    branches = "".join(
+        " WHEN {} THEN '{}'".format(
+            " OR ".join(f"{_USAGE_TEXT_SQL} LIKE '%{kw}%'" for kw in keywords),
+            category,
+        )
+        for category, keywords in _USAGE_CATEGORY_RULES
+    )
+    return f"CASE{branches} ELSE '{_UNCATEGORISED}' END"
 
 
 _DBU_USD_RATES = {
@@ -669,13 +704,237 @@ _BYTES_UNIT_SQL = (
 )
 
 
+_WORKSPACE_ID_CACHE: dict[str, Any] = {}
+
+
+def _resolve_workspace_id() -> str | None:
+    """The workspace whose billing this app should report, or None if unknown.
+
+    ``DATABRICKS_WORKSPACE_ID`` was read here from the start but is set by
+    nothing — not app.yaml, not the bundle, not render_app_yaml.py. An unset
+    value silently widened every billing query from "this workspace" to "every
+    workspace in the account", so the cost panel in a shared demo account was
+    reporting other teams' jobs as though they were the app's. Asking the SDK
+    is the fix: the app already authenticates against exactly the workspace it
+    is deployed in, so the answer is always available and always right. The env
+    var still wins when set, which keeps a manual override for anyone pointing
+    a local dev server at a different workspace.
+    """
+    env_value = (os.environ.get("DATABRICKS_WORKSPACE_ID", "") or "").strip()
+    if env_value.isdigit():
+        return env_value
+    if "id" in _WORKSPACE_ID_CACHE:
+        return _WORKSPACE_ID_CACHE["id"]
+    resolved: str | None = None
+    try:
+        from agent_server.tools.workspace_client import app_workspace_client
+
+        candidate = str(app_workspace_client().get_workspace_id()).strip()
+        resolved = candidate if candidate.isdigit() else None
+    except Exception as e:  # noqa: BLE001 - falls back to account-wide, which we label
+        logger.warning("Could not resolve workspace id for cost scoping: %s", str(e)[:200])
+    _WORKSPACE_ID_CACHE["id"] = resolved
+    return resolved
+
+
+_APP_IDENTITY_CACHE: dict[str, Any] = {}
+
+
+def _resolve_app_identity() -> tuple[str | None, str | None]:
+    """``(principal_id, principal_name)`` of the identity the app runs SQL as.
+
+    Warehouse queries go out as the app service principal (see
+    ``tools/sql_query.py``), and ``system.query.history`` records that in
+    ``executed_as_user_id`` / ``executed_as``. Matching on the id is the
+    reliable half — the name is an application UUID for a service principal
+    and a display name for a user, so both are checked.
+    """
+    if "id" in _APP_IDENTITY_CACHE:
+        return _APP_IDENTITY_CACHE["id"], _APP_IDENTITY_CACHE["name"]
+    principal_id: str | None = None
+    principal_name: str | None = None
+    try:
+        from agent_server.tools.workspace_client import app_workspace_client
+
+        me = app_workspace_client().current_user.me()
+        principal_id = str(getattr(me, "id", "") or "").strip() or None
+        principal_name = str(getattr(me, "user_name", "") or "").strip() or None
+    except Exception as e:  # noqa: BLE001 - attribution degrades, panel still renders
+        logger.warning("Could not resolve app identity for query attribution: %s", str(e)[:200])
+    _APP_IDENTITY_CACHE["id"] = principal_id
+    _APP_IDENTITY_CACHE["name"] = principal_name
+    return principal_id, principal_name
+
+
+def _sql_literal(value: str) -> str:
+    """Single-quote a value for inline SQL. Inputs here are ids from the SDK
+    and the environment rather than request data, but these strings are
+    interpolated into a query, so quoting is not optional."""
+    return "'" + str(value).replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+_WH_SHARE_CACHE: dict[str, Any] = {}
+_WH_SHARE_LOCK = threading.Lock()
+# `system.query.history` holds account-wide records for the whole region and
+# offers nothing to prune a warehouse_id filter against, so this aggregate costs
+# ~17s of warehouse time — measured, not guessed. Recomputing it on every panel
+# refresh would have made the Cost tab the app's single largest warehouse
+# consumer, and worse, a self-fulfilling one: the panel's own queries run as the
+# app service principal, so each load would inflate the very share it reports.
+# The window is 24h and the source table has ingestion lag of its own, so a
+# result minutes old is no less true than a fresh one.
+_WH_SHARE_TTL_S = 600.0
+
+
+def _warehouse_query_share(_sql: Any, warehouse_id: str, window_h: int,
+                           warehouse_dbu: float | None) -> dict[str, Any] | None:
+    """Split a shared warehouse's cost between this app and everything else.
+
+    A SQL warehouse bills for uptime, not for queries, so query history cannot
+    measure what the app spent — it can only measure the app's share of the
+    work the warehouse did. This apportions the warehouse's DBU by that share,
+    which spreads idle time across tenants in proportion to their usage and
+    makes every tenant's share sum back to the actual bill. That is a
+    convention, not a measurement, and the payload says so.
+
+    Returns None when the warehouse isn't known or query history can't be read;
+    the caller treats that as "no attribution available" rather than as zero.
+    """
+    if not warehouse_id:
+        return None
+
+    # Keyed on the window too: the same warehouse over 6h and over 24h are
+    # different questions with different answers.
+    cache_key = f"{warehouse_id}|{window_h}"
+    now = time.time()
+    with _WH_SHARE_LOCK:
+        hit = _WH_SHARE_CACHE.get(cache_key)
+        if hit and (now - hit["at"]) < _WH_SHARE_TTL_S:
+            # DBU comes from the caller's fresh billing read, so only the query
+            # split is reused; the apportioned figures are recomputed from it.
+            return _apportion(hit["split"], warehouse_dbu, age_s=round(now - hit["at"], 1))
+
+    principal_id, principal_name = _resolve_app_identity()
+    identity_clauses = []
+    if principal_id:
+        identity_clauses.append(f"executed_as_user_id = {_sql_literal(principal_id)}")
+    if principal_name:
+        identity_clauses.append(f"executed_as = {_sql_literal(principal_name)}")
+
+    from agent_server.tools.sql_query import APP_QUERY_TAG_KEY, APP_QUERY_TAG_VALUE
+
+    tag_clause = (
+        f"element_at(query_tags, {_sql_literal(APP_QUERY_TAG_KEY)}) = {_sql_literal(APP_QUERY_TAG_VALUE)}"
+    )
+
+    def _run(app_predicate: str) -> Any:
+        return _sql.invoke(
+            f"""
+            SELECT
+              CASE WHEN {app_predicate} THEN 'app' ELSE 'other' END AS attribution,
+              count(*) AS statements,
+              coalesce(sum(total_duration_ms), 0) AS duration_ms,
+              coalesce(sum(CASE WHEN query_source.genie_space_id IS NOT NULL
+                                THEN total_duration_ms ELSE 0 END), 0) AS genie_duration_ms
+            FROM system.query.history
+            WHERE compute.warehouse_id = {_sql_literal(warehouse_id)}
+              AND start_time >= current_timestamp() - INTERVAL {window_h} HOURS
+            GROUP BY 1
+            """
+        )
+
+    def _failed(result: Any) -> bool:
+        return not isinstance(result, list) or (
+            bool(result) and isinstance(result[0], dict) and "error" in result[0]
+        )
+
+    # `query_tags` is Public Preview and absent on older metastores, where
+    # referencing it fails the whole statement — so the tag is an upgrade on
+    # identity matching, never a dependency.
+    attribution_key = "identity+tag"
+    rows = _run(" OR ".join([*identity_clauses, tag_clause]))
+    if _failed(rows) and identity_clauses:
+        attribution_key = "identity"
+        rows = _run(" OR ".join(identity_clauses))
+    if _failed(rows):
+        detail = rows[0].get("error") if isinstance(rows, list) and rows else "unknown error"
+        return {"available": False, "warehouse_id": warehouse_id,
+                "note": f"Could not read system.query.history: {str(detail)[:160]}"}
+
+    buckets = {"app": {"statements": 0, "duration_ms": 0.0, "genie_duration_ms": 0.0},
+               "other": {"statements": 0, "duration_ms": 0.0, "genie_duration_ms": 0.0}}
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        bucket = buckets.get(str(r.get("attribution")))
+        if bucket is None:
+            continue
+        bucket["statements"] = int(_safe_num(r.get("statements")))
+        bucket["duration_ms"] = _safe_num(r.get("duration_ms"))
+        bucket["genie_duration_ms"] = _safe_num(r.get("genie_duration_ms"))
+
+    split = {"warehouse_id": warehouse_id, "attribution_key": attribution_key, **buckets}
+    with _WH_SHARE_LOCK:
+        _WH_SHARE_CACHE[cache_key] = {"at": time.time(), "split": split}
+    return _apportion(split, warehouse_dbu, age_s=0.0)
+
+
+def _apportion(split: dict[str, Any], warehouse_dbu: float | None, age_s: float) -> dict[str, Any]:
+    """Turn a cached app/other query-time split into apportioned DBU and USD."""
+    app, other = split["app"], split["other"]
+    total_ms = app["duration_ms"] + other["duration_ms"]
+    # No queries at all means the warehouse was idle for the whole window. Its
+    # DBU is then genuinely unattributable, and 0/0 must not become "100% app".
+    share = (app["duration_ms"] / total_ms) if total_ms > 0 else None
+    app_dbu = round((warehouse_dbu or 0.0) * share, 3) if (share is not None and warehouse_dbu) else None
+
+    return {
+        "available": True,
+        "warehouse_id": split["warehouse_id"],
+        "attribution_key": split["attribution_key"],
+        "app_statements": app["statements"],
+        "other_statements": other["statements"],
+        "app_duration_ms": round(app["duration_ms"], 1),
+        "other_duration_ms": round(other["duration_ms"], 1),
+        "app_genie_duration_ms": round(app["genie_duration_ms"], 1),
+        "app_share": round(share, 4) if share is not None else None,
+        "warehouse_dbu": warehouse_dbu,
+        "app_dbu": app_dbu,
+        "app_estimated_usd": _estimate_usd("SQL Warehouse", app_dbu) if app_dbu is not None else None,
+        "split_age_seconds": age_s,
+        "note": (
+            "Warehouses bill for uptime, so this apportions the warehouse's DBU by each "
+            "tenant's share of query time (total_duration_ms). Idle time is spread across "
+            "tenants in proportion to their usage rather than measured per tenant."
+        ),
+    }
+
+
 @app.get("/ops/cost-summary")
 async def ops_cost_summary(hours: int = 24, include_details: bool = False):
+    """Offload the rollup to a worker thread.
+
+    The body below is half a dozen sequential warehouse round trips and nothing
+    else — no `await` anywhere in it. Declared `async def` and called directly,
+    it ran that blocking work *on the event loop*, so for as long as it took,
+    the process served nothing else: every other request queued and the
+    `/serving/stream` SSE ticks stopped dead. Measured against dev, a cold call
+    froze the live stream for 44.9s, versus its normal 1.04s tick.
+
+    Every other handler here already offloads (`asyncio.to_thread`) for exactly
+    this reason — see the note above `ops_lakebase_state`.
+    """
+    return await asyncio.to_thread(_cost_summary_payload, hours, include_details)
+
+
+def _cost_summary_payload(hours: int = 24, include_details: bool = False):
     """Return cost/usage rollups from system.billing.usage with $ estimates and freshness.
 
     Always returns: totals, components (DBU + USD), app_attribution, zerobus, data_processed,
     pricing rates, scope, freshness. With include_details=true also returns trend +
     matched/unmatched detail with top unmatched rows.
+
+    Blocking — call it through a thread, never straight from the event loop.
     """
     window_h = max(1, min(hours, 24 * 14))
     try:
@@ -683,14 +942,23 @@ async def ops_cost_summary(hours: int = 24, include_details: bool = False):
     except Exception as e:
         return JSONResponse({"error": f"SQL tool unavailable: {str(e)[:120]}"}, status_code=500)
 
-    workspace_id_env = (os.environ.get("DATABRICKS_WORKSPACE_ID", "") or "").strip()
-    workspace_filter = f" AND workspace_id = {workspace_id_env}" if workspace_id_env.isdigit() else ""
+    workspace_id = _resolve_workspace_id()
+    workspace_filter = f" AND workspace_id = {workspace_id}" if workspace_id else ""
     warehouse_id = (os.environ.get("DATABRICKS_WAREHOUSE_ID", "") or "").strip()
     producer_job_id = (os.environ.get("OPS_PRODUCER_JOB_ID", "") or "").strip()
     setup_job_id = (os.environ.get("OPS_SETUP_JOB_ID", "") or "").strip()
     zerobus_enabled = _truthy(os.environ.get("ZEROBUS_INGEST_ENABLED"))
     pipeline_mode = "zerobus" if zerobus_enabled else "no-zerobus"
-    base_where = f"usage_start_time >= current_timestamp() - INTERVAL {window_h} HOURS {workspace_filter}"
+    # `usage_date` is the partition column; `usage_start_time` is not. Filtering
+    # on the timestamp alone made every one of the six-to-eight queries behind a
+    # single panel load scan the account's entire billing history. The date
+    # predicate is a deliberate superset of the timestamp window (floor to the
+    # UTC day) so it prunes without changing which rows survive.
+    base_where = (
+        f"usage_date >= to_date(current_timestamp() - INTERVAL {window_h} HOURS)"
+        f" AND usage_start_time >= current_timestamp() - INTERVAL {window_h} HOURS"
+        f"{workspace_filter}"
+    )
 
     summary_rows = _sql.invoke(
         f"""
@@ -726,6 +994,7 @@ async def ops_cost_summary(hours: int = 24, include_details: bool = False):
                 "total_app_dbu": 0.0,
                 "total_app_estimated_usd": 0.0,
             },
+            "warehouse_share": None,
             "zerobus": {
                 "enabled": zerobus_enabled,
                 "ingested_bytes": 0,
@@ -739,8 +1008,8 @@ async def ops_cost_summary(hours: int = 24, include_details: bool = False):
             "data_processed": {"records": 0, "bytes": 0, "bytes_human": "0 B"},
             "pricing": {"rates_usd_per_dbu": _DBU_USD_RATES, "note": "USD estimates are list-price approximations and vary by SKU and discount."},
             "scope": {
-                "workspace_id_filter": workspace_id_env if workspace_id_env.isdigit() else None,
-                "attribution_mode": "workspace-scoped" if workspace_id_env.isdigit() else "workspace-wide",
+                "workspace_id_filter": workspace_id,
+                "attribution_mode": "workspace-scoped" if workspace_id else "account-wide",
                 "app_resources": {
                     "warehouse_id": warehouse_id or None,
                     "producer_job_id": producer_job_id or None,
@@ -764,6 +1033,12 @@ async def ops_cost_summary(hours: int = 24, include_details: bool = False):
         try:
             from datetime import datetime as _dt
             parsed = _dt.fromisoformat(latest_ts_str.replace("Z", "+00:00"))
+            # A Spark TIMESTAMP renders without an offset, and `.astimezone()`
+            # reads a naive datetime as *local* time. The warehouse returns UTC,
+            # so on a UTC+2 machine every billing row looked two hours older
+            # than it was and the ">6h stale" warning fired two hours early.
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
             lag_seconds = max(0.0, (datetime.now(timezone.utc) - parsed.astimezone(timezone.utc)).total_seconds())
             lag_hours = round(lag_seconds / 3600.0, 2)
         except Exception:
@@ -772,16 +1047,7 @@ async def ops_cost_summary(hours: int = 24, include_details: bool = False):
     components_rows = _sql.invoke(
         f"""
         SELECT
-          CASE
-            WHEN upper(coalesce(billing_origin_product, '')) LIKE '%ZEROBUS%' OR upper(coalesce(sku_name, '')) LIKE '%ZEROBUS%' THEN 'Zerobus'
-            WHEN upper(coalesce(billing_origin_product, '')) LIKE '%LAKEBASE%' OR upper(coalesce(sku_name, '')) LIKE '%LAKEBASE%' THEN 'Lakebase'
-            WHEN upper(coalesce(billing_origin_product, '')) LIKE '%LAKEFLOW%' OR upper(coalesce(billing_origin_product, '')) LIKE '%PIPELINE%' OR upper(coalesce(billing_origin_product, '')) LIKE '%DLT%' OR upper(coalesce(sku_name, '')) LIKE '%LAKEFLOW%' OR upper(coalesce(sku_name, '')) LIKE '%DLT%' THEN 'Pipelines'
-            WHEN upper(coalesce(billing_origin_product, '')) LIKE '%SERVING%' OR upper(coalesce(sku_name, '')) LIKE '%MODEL%' OR upper(coalesce(sku_name, '')) LIKE '%FOUNDATION%' OR upper(coalesce(sku_name, '')) LIKE '%LLM%' THEN 'Model Serving'
-            WHEN upper(coalesce(billing_origin_product, '')) LIKE '%SQL%' OR upper(coalesce(sku_name, '')) LIKE '%WAREHOUSE%' THEN 'SQL Warehouse'
-            WHEN upper(coalesce(billing_origin_product, '')) LIKE '%JOBS%' OR upper(coalesce(sku_name, '')) LIKE '%JOBS%' THEN 'Jobs'
-            WHEN upper(coalesce(billing_origin_product, '')) LIKE '%APP%' OR upper(coalesce(sku_name, '')) LIKE '%APP%' THEN 'Apps'
-            ELSE 'Other'
-          END AS component,
+          {_usage_category_sql()} AS component,
           sum(usage_quantity) AS dbu,
           count(*) AS records
         FROM system.billing.usage
@@ -857,6 +1123,10 @@ async def ops_cost_summary(hours: int = 24, include_details: bool = False):
     sql_usd = _estimate_usd("SQL Warehouse", warehouse_dbu or 0.0)
     jobs_usd = _estimate_usd("Jobs", (producer_job_dbu or 0.0) + (setup_job_dbu or 0.0))
     total_app_usd = round(sql_usd + jobs_usd, 4)
+    # `warehouse_dbu` above credits the app with everything the warehouse burned,
+    # which is right for a dedicated warehouse and wrong for a shared one. This
+    # sits alongside it rather than replacing it, so the two can be compared.
+    warehouse_share = _warehouse_query_share(_sql, warehouse_id, window_h, warehouse_dbu)
 
     estimated_zerobus_dbu = round(zerobus_ingested_gb * 0.143, 3) if zerobus_enabled else 0.0
     observed_zerobus_dbu = round(sum(c["dbu"] for c in components if c["component"] == "Zerobus"), 3)
@@ -944,6 +1214,14 @@ async def ops_cost_summary(hours: int = 24, include_details: bool = False):
     warning = None
     if dbu_records == 0:
         warning = "No DBU usage rows in window. system.billing.usage typically lags 1-4 hours."
+    elif not workspace_id:
+        # Silently reporting the whole account as though it were this app is the
+        # failure mode that makes the panel actively misleading, so say it.
+        warning = (
+            "Could not determine this workspace's id, so totals and components cover EVERY "
+            "workspace in the account, not just this app. Set DATABRICKS_WORKSPACE_ID to scope them. "
+            "The App attribution card is unaffected — it filters on resource id."
+        )
     elif lag_hours is not None and lag_hours > 6:
         warning = f"system.billing.usage latest row is {lag_hours} h old; recent activity may not be reflected yet."
 
@@ -969,6 +1247,7 @@ async def ops_cost_summary(hours: int = 24, include_details: bool = False):
             "total_app_dbu": total_app_dbu,
             "total_app_estimated_usd": total_app_usd,
         },
+        "warehouse_share": warehouse_share,
         "zerobus": zerobus_payload,
         "data_processed": {
             "records": int(_safe_num(row.get("data_processed_records"))),
@@ -980,8 +1259,8 @@ async def ops_cost_summary(hours: int = 24, include_details: bool = False):
             "note": "USD numbers are list-price approximations using fixed rates per component. Real cost depends on cloud, tier, and discounts.",
         },
         "scope": {
-            "workspace_id_filter": workspace_id_env if workspace_id_env.isdigit() else None,
-            "attribution_mode": "workspace-scoped" if workspace_id_env.isdigit() else "workspace-wide",
+            "workspace_id_filter": workspace_id,
+            "attribution_mode": "workspace-scoped" if workspace_id else "account-wide",
             "app_resources": {
                 "warehouse_id": warehouse_id or None,
                 "producer_job_id": producer_job_id or None,
@@ -1069,6 +1348,15 @@ async def ops_cost_live(minutes: int = 60):
     sql_wh_id = (os.environ.get("OPS_SQL_WAREHOUSE_ID") or "").strip()
     genie_has_separate_warehouse = bool(genie_wh_id and genie_wh_id != sql_wh_id)
     genie_usd = round(genie_calls * _LIVE_RATES["genie_usd_per_query"], 4)
+    # A dedicated Genie warehouse was billed a full hourly rate unconditionally,
+    # while the main warehouse line is gated on `wh_on`. An idle Genie warehouse
+    # therefore invented $0.70/h that Databricks never charged. Serverless
+    # warehouses auto-stop, so "configured" and "running" are different things
+    # and only the second one costs money; absent any query in the window we
+    # treat it as stopped, which matches how the Producer job line behaves.
+    genie_wh_running = genie_has_separate_warehouse and genie_calls > 0
+    genie_wh_usd = (round(_LIVE_RATES["sql_warehouse_usd_per_hour"] * win_h, 4)
+                    if genie_wh_running else 0.0)
     # Zerobus: only flows when the Producer Job is running (it's the only
     # writer to Zerobus in this app). When idle → 0 ingest by definition.
     # When running → estimate from producer throughput × running hours.
@@ -1099,14 +1387,7 @@ async def ops_cost_live(minutes: int = 60):
     # If a separate Genie warehouse is configured we bill it independently of
     # the SQL Warehouse line; otherwise ``genie_usd`` is just the per-query
     # overhead (compute is already in the SQL Warehouse total).
-    genie_total_usd = (round(_LIVE_RATES["sql_warehouse_usd_per_hour"] * win_h, 4)
-                       if genie_has_separate_warehouse else genie_usd)
-    total_usd = round(
-        llm_in_usd + llm_out_usd + lakebase_compute_usd + app_compute_usd
-        + wh_usd + prod_usd + sync_usd + syncer_usd
-        + vs_usd + genie_total_usd + zb_usd,
-        4,
-    )
+    genie_total_usd = genie_wh_usd if genie_has_separate_warehouse else genie_usd
 
     def _line(name: str, usd: float, detail: str, *, on: bool | None = None) -> dict[str, Any]:
         row = {"component": name, "usd": usd, "detail": detail}
@@ -1139,6 +1420,17 @@ async def ops_cost_live(minutes: int = 60):
                if wh_on else _state_label("warehouse", "warehouse STOPPED — no compute charged")),
               on=wh_on),
         _line("Producer job", prod_usd, producer_detail, on=prod_on),
+        # This line existed in `total_usd` but had no row of its own, so the
+        # Total printed under the table was larger than the rows above it by
+        # $0.30/h per synced table with nothing on screen to account for the
+        # difference. The total is now summed from these rows, so an unlisted
+        # cost is no longer representable.
+        _line("Synced tables", sync_usd,
+              (f"{synced_count} table(s) × ${_LIVE_RATES['synced_table_usd_per_hour']}/h × {win_h:.2f}h "
+               f"(Lakeflow sync pipelines kept warm per synced table)"
+               if synced_count
+               else "no synced tables configured (set OPS_SYNCED_TABLES_COUNT)"),
+              on=bool(synced_count)),
         _line("Streaming QC + Dual-Write", syncer_usd,
               (f"${_LIVE_RATES['lakebase_syncer_usd_per_hour']}/h × {win_h:.2f}h "
                f"(continuous Spark Streaming: bronze → QC → gold_history Delta + "
@@ -1158,17 +1450,19 @@ async def ops_cost_live(minutes: int = 60):
                else "no Vector Search index configured (OPS_VS_ENDPOINT_ALWAYS_ON=false)"),
               on=vs_endpoint_live),
         _line("Genie",
-              # When a separate Genie warehouse is configured we bill it like
-              # the SQL Warehouse line; otherwise Genie's cost is bundled into
-              # the SQL Warehouse line above and we just show a per-query count.
-              (round(_LIVE_RATES["sql_warehouse_usd_per_hour"] * win_h, 4)
-               if genie_has_separate_warehouse else genie_usd),
-              ((f"{int(genie_calls)} queries · runs on dedicated Serverless SQL Warehouse "
-                f"(OPS_GENIE_WAREHOUSE_ID={genie_wh_id}) — ${_LIVE_RATES['sql_warehouse_usd_per_hour']}/h × {win_h:.2f}h")
+              # Same value the total uses — this used to be a second copy of the
+              # expression, free to drift from the one being summed.
+              genie_total_usd,
+              ((f"{int(genie_calls)} queries · dedicated Serverless SQL Warehouse "
+                f"(OPS_GENIE_WAREHOUSE_ID={genie_wh_id}) — "
+                f"${_LIVE_RATES['sql_warehouse_usd_per_hour']}/h × {win_h:.2f}h")
+               if genie_wh_running
+               else (f"dedicated Genie warehouse (OPS_GENIE_WAREHOUSE_ID={genie_wh_id}) had no queries "
+                     f"in this window — assumed auto-stopped, no compute charged")
                if genie_has_separate_warehouse
                else (f"{int(genie_calls)} queries · compute folded into the SQL Warehouse line above "
                      f"(no separate Serverless SQL configured — set OPS_GENIE_WAREHOUSE_ID to split)")),
-              on=(genie_has_separate_warehouse or genie_calls > 0)),
+              on=genie_wh_running),
         _line("Zerobus ingest", zb_usd,
               ("zerobus mode disabled" if not zerobus_enabled
                else (f"~{zb_gb:.3f} GB × ${_LIVE_RATES['zerobus_usd_per_gb']}/GB "
@@ -1183,6 +1477,9 @@ async def ops_cost_live(minutes: int = 60):
         _line("LLM (output)", llm_out_usd,
               f"{int(llm_out)} tokens × ${_LIVE_RATES['llm_output_usd_per_1k_tokens']}/1k"),
     ]
+    # Summed from the rows the user can see rather than recomputed alongside
+    # them, so the Total is the visible breakdown by construction.
+    total_usd = round(sum(c["usd"] for c in components), 4)
     return {
         "generated_at": datetime.utcnow().isoformat() + "Z",
         "window_minutes": win_min,

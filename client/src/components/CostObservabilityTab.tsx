@@ -39,6 +39,24 @@ interface CostSummaryResponse {
     total_app_dbu?: number;
     total_app_estimated_usd?: number;
   };
+  warehouse_share?: {
+    available?: boolean;
+    warehouse_id?: string;
+    attribution_key?: 'identity' | 'identity+tag';
+    app_statements?: number;
+    other_statements?: number;
+    app_duration_ms?: number;
+    other_duration_ms?: number;
+    app_genie_duration_ms?: number;
+    /** null when the warehouse ran no queries at all in the window. */
+    app_share?: number | null;
+    warehouse_dbu?: number | null;
+    app_dbu?: number | null;
+    app_estimated_usd?: number | null;
+    /** Age of the cached query-time split; the DBU it is applied to is always fresh. */
+    split_age_seconds?: number;
+    note?: string;
+  } | null;
   zerobus?: {
     enabled?: boolean;
     ingested_bytes?: number;
@@ -176,9 +194,17 @@ function fmtDbu(v: number | null | undefined): string {
   return v.toFixed(3);
 }
 
+/**
+ * Every dollar figure here is DBU multiplied by a rounded list-price guess, so
+ * four decimals advertised a precision the number never had — `$341.6100` reads
+ * like a settled invoice rather than an estimate that is comfortably ±20%.
+ * Sub-cent live line items (a Vector Search query is $0.0001) still need the
+ * extra digits or they render as a misleading `$0.00`.
+ */
 function fmtUsd(v: number | null | undefined): string {
   if (v == null) return '—';
-  return `$${v.toFixed(4)}`;
+  if (v !== 0 && Math.abs(v) < 0.01) return `$${v.toFixed(4)}`;
+  return `$${v.toFixed(2)}`;
 }
 
 function statusClass(connected: boolean): string {
@@ -280,6 +306,7 @@ export default function CostObservabilityTab({
     (costData != null || liveData != null) && lastFetchedWindowHours != null && lastFetchedWindowHours !== windowHours;
   const components = useMemo(() => costData?.components ?? [], [costData]);
   const appAttr = costData?.app_attribution;
+  const whShare = costData?.warehouse_share;
   const zerobus = costData?.zerobus;
   const trend = useMemo(() => costData?.details?.trend ?? [], [costData]);
   const topUnmatched = costData?.details?.top_unmatched_rows ?? [];
@@ -293,6 +320,9 @@ export default function CostObservabilityTab({
 
   const totalUsd = isLiveMode ? liveData?.estimated_usd?.total : costData?.totals?.estimated_usd;
   const appUsd = appAttr?.total_app_estimated_usd;
+  // "account" is the fallback when the workspace id could not be resolved, in
+  // which case these totals span every workspace the account bills for.
+  const scopeLabel = costData?.scope?.attribution_mode === 'workspace-scoped' ? 'workspace' : 'account';
 
   const isBusy = loading || verifyLoading;
   const noData = !loading && !error && (isLiveMode ? !liveData : !costData);
@@ -376,9 +406,21 @@ export default function CostObservabilityTab({
         </div>
         <div
           className="rounded-lg border border-border bg-card p-3"
-          {...tip('Approximate USD using fixed list-price rates per component. Estimate only.')}
+          {...tip(
+            isLiveMode
+              ? 'Approximate USD using fixed list-price rates per component. Estimate only.'
+              : `Everything billed in this ${scopeLabel} for the window — not just this app. ` +
+                'The App attribution card below shows the app\'s own share. ' +
+                'Approximate USD using fixed list-price rates per component; estimate only.',
+          )}
         >
-          <p className="text-[11px] text-muted-foreground">Estimated USD</p>
+          {/* The panel shows two dollar figures — this one and "Total app est.
+              USD" — and they legitimately differ by however much other work
+              runs alongside the app. Labelled only "Estimated USD", the pair
+              read as a contradiction rather than as two scopes. */}
+          <p className="text-[11px] text-muted-foreground">
+            {isLiveMode ? 'Estimated USD (app)' : `Estimated USD (${scopeLabel})`}
+          </p>
           <p className="text-sm font-semibold mt-1">{fmtUsd(totalUsd)}</p>
         </div>
       </div>
@@ -799,6 +841,79 @@ export default function CostObservabilityTab({
                 </li>
               </ul>
             </div>
+
+            {/* Warehouse share, from query history. The card above credits the
+                app with every DBU the warehouse burned, which is only right if
+                nothing else uses it. */}
+            {whShare && (
+              <div className="rounded-lg border border-border p-3 space-y-2 lg:col-span-3">
+                <h4 className="text-xs font-semibold uppercase text-muted-foreground">
+                  Warehouse share (from query history)
+                </h4>
+                {whShare.available === false ? (
+                  <p className="text-[11px] text-amber-600 dark:text-amber-400">{whShare.note}</p>
+                ) : (
+                  <>
+                    <p className="text-[11px] text-muted-foreground">
+                      The card above assumes the warehouse is this app&apos;s alone. If it is shared,
+                      this apportions its DBU by each tenant&apos;s share of query time.
+                    </p>
+                    <ul className="text-xs space-y-1">
+                      <li
+                        className="flex items-center justify-between"
+                        {...tip(
+                          `Matched on ${whShare.attribution_key === 'identity+tag'
+                            ? "the app service principal's identity and the app:prodline-copilot query tag"
+                            : "the app service principal's identity (query tags unavailable on this metastore)"}.`,
+                        )}
+                      >
+                        <span className="text-muted-foreground">App statements</span>
+                        <span className="font-medium tabular-nums">
+                          {whShare.app_statements ?? '—'}
+                          {whShare.app_genie_duration_ms != null && whShare.app_genie_duration_ms > 0 && (
+                            <span className="text-muted-foreground"> (incl. Genie)</span>
+                          )}
+                        </span>
+                      </li>
+                      <li className="flex items-center justify-between">
+                        <span className="text-muted-foreground">Other statements</span>
+                        <span className="font-medium tabular-nums">{whShare.other_statements ?? '—'}</span>
+                      </li>
+                      <li
+                        className="flex items-center justify-between"
+                        {...tip('App query time ÷ all query time on this warehouse, by total_duration_ms.')}
+                      >
+                        <span className="text-muted-foreground">
+                          App share of query time
+                          {whShare.split_age_seconds != null && whShare.split_age_seconds > 60 && (
+                            <span className="text-muted-foreground/70">
+                              {' '}
+                              (cached {Math.round(whShare.split_age_seconds / 60)}m)
+                            </span>
+                          )}
+                        </span>
+                        <span className="font-medium tabular-nums">
+                          {whShare.app_share == null ? '—' : `${(whShare.app_share * 100).toFixed(1)}%`}
+                        </span>
+                      </li>
+                      <li className="flex items-center justify-between border-t border-border pt-1">
+                        <span className="text-muted-foreground">App share of warehouse DBU</span>
+                        <span className="font-semibold tabular-nums">{fmtDbu(whShare.app_dbu)}</span>
+                      </li>
+                      <li className="flex items-center justify-between">
+                        <span className="text-muted-foreground">App share est. USD</span>
+                        <span className="font-semibold tabular-nums">{fmtUsd(whShare.app_estimated_usd)}</span>
+                      </li>
+                    </ul>
+                    <p className="text-[11px] text-muted-foreground">
+                      {whShare.app_share == null
+                        ? 'No queries ran on this warehouse in the window, so its DBU cannot be attributed to anyone.'
+                        : whShare.note}
+                    </p>
+                  </>
+                )}
+              </div>
+            )}
           </div>
         )}
 

@@ -98,6 +98,22 @@ def _get_host() -> str:
     return raw.replace("https://", "").replace("http://", "").rstrip("/")
 
 
+# Stamped on every statement this tool runs so the Cost panel can separate the
+# app's warehouse usage from everything else sharing the same warehouse. The
+# app SP's identity already distinguishes most of it, but an SP can be reused
+# across apps and jobs whereas this tag cannot; it also makes the app's queries
+# filterable in the Query History UI.
+#
+# Connector 4.2.5 reads tags out of `session_configuration` (see
+# databricks/sql/client.py), not from the top-level `query_tags=` argument that
+# newer releases document, so this goes through the session config using the
+# documented "key:value,key:value" serialisation.
+APP_QUERY_TAG_KEY = "app"
+APP_QUERY_TAG_VALUE = "prodline-copilot"
+_QUERY_TAGS_SESSION_CONF = {"query_tags": f"{APP_QUERY_TAG_KEY}:{APP_QUERY_TAG_VALUE}"}
+_query_tags_supported = True
+
+
 def _create_connection():
     """Create a fresh SQL warehouse connection."""
     from databricks import sql as dbsql
@@ -128,13 +144,31 @@ def _create_connection():
             raise RuntimeError("Could not obtain OAuth token")
         logger.info("Using OAuth token (len=%d)", len(token))
 
-    return dbsql.connect(
+    kwargs = dict(
         server_hostname=host,
         http_path=http_path,
         access_token=token,
         catalog=_CATALOG,
         schema=_SCHEMA,
     )
+    # Query tags are Public Preview, and session configuration is applied as a
+    # `SET` at session open — so on a workspace that doesn't know the parameter
+    # this is the difference between a tagged connection and no connection at
+    # all. Cost attribution is not worth taking the app's only data path down
+    # for, so an unsupported tag degrades to an untagged session once and stops
+    # being retried.
+    global _query_tags_supported
+    if _query_tags_supported:
+        try:
+            return dbsql.connect(session_configuration=dict(_QUERY_TAGS_SESSION_CONF), **kwargs)
+        except Exception as e:
+            _query_tags_supported = False
+            logger.warning(
+                "Warehouse rejected the query_tags session parameter (%s); reconnecting untagged. "
+                "Cost attribution falls back to the app service principal's identity.",
+                str(e)[:160],
+            )
+    return dbsql.connect(**kwargs)
 
 
 def _get_connection():

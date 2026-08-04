@@ -4,7 +4,92 @@ All notable changes to ProdLine CoPilot are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.4] - 2026-08-04
+
+### Added
+- **The Cost panel can now tell the app's warehouse usage apart from everyone
+  else's.** App-attributed DBU credited the app with every DBU the warehouse
+  burned, which is right for a dedicated warehouse and wrong for a shared one —
+  on a warehouse the app shares with analysts and jobs, it was reporting their
+  spend as the app's. A new card apportions the warehouse's DBU by each
+  tenant's share of query time, read from `system.query.history` and matched on
+  the app service principal plus an `app:prodline-copilot` query tag the SQL
+  tool now stamps on its sessions. It sits alongside the existing figure rather
+  than replacing it, so the two can be compared. Warehouses bill for uptime
+  rather than for queries, so this apportions idle time across tenants in
+  proportion to their usage — a convention, stated as one in the panel, not a
+  per-tenant measurement. An idle warehouse attributes its DBU to nobody
+  instead of dividing by zero and handing the whole bill to the app. Query tags
+  are Public Preview, so a workspace that rejects the session parameter falls
+  back to an untagged connection and identity-only matching rather than leaving
+  the app with no warehouse connection at all. The split is cached for ten
+  minutes: `system.query.history` is account-wide for the region with nothing to
+  prune a warehouse filter against, so the aggregate costs ~26s in the deployed
+  app, and running it per refresh would have made the Cost tab the app's
+  largest warehouse consumer — and a self-fulfilling one, since the panel's own
+  queries run as the app service principal and would inflate the share they
+  report. Only the split is reused; it is repriced against each load's fresh DBU
+  so the panel never shows two different warehouse costs at once.
+
+### Changed
+- **Billing queries now prune on `usage_date`.** They filtered on
+  `usage_start_time`, which is not the partition column, so each panel load
+  scanned the account's entire billing history six to eight times over. The
+  added date predicate is a deliberate superset of the time window, so it
+  changes cost and latency but not results.
+- **Dollar figures render at two decimals.** `$341.6100` reads like a settled
+  invoice; it is DBU multiplied by a rounded list-price guess and is
+  comfortably ±20%. Sub-cent live line items keep four decimals so they do not
+  collapse to `$0.00`.
+- **The two dollar figures say which scope they cover.** The headline tile and
+  "Total app est. USD" legitimately differ by however much other work runs
+  alongside the app, but both were labelled as though they were the same
+  quantity, so the pair read as a contradiction.
+
+### Fixed
+- **Opening the Cost tab froze the whole app, live stream included.** Present
+  since before 0.3.3, so this affects anyone already running the app.
+  `/ops/cost-summary` was declared `async def` but its body is half a dozen
+  sequential warehouse round trips and no `await` at all, so FastAPI ran that
+  blocking work on the event loop rather than in its threadpool. For as long as
+  it took, the process served nothing else: requests queued and `/serving/stream`
+  stopped emitting. Measured against a deployed app, a cold load stalled the SSE
+  stream for 44.9s against its normal 1.04s tick — the live data simply stopped
+  for three quarters of a minute. The rollup now runs in a worker thread, which
+  is the pattern every other handler in the module already used; the same load
+  now leaves a worst-case gap of 1.07s. A test walks the module's AST and fails
+  any `async` route that makes a warehouse or SDK call inline, with
+  `ops_control_action` recorded as a known pre-existing offender rather than
+  quietly grandfathered.
+- **The Cost & Obs panel reported the whole account as though it were this
+  app.** Every billing query was scoped by `DATABRICKS_WORKSPACE_ID`, a
+  variable read in one place and set in none — not `app.yaml`, not the bundle,
+  not `render_app_yaml.py`. Unset, the filter vanished and the totals covered
+  every workspace the account bills for, so in a shared demo workspace the
+  panel was quoting other teams' jobs. The workspace id now comes from the SDK,
+  which always knows it because the app authenticates against that workspace;
+  the env var still overrides for local dev. If neither resolves, the panel
+  says so in a banner rather than silently widening.
+- **Two numbers on the same screen priced the same row differently.** The
+  components table classified SKUs with a hand-written SQL `CASE` and the
+  verification figure below it with a hand-written Python function, and the two
+  had drifted: the `CASE` checked `sku_name` for `MODEL` but not
+  `billing_origin_product`, so a `FOUNDATION_MODEL_TRAINING` row was "Other" at
+  $0.55/DBU in one and "Model Serving" at $0.07/DBU in the other — a 7.9×
+  disagreement. Both are now generated from one ordered rule table, with a test
+  over realistic SKU names holding them together.
+- **Live mode's Total was larger than the rows it sat under.** The
+  synced-tables charge was in the total but had no line of its own, so the
+  breakdown came up $0.30/h per synced table short with nothing on screen to
+  explain it. The total is now summed from the rendered rows, which makes an
+  unlisted cost unrepresentable, and synced tables have a row.
+- **An idle dedicated Genie warehouse was billed a full hourly rate.** Unlike
+  the main warehouse line it was never gated on running state, so a configured
+  but auto-stopped warehouse invented $0.70/h that Databricks never charged.
+- **Billing freshness was off by the machine's UTC offset.** A Spark
+  `TIMESTAMP` renders without an offset and `.astimezone()` reads a naive
+  datetime as local time, so on a UTC+2 host every row looked two hours older
+  than it was and the "stale by >6h" banner fired two hours early.
 
 ## [0.3.3] - 2026-08-04
 
