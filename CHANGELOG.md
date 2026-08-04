@@ -6,6 +6,55 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-08-04
+
+A second security pass, this time over the repository itself rather than its
+dependencies: static analysis of our own code, the CI workflows, and what the
+public mirror discloses. Two real defects, both in the "safe until someone runs
+the obvious command" category. No runtime code changed, so no redeploy is
+required.
+
+### Security
+- **`app.prod.local.yaml` was the one operator config `.gitignore` missed.**
+  The ignore list enumerated environments by hand — `app.local.yaml`,
+  `app.dev.local.yaml` — while `render_app_yaml.py` writes
+  `app.<env>.local.yaml` for whatever environment it is given. So the dev copy
+  was ignored and the production copy, the one carrying the real Lakebase host,
+  service principal UUIDs and resolved deployer email, was the single local
+  config a `git add -A` would have staged. In a repository that is mirrored to
+  a public solution accelerator, that is disclosure rather than mess. Replaced
+  with an `app.*.local.yaml` glob, which also covers environments nobody has
+  added yet. The committed `app.yaml` / `app.dev.yaml` SET_ME templates stay
+  tracked, and a test asserts both halves: every environment the renderer
+  supports is ignored, and the templates operators copy from are not.
+- **The CI workflow ran `databricks/setup-cli@main`.** A branch ref re-resolves
+  on every run, and that job holds `DEPLOY_NOTEBOOK_TOKEN`, so whatever landed
+  on that branch would have executed in a workspace-authenticated context.
+  Pinned to `v1.9.0`.
+
+### Notes
+- **Hardening still open: CI uses a self-hosted runner on `pull_request`.**
+  `runs-on: html_publisher` combined with a `pull_request` trigger means a fork
+  PR can execute on org infrastructure — the steps that run repository code are
+  gated behind `vars.CI_DATABRICKS_HOST`, and GitHub's first-time-contributor
+  approval stands in front, but neither is a boundary to rely on. Fork PRs
+  receive no secrets, so the exposure is the runner, not the token. Moving the
+  validate job to `ubuntu-latest` would close it; left alone here because it
+  depends on how the org provisions runners.
+- **What the scan found clean.** Bandit over 17k lines reports no HIGH
+  findings. Of 59 MEDIUM, 54 are f-string SQL built from configured table names
+  rather than request data; the rest are a dev-only `eval` already stripped of
+  builtins, predictable `/tmp` paths in two setup scripts, and binding
+  `0.0.0.0` in the server, which is the point. The client has no
+  `dangerouslySetInnerHTML`, `innerHTML`, `eval` or `new Function`, and renders
+  model output through `react-markdown` without `rehype-raw`, so HTML in an
+  answer stays inert. `sql_query` gates on a `SELECT`/`WITH` prefix, denies
+  nine mutating keywords anywhere in the statement, and runs against a
+  read-only warehouse. Dev-only Python dependencies carry no advisories.
+- **`ruff` reports 36 findings and no CI job runs it.** All pre-date this
+  release and none are security-relevant, but a linter nothing enforces will
+  keep drifting.
+
 ## [0.3.1] - 2026-08-04
 
 Dependency security patches. Prompted by four Dependabot PRs on the public
@@ -822,6 +871,7 @@ GenAI copilot for production-line operations, real-time streaming
 simulator (Zerobus → Lakebase), one-command `deploy.sh`, Data Quality
 dashboard, and a baseline MLflow eval harness.
 
+[0.3.2]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.3.2
 [0.3.1]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.3.1
 [0.3.0]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.3.0
 [0.2.1]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.2.1

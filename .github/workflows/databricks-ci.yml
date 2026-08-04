@@ -37,8 +37,12 @@ jobs:
         with:
           python-version: '3.11'
 
+      # Pinned to a release rather than @main: this job holds
+      # DEPLOY_NOTEBOOK_TOKEN, and a branch ref re-resolves on every run, so
+      # anything landing on that branch would execute here with the token in
+      # scope.
       - name: Set up Databricks CLI
-        uses: databricks/setup-cli@main
+        uses: databricks/setup-cli@v1.9.0
 
       - name: Configure Databricks CLI authentication
         if: ${{ vars.CI_DATABRICKS_HOST != '' }}

@@ -47,9 +47,12 @@ dist/server/
 # app.dev.yaml ship as SET_ME placeholders; copy them to *.local.yaml,
 # fill in your values, and deploy.sh / sync_project_settings.py /
 # refresh_app_yaml_ids.py will prefer the .local.yaml siblings.
+# Globbed rather than enumerated: render_app_yaml.py writes app.<env>.local.yaml
+# for whatever env it is given, so listing envs by hand left app.prod.local.yaml
+# — the one carrying production hosts and SP ids — as the single unignored copy.
 config/project-settings.local.yaml
 app.local.yaml
-app.dev.local.yaml
+app.*.local.yaml
 
 # Generated from project-settings.local.yaml (or .yaml) at deploy time.
 # Never commit — it carries the resolved deployer email + per-environment
