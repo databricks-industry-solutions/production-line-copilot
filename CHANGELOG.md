@@ -6,6 +6,52 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-08-04
+
+Dependency security patches. Prompted by four Dependabot PRs on the public
+mirror, but an OSV scan of all 197 runtime packages and 938 npm packages found
+that Dependabot had flagged two of the four vulnerable Python packages and
+missed two others, so the scan — not the PR list — is what this release acts on.
+
+### Security
+- **aiohttp 3.14.1 → 3.14.3.** Three advisories, worst HIGH: an out-of-bounds
+  heap read in the C HTTP response parser on a malformed chunked response
+  (CVE-2026-69244), request smuggling via WebSocket upgrade (CVE-2026-69243),
+  and a WebSocket client accepting compressed frames without negotiated
+  permessage-deflate (CVE-2026-59881). Transitive through `mlflow`, `litellm`,
+  `langchain-community` and `unitycatalog-client`, all of which make
+  authenticated calls from the app runtime.
+- **GitPython 3.1.53 → 3.1.57.** Seven advisories, five HIGH, all variants of
+  argument injection through unguarded git option forwarding — arbitrary file
+  overwrite via `IndexFile.checkout()` and `--output` on `diff`/`rev-list`,
+  arbitrary command execution via `--template` on clone, and environment
+  exfiltration via `create_remote()` URLs. Transitive through `mlflow-skinny`;
+  we never import it, and nothing routes untrusted input to git, so the
+  reachable risk here was low and the fix is free.
+
+### Notes
+- **Two vulnerable packages cannot be fixed yet, and neither had a Dependabot
+  PR.** `cryptography` 48.0.1 carries three advisories (two HIGH), fixed in
+  49.0.0 and 50.0.0, but mlflow 3.13–3.14 requires `cryptography>=43,<49`, so
+  the upgrade is unsatisfiable until mlflow relaxes the cap — and 50.0.0, which
+  the HIGH Bleichenbacher-oracle fix needs, is not published on our index at
+  all. `protobuf` has a HIGH JSON-recursion bypass (CVE-2026-0994) fixed in
+  6.33.5; the lock already resolves to 6.33.6 on Python ≥3.12 and only falls
+  back to the vulnerable 6.31.1 on 3.11, because 6.33.x drops 3.11 support.
+  Raising `requires-python` to `>=3.12` would close it and is deliberately not
+  done in a patch release.
+- **The two npm advisories are deferred, not dismissed.** `brace-expansion`
+  5.0.8 (HIGH, DoS) and `postcss` 8.5.19 (MODERATE, arbitrary `.map` read) both
+  arrive through build tooling only — vite, tailwind, autoprefixer and eslint —
+  so neither ships in the browser bundle or runs in the deployed app. They were
+  left at their current versions because `registry.npmjs.org` is unreachable
+  from the machine this release was cut on, and the alternative was writing
+  integrity hashes sourced from a third-party mirror into `package-lock.json`.
+- **`npm audit` reported zero vulnerabilities and was wrong.** Its advisory
+  endpoint was failing, and a failed bulk request is reported as a clean result
+  rather than an error. Both npm findings above came from OSV instead. Worth
+  remembering the next time a green audit is taken as evidence.
+
 ## [0.3.0] - 2026-08-04
 
 Three themes. Every agent role now runs on the model that suits its work — seven
@@ -776,6 +822,7 @@ GenAI copilot for production-line operations, real-time streaming
 simulator (Zerobus → Lakebase), one-command `deploy.sh`, Data Quality
 dashboard, and a baseline MLflow eval harness.
 
+[0.3.1]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.3.1
 [0.3.0]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.3.0
 [0.2.1]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.2.1
 [0.2.0]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.2.0

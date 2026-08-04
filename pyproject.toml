@@ -1,6 +1,6 @@
 [project]
 name = "productionline-copilot-agent-server"
-version = "0.3.0"
+version = "0.3.1"
 description = "LangGraph agent server for ProdLine CoPilot — multi-specialist GenAI system for production line operations"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.11"
