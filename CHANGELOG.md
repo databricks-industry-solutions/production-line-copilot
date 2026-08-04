@@ -6,6 +6,49 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-08-04
+
+Closes the two npm advisories 0.3.1 deferred. Both are build-time dependencies
+and no runtime code changed, so no redeploy is required. The npm tree is now
+clean: 938 packages, zero known advisories.
+
+### Security
+- **`postcss` 8.5.19 → 8.5.25** (GHSA-fxqj-rqcc-2cmp, CVE-2026-69153,
+  MODERATE). An incomplete fix of an earlier advisory: an attacker-controlled
+  `sourceMappingURL` can read arbitrary `.map` files when `from` is unset. Our
+  use is Tailwind and Vite compiling first-party CSS at build time, so there is
+  no attacker-controlled stylesheet to begin with.
+- **`brace-expansion` 5.0.8 → 5.0.9** (GHSA-rgw5-rvv9-x895, CVE-2026-69152,
+  HIGH). Denial of service through unbounded intermediate arrays, bypassing the
+  mitigation added for CVE-2026-14257. Reaches us transitively through
+  `minimatch`; the existing `overrides` pin moved with it.
+
+### Notes
+- **The registry block was local, not the VPN.** 0.3.1 deferred these because
+  `registry.npmjs.org` was unreachable and the corporate proxy was the obvious
+  suspect. It was not: `/etc/hosts` pins `registry.npmjs.org`, `pypi.org` and a
+  long list of package mirrors to `127.0.0.1`, so the connection is refused
+  locally before it leaves the machine. That is managed tooling steering builds
+  at the internal mirror, and it was left alone.
+- **The upgrades came from Dependabot's resolution rather than the registry.**
+  With no way to run `npm install`, this applies the patches from the two
+  Dependabot PRs, which are computed against the real registry. Both were based
+  on the same tree as ours, so they applied unmodified. The new constraints are
+  already satisfied by what is locked — `postcss` 8.5.25 wants `nanoid ^3.3.16`
+  and 3.3.16 is present, `brace-expansion` 5.0.9 wants `balanced-match ^4.0.2`
+  and 4.0.4 is present — so nothing cascades. The consumers still resolve:
+  `@tailwindcss/postcss` wants `^8.4.41`, `vite` wants `^8.5.6`, `minimatch`
+  wants `^5.0.8`.
+- **The integrity hashes are trusted, not verified locally.** They come from
+  GitHub's resolution against npm, and the tarballs cannot be fetched here to
+  check them. `node_modules` still holds the old versions, so the test and
+  build gates above ran against 8.5.19 and 5.0.8; the first clean `npm ci`
+  is what actually exercises these. That is the same trust placed in merging a
+  Dependabot PR, but it is worth stating plainly.
+- **Python is unchanged.** `cryptography` and `protobuf` still carry the five
+  advisories described in 0.3.1, for the same reasons: an upstream `mlflow`
+  cap and a Python 3.11 floor.
+
 ## [0.3.2] - 2026-08-04
 
 A second security pass, this time over the repository itself rather than its
@@ -871,6 +914,7 @@ GenAI copilot for production-line operations, real-time streaming
 simulator (Zerobus → Lakebase), one-command `deploy.sh`, Data Quality
 dashboard, and a baseline MLflow eval harness.
 
+[0.3.3]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.3.3
 [0.3.2]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.3.2
 [0.3.1]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.3.1
 [0.3.0]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.3.0
