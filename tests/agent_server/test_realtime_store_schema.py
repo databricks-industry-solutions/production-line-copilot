@@ -91,3 +91,48 @@ def test_bootstrap_uc_catalog_not_in_auto_list_passes_through(monkeypatch: pytes
         assert lsc.lakebase_synced_data_schema() == "public"
     finally:
         monkeypatch.delenv("SSE_USE_AI_SERVING_ONLY", raising=False)
+
+
+class TestKpiRowNormalisation:
+    """``_normalize_line_kpi_row`` fills the columns gold ``line_kpi`` lacks.
+
+    It used ``setdefault``, which cannot see the case that actually occurs:
+    both readers ``SELECT *``, so a nullable column comes back as a present key
+    holding ``None`` and ``setdefault`` leaves it there. Callers then call
+    ``float()`` on it and the request dies.
+    """
+
+    def test_a_column_that_is_absent_becomes_zero(self):
+        from agent_server.serving.realtime_store import _normalize_line_kpi_row
+
+        out = _normalize_line_kpi_row({"shift_id": "s1"})
+        assert out["availability_to_now"] == 0
+        assert out["cumulative_cases"] == 0
+
+    def test_a_column_that_is_present_but_null_also_becomes_zero(self):
+        from agent_server.serving.realtime_store import _normalize_line_kpi_row
+
+        out = _normalize_line_kpi_row({"shift_id": "s1", "oee_to_now": None})
+        assert out["oee_to_now"] == 0
+
+    def test_a_real_reading_is_left_alone(self):
+        from agent_server.serving.realtime_store import _normalize_line_kpi_row
+
+        out = _normalize_line_kpi_row({"oee_to_now": 74.6, "cumulative_cases": 0})
+        assert out["oee_to_now"] == 74.6
+        assert out["cumulative_cases"] == 0
+
+    def test_every_filled_column_survives_float(self):
+        # The contract the callers actually rely on.
+        from agent_server.serving.realtime_store import _normalize_line_kpi_row
+
+        out = _normalize_line_kpi_row(dict.fromkeys(
+            ["cumulative_cases", "availability_to_now", "performance_to_now",
+             "quality_to_now", "oee_to_now"], None))
+        assert all(isinstance(float(v), float) for v in out.values())
+
+    def test_no_row_stays_no_row(self):
+        from agent_server.serving.realtime_store import _normalize_line_kpi_row
+
+        assert _normalize_line_kpi_row(None) is None
+        assert _normalize_line_kpi_row({}) is None

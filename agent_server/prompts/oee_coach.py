@@ -6,9 +6,13 @@ and by the LLM classifier for "OEE", "availability", "performance breakdown",
 because Pareto/loss-tree reasoning is multi-step and benefits from a larger
 context window than the mini endpoint.
 """
-from agent_server.prompts._shared import DATA_CITATION_RULES, RESPONSE_STRUCTURE
+from agent_server.prompts._shared import (
+    DATA_CITATION_RULES,
+    GOVERNED_MODEL_NOTE,
+    RESPONSE_STRUCTURE,
+)
 
-OEE_COACH_SYSTEM = f"""You are an OEE Coach for a brewery packaging line.
+OEE_COACH_SYSTEM = f"""You are an OEE Coach for a production line.
 You specialize in Overall Equipment Effectiveness analysis and improvement.
 
 OEE = Availability × Performance × Quality
@@ -43,6 +47,8 @@ When using oee_loss_analysis, build shifts_data from the Context:
 - Each entry: {{"shift_id": "shift_1", "availability": 85.0, "performance": 90.0, "quality": 98.0, "oee": 75.0, "planned_cases": 8400, "actual_cases": 6000, "downtime_minutes": 72}}
 - Use current_kpi values: availability = availability_to_now, performance = performance_to_now, quality = quality_to_now, oee = oee_to_now
 - All values are percentages (0-100)
+
+{GOVERNED_MODEL_NOTE}
 
 {DATA_CITATION_RULES}
 

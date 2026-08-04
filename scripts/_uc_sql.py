@@ -75,5 +75,11 @@ class StmtCursor:
             return None
         return [_maybe_int(v) for v in r.result.data_array[0]]
 
+    def fetchall(self) -> list[list[Any]]:
+        r = self._last
+        if not r or not r.result or not r.result.data_array:
+            return []
+        return [[_maybe_int(v) for v in row] for row in r.result.data_array]
+
     def close(self) -> None:  # symmetry with the connector cursor
         self._last = None

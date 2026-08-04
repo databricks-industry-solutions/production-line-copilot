@@ -5,107 +5,15 @@
  */
 import type { ReactNode } from 'react';
 
-const SPECIALISTS = [
-  {
-    id: 'downtime_analyst',
-    name: 'Downtime Analyst',
-    icon: '⏱️',
-    domain: 'Unplanned stops, root cause analysis, cascade impact, recovery prioritization',
-    tools: ['sql_query', 'calculator', 'detect_anomalies', 'load_plan_and_constraints', 'retrieve_similar_cases'],
-    model: 'GPT-5-mini',
-  },
-  {
-    id: 'quality_specialist',
-    name: 'Quality Specialist',
-    icon: '🔬',
-    domain: 'Quality deviations, SPC, reject analysis, quality holds, contamination risk',
-    tools: [
-      'sql_query',
-      'calculator',
-      'load_plan_and_constraints',
-      'retrieve_similar_cases',
-      'detect_anomalies',
-      'quality_risk_assessment',
-    ],
-    model: 'GPT-5-mini',
-  },
-  {
-    id: 'supply_chain_advisor',
-    name: 'Supply Chain Advisor',
-    icon: '📦',
-    domain: 'Inventory levels, material depletion, reorder timing, supplier coordination',
-    tools: ['sql_query', 'calculator', 'load_plan_and_constraints', 'retrieve_similar_cases'],
-    model: 'GPT-5-mini',
-  },
-  {
-    id: 'oee_coach',
-    name: 'OEE Coach',
-    icon: '📈',
-    domain: 'OEE breakdown, loss categorization, efficiency improvement, benchmarking',
-    tools: [
-      'sql_query',
-      'genie_query',
-      'calculator',
-      'load_plan_and_constraints',
-      'oee_loss_analysis',
-      'production_forecast',
-    ],
-    model: 'GPT-5',
-  },
-  {
-    id: 'schedule_optimizer',
-    name: 'Schedule Optimizer',
-    icon: '📅',
-    domain: 'Recovery planning, speed optimization, overtime decisions, CIP scheduling, stochastic planning',
-    tools: [
-      'sql_query',
-      'calculator',
-      'load_plan_and_constraints',
-      'schedule_recovery',
-      'production_forecast',
-      'stochastic_schedule_recovery',
-    ],
-    model: 'GPT-5-mini',
-  },
-  {
-    id: 'maintenance_predictor',
-    name: 'Maintenance Predictor',
-    icon: '🔧',
-    domain: 'Equipment health, anomaly trending, remaining useful life, predictive maintenance, PM scheduling',
-    tools: [
-      'sql_query',
-      'calculator',
-      'detect_anomalies',
-      'load_plan_and_constraints',
-      'retrieve_similar_cases',
-      'estimate_rul',
-    ],
-    model: 'GPT-5-mini',
-  },
-  {
-    id: 'strategic_advisor',
-    name: 'Strategic Advisor',
-    icon: '🎯',
-    domain: 'Cross-shift trends, multi-shift planning, capex/opex framing, improvement roadmaps, benchmarking',
-    tools: [
-      'sql_query',
-      'genie_query',
-      'calculator',
-      'load_plan_and_constraints',
-      'retrieve_similar_cases',
-      'multi_shift_plan',
-    ],
-    model: 'GPT-5',
-  },
-  {
-    id: 'shift_briefing',
-    name: 'Shift Briefing',
-    icon: '📝',
-    domain: 'Pre-shift huddle and post-shift handover readouts — Genie-friendly, mobile-first summarisation',
-    tools: ['sql_query', 'genie_query', 'calculator', 'load_plan_and_constraints', 'retrieve_similar_cases'],
-    model: 'GPT-5-mini',
-  },
-];
+import { rosterStats } from '../lib/modelRosterView';
+import { OPTIMIZER_TOOLS, SPECIALISTS } from '../lib/specialistCatalog';
+import { genieSpacePhrase, genieSpaceRole, GOVERNED_DOMAINS } from '../lib/topologyCopy';
+import type { ModelRoster } from '../lib/useModelRoster';
+import { useModelRoster } from '../lib/useModelRoster';
+import type { GovernedDomain } from '../lib/useTopology';
+import { useTopology } from '../lib/useTopology';
+import DatabricksIcon from './DatabricksIcon';
+import SystemMap from './SystemMap';
 
 const TOOLS: { id: string; name: string; icon: string; desc: string; platform?: string }[] = [
   {
@@ -117,9 +25,16 @@ const TOOLS: { id: string; name: string; icon: string; desc: string; platform?: 
   },
   {
     id: 'genie_query',
-    name: 'Genie Query',
+    name: 'Line Ops Genie',
     icon: '✨',
-    desc: 'Natural language data analyst — translates questions to SQL against curated, governed datasets',
+    desc: 'Natural language questions against the curated space over the live streaming tables — the shift as it is happening. Broader than a governed domain by design: 14 tables behind a free-form surface, where the governed model splits along the schemas its grants follow. Carried by the three specialists that reason across a whole shift, and by Ask the line.',
+    platform: 'AI/BI Genie',
+  },
+  {
+    id: 'governed_domain_query',
+    name: 'Governed Domain Genie',
+    icon: '🏛️',
+    desc: 'One curated space per governed schema — asset, quality, inventory, production — and a specialist is handed only its own. Narrow scope is what keeps Genie accurate, and the boundary is a Unity Catalog schema, so per-domain grants are real rather than diagrammatic. Genie cannot join across spaces, so cross-domain questions go to SQL instead.',
     platform: 'AI/BI Genie',
   },
   {
@@ -211,7 +126,8 @@ const OPTIMIZERS: { id: string; name: string; icon: string; method: string; desc
 const PLATFORM = [
   { name: 'Databricks Apps', role: 'Application hosting (React + FastAPI)', icon: 'apps' },
   { name: 'Databricks SQL', role: 'Serverless query engine for dashboards and agents', icon: 'sql' },
-  { name: 'AI/BI Genie', role: 'Natural language data analyst with curated Genie Space', icon: 'genie' },
+  // `role` is filled in at render from the topology endpoint — see genieSpaceRole.
+  { name: 'AI/BI Genie', role: '', icon: 'genie' },
   { name: 'Delta Lake', role: 'Bronze + Gold tables backing both the live and analytics paths', icon: 'delta' },
   { name: 'Unity Catalog', role: 'Governance, lineage, access control, model registry', icon: 'uc' },
   {
@@ -221,8 +137,18 @@ const PLATFORM = [
   },
   {
     name: 'Spark Structured Streaming',
-    role: 'Continuous quality-gate job (streaming_quality_sync): validates Bronze, writes Gold + Lakebase, records rejects to quality_rejects',
+    role: 'Continuous quality-gate job (streaming_quality_sync): validates Bronze, writes Gold + Lakebase, records rejects, and (streaming silver) MERGEs into the governed industry model at seconds latency',
     icon: 'lakeflow',
+  },
+  {
+    name: 'Manufacturing Industry Model',
+    role: 'Governed silver model (asset / production / quality / inventory) mirroring a canonical enterprise schema; each domain has its own curated Genie space, and because the four schemas share one catalog, SQL can join across them where Genie cannot',
+    icon: 'mvm',
+  },
+  {
+    name: 'DQX (Databricks Labs)',
+    role: 'Optional data-quality checks (freshness / range / referential) flagged into a dqx_warnings audit table; observability-only, never gates the pipeline',
+    icon: 'dqx',
   },
   { name: 'Mosaic AI Model Serving', role: 'LLM inference (GPT-5-mini routing, GPT-5 strategy)', icon: 'serving' },
   { name: 'Mosaic AI Vector Search', role: 'Similar case retrieval for historical event matching', icon: 'vector' },
@@ -243,6 +169,8 @@ const PLATFORM_COLORS: Record<string, string> = {
   uc: 'bg-indigo-100 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-300',
   lakeflow: 'bg-orange-100 text-orange-700 dark:bg-orange-900/30 dark:text-orange-300',
   zerobus: 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300',
+  mvm: 'bg-cyan-100 text-cyan-700 dark:bg-cyan-900/30 dark:text-cyan-300',
+  dqx: 'bg-rose-100 text-rose-700 dark:bg-rose-900/30 dark:text-rose-300',
   serving: 'bg-fuchsia-100 text-fuchsia-700 dark:bg-fuchsia-900/30 dark:text-fuchsia-300',
   vector: 'bg-pink-100 text-pink-700 dark:bg-pink-900/30 dark:text-pink-300',
   lakebase: 'bg-teal-100 text-teal-700 dark:bg-teal-900/30 dark:text-teal-300',
@@ -250,21 +178,55 @@ const PLATFORM_COLORS: Record<string, string> = {
   dabs: 'bg-slate-100 text-slate-700 dark:bg-slate-800/50 dark:text-slate-300',
 };
 
-function DatabricksIcon({ className = 'w-4 h-4' }: { className?: string }) {
-  return (
-    <svg viewBox="0 0 36 36" className={className} fill="currentColor">
-      <path d="M18 0L3.5 8.4v7.2L18 7.2l14.5 8.4V8.4L18 0z" opacity=".7" />
-      <path d="M18 10.8L3.5 19.2v7.2L18 18l14.5 8.4v-7.2L18 10.8z" />
-      <path d="M3.5 26.4L18 34.8l14.5-8.4v-7.2L18 27.6 3.5 19.2v7.2z" opacity=".7" />
-    </svg>
-  );
-}
-
 function PlatformTag({ name }: { name: string }) {
   return (
     <span className="mt-1 inline-flex items-center gap-1 rounded-full bg-muted/60 px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
-      <DatabricksIcon className="h-2.5 w-2.5" />
+      <DatabricksIcon className="h-3 w-3" />
       {name}
+    </span>
+  );
+}
+
+/** Domain tint, matching the System Map above so a domain keeps one colour. */
+const DOMAIN_BADGE: Record<string, string> = {
+  asset: 'bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300',
+  quality: 'bg-rose-100 text-rose-800 dark:bg-rose-900/30 dark:text-rose-300',
+  inventory: 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-300',
+  production: 'bg-sky-100 text-sky-800 dark:bg-sky-900/30 dark:text-sky-300',
+};
+
+/**
+ * The specialist's governed Genie space. Separate from ToolBadge because this
+ * one is not in the static tool list: which domains exist is a property of the
+ * deployment, so an unprovisioned space must show as absent rather than be
+ * asserted from a hardcoded roster.
+ *
+ * An absent domain says what the specialist HAS, not what it lacks. Striking
+ * the badge through was the obvious rendering and the wrong one: prod runs
+ * without the governed model by design, so every specialist showed a crossed-out
+ * domain and a supported configuration read as a broken one. The System Map hit
+ * this first and settled on `sql only`; this is the same answer, so the two
+ * sections of the same page agree.
+ */
+function DomainBadge({ domain }: { domain: GovernedDomain }) {
+  if (!domain.configured) {
+    return (
+      <span
+        className="inline-flex items-center gap-1 rounded-full bg-muted px-2 py-0.5 text-[11px] font-medium text-muted-foreground"
+        title={`The governed ${domain.domain} domain is not provisioned in this deployment, so this specialist reaches its data with direct SQL instead.`}
+      >
+        sql only
+      </span>
+    );
+  }
+  return (
+    <span
+      className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-medium ${
+        DOMAIN_BADGE[domain.domain] ?? 'bg-muted text-muted-foreground'
+      }`}
+      title={`Dedicated Genie space over the governed ${domain.domain} domain: ${domain.entities.join(', ')}`}
+    >
+      🏛️ {domain.domain} domain
     </span>
   );
 }
@@ -286,17 +248,84 @@ function ToolBadge({ id, isOptimizer }: { id: string; isOptimizer?: boolean }) {
   );
 }
 
+/**
+ * A pointer to the Multi-AI tab, which owns the roster in full.
+ *
+ * The table used to live here. It moved because it had outgrown a section on a
+ * page about something else, and duplicating it in two places is how the two
+ * copies end up disagreeing.
+ */
+function ModelRosterSummary({ roster }: { roster: ModelRoster | null }) {
+  if (!roster) return null;
+  // Same count as the Multi-AI tab's headline stat, from the same helper, so
+  // the two pages cannot state different numbers of vendors.
+  const vendorCount = rosterStats(roster).vendorCount;
+  const vendors = Array.isArray(roster.vendors) ? roster.vendors : [];
+
+  return (
+    <section className="rounded-lg border bg-card p-4">
+      <h3 className="text-sm font-semibold uppercase tracking-wider text-muted-foreground">
+        Model Roster
+      </h3>
+      <p className="mt-1.5 text-xs leading-relaxed text-muted-foreground">
+        {roster.multi_vendor
+          ? `Each role runs on the model that suits its work — ${vendorCount} vendors answering here, behind one API, one permission model and one bill.`
+          : 'Multi-vendor routing is disabled (MODEL_MULTI_VENDOR=0) — every role runs on the two fallback tiers.'}{' '}
+        The full roster, the reasoning behind each pick and this workspace&rsquo;s coverage are on
+        the <strong className="text-foreground">Multi-AI</strong> tab.
+      </p>
+      <div className="mt-2.5 flex flex-wrap gap-1.5">
+        {vendors.map((v) => (
+          <span
+            key={v}
+            className="rounded-full bg-primary/10 px-2.5 py-0.5 text-[11px] font-medium text-primary"
+          >
+            {v}
+          </span>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 export default function AboutTab() {
+  // Fetched once here and passed down to SystemMap, which would otherwise ask
+  // for both again on every mount of this tab.
+  const { roster, error: rosterError } = useModelRoster();
+  const { topology, error: topologyError } = useTopology();
+  const modelByRole = new Map((roster?.roles ?? []).map((r) => [r.role, r]));
+  // Until topology arrives, state the full wiring rather than flash a smaller
+  // number and correct itself a moment later.
+  const genieSpaces = topology ? topology.configured + (topology.streaming_space ? 1 : 0) : 5;
+
+  const domainBySpecialist = new Map<string, GovernedDomain>();
+  for (const domain of topology?.domains ?? []) {
+    for (const role of domain.specialists) domainBySpecialist.set(role, domain);
+  }
+
   return (
     <div className="space-y-8">
       {/* Header */}
       <div className="text-center">
         <h2 className="text-xl font-bold text-foreground">ProdLine CoPilot</h2>
         <p className="mt-1 text-sm text-muted-foreground">
-          A compound AI system for brewery line management — 8 specialist agents, 6 tools (incl. Genie), 7 mathematical
-          optimizers, built on the Databricks Data Intelligence Platform.
+          A compound AI system for production line management — {SPECIALISTS.length} specialist agents, 7 tools
+          across {genieSpacePhrase(genieSpaces)}, {OPTIMIZER_TOOLS.size} mathematical optimizers, a governed
+          Manufacturing industry model, and optional DQX data-quality checks, built on the Databricks Data
+          Intelligence Platform.
         </p>
       </div>
+
+      {/* Leads the page: the agent-to-governed-data topology is the thing that
+          explains the architecture fastest, and the sections below detail it. */}
+      <SystemMap
+        topology={topology}
+        topologyError={topologyError}
+        roster={roster}
+        rosterError={rosterError}
+      />
+
+      <ModelRosterSummary roster={roster} />
 
       {/* Agent Architecture */}
       <section>
@@ -335,11 +364,20 @@ export default function AboutTab() {
                   </span>
                   <div className="min-w-0">
                     <div className="text-sm font-semibold text-foreground">{s.name}</div>
-                    <div className="text-[11px] text-muted-foreground">{s.model}</div>
+                    <div className="text-[11px] text-muted-foreground">
+                      {modelByRole.get(s.id)
+                        ? `${modelByRole.get(s.id)!.display} · ${modelByRole.get(s.id)!.vendor}`
+                        : '—'}
+                    </div>
                   </div>
                 </div>
                 <p className="mb-3 text-xs leading-relaxed text-muted-foreground">{s.domain}</p>
                 <div className="flex flex-wrap gap-1">
+                  {/* The governed space leads: it is the tool that decides which
+                      slice of the enterprise schema this specialist can reach. */}
+                  {domainBySpecialist.has(s.id) ? (
+                    <DomainBadge domain={domainBySpecialist.get(s.id)!} />
+                  ) : null}
                   {regularTools.map((t) => (
                     <ToolBadge key={t} id={t} />
                   ))}
@@ -402,6 +440,10 @@ export default function AboutTab() {
         <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
           {PLATFORM.map((p) => {
             const colors = PLATFORM_COLORS[p.icon] ?? 'bg-muted text-muted-foreground';
+            const role =
+              p.icon === 'genie'
+                ? genieSpaceRole(topology?.configured ?? GOVERNED_DOMAINS, topology?.streaming_space ?? true)
+                : p.role;
             return (
               <div key={p.name} className="flex items-start gap-3 rounded-md border bg-card p-3">
                 <span className={`mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-md ${colors}`}>
@@ -409,7 +451,7 @@ export default function AboutTab() {
                 </span>
                 <div className="min-w-0">
                   <div className="text-xs font-semibold text-foreground">{p.name}</div>
-                  <div className="mt-0.5 text-[11px] text-muted-foreground">{p.role}</div>
+                  <div className="mt-0.5 text-[11px] text-muted-foreground">{role}</div>
                 </div>
               </div>
             );
@@ -419,7 +461,13 @@ export default function AboutTab() {
 
       {/* Data Pipeline */}
       <section>
-        <h3 className="mb-3 text-sm font-semibold uppercase tracking-wider text-muted-foreground">Data Pipeline</h3>
+        <h3 className="mb-1 text-sm font-semibold uppercase tracking-wider text-muted-foreground">Data Pipeline</h3>
+        <p className="mb-3 text-xs leading-relaxed text-muted-foreground">
+          <strong className="text-foreground">Two tiers</strong>, fed by one producer that
+          dual-writes at the source. Tier 1 carries the live UI; Tier 2 carries analytics and the
+          governed model. Everything indented under Tier 2 is a branch of that same streaming job,
+          not a third pipeline.
+        </p>
         <div className="space-y-3 rounded-lg border bg-card p-4 text-xs">
           {/*
             Architecture: producer dual-writes at the source (LinkedIn /
@@ -438,8 +486,8 @@ export default function AboutTab() {
             from bronze on resume.
           */}
           <div>
-            <div className="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
-              Tier-1 serving (sub-second live UI)
+            <div className="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-foreground">
+              Tier 1 · serving (sub-second live UI)
             </div>
             <div className="flex flex-wrap items-center gap-2">
               <Pill color="blue">OT/IT Sources</Pill>
@@ -462,8 +510,8 @@ export default function AboutTab() {
             Delta — see footnote below.
           */}
           <div>
-            <div className="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
-              Tier-2 analytics + governed lakehouse
+            <div className="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-foreground">
+              Tier 2 · analytics + governed lakehouse
             </div>
             <div className="flex flex-wrap items-center gap-2">
               <Pill color="orange">Producer (Zerobus client)</Pill>
@@ -478,9 +526,63 @@ export default function AboutTab() {
               <Arrow />
               <Pill color="violet">SQL Warehouse</Pill>
               <Arrow />
-              <Pill color="sky">Genie Space</Pill>
+              <Pill color="sky">Line ops Genie space</Pill>
               <Arrow />
               <Pill color="red">AI agents</Pill>
+            </div>
+          </div>
+          {/*
+            There are TWO tiers, not four. Both blocks below are branches of the
+            Tier-2 structured-streaming job above — the same job that writes Gold
+            also MERGEs each micro-batch into the governed model (design B, so the
+            industry schema rides the live path at seconds latency instead of a
+            batch refresh) and runs the QC gate. They are indented rather than
+            given their own headings, because sibling headings read as extra
+            tiers and invite the question.
+          */}
+          <div className="ml-3 border-l-2 border-muted pl-3">
+            <div className="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+              ↳ Same streaming job, two further sinks
+            </div>
+
+            <div className="mb-1 text-[10px] font-medium text-muted-foreground">
+              Governed industry model (streaming silver)
+              {/* Prod runs with this sink switched off, and a diagram of a
+                  pipeline that is not running reads as a claim that it is. The
+                  System Map says the same thing at the foot of its own section. */}
+              {topology && !topology.mvm_silver_enabled && (
+                <span className="ml-1.5 font-normal normal-case text-muted-foreground/70">
+                  — not enabled in this environment; the rows come from whichever environment owns
+                  the write path
+                </span>
+              )}
+            </div>
+            <div
+              className={`flex flex-wrap items-center gap-2 ${
+                topology && !topology.mvm_silver_enabled ? 'opacity-50' : ''
+              }`}
+            >
+              <Pill color="orange">Streaming MERGE (silver_mapper)</Pill>
+              <Arrow />
+              <Pill color="cyan">asset / production / quality / inventory</Pill>
+              <Arrow />
+              <Pill color="sky">
+                {topology?.configured ?? GOVERNED_DOMAINS} domain Genie space
+                {(topology?.configured ?? GOVERNED_DOMAINS) === 1 ? '' : 's'}
+              </Pill>
+              <Arrow />
+              <Pill color="red">Domain specialists</Pill>
+            </div>
+
+            <div className="mb-1 mt-2.5 text-[10px] font-medium text-muted-foreground">
+              Quality gate (observability-only)
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <Pill color="orange">Streaming QC gate</Pill>
+              <Arrow />
+              <Pill color="rose">DQX warnings (optional)</Pill>
+              <Arrow />
+              <Pill color="emerald">dqx_warnings audit</Pill>
             </div>
           </div>
           {/*
@@ -502,6 +604,19 @@ export default function AboutTab() {
               is the lowest-latency option. A future Kafka-fronted ingest could swap in true RTM without changing the
               rest of this diagram.
             </p>
+            <p>
+              <span className="font-medium text-foreground">Governed model honesty.</span> The industry model mirrors a
+              canonical enterprise schema, but only a curated column subset is populated by the mapper (others are
+              intentionally <code>NULL</code>). Incident-driven facts (<code>asset.failure_record</code>,{' '}
+              <code>quality.inspection_result</code>, <code>quality.ncr</code>) are empty at steady state and fill only
+              during incidents. For real-time monitoring the agents prefer the live streaming tables — the governed
+              model is for enterprise-term, audit-grade questions.
+            </p>
+            <p>
+              <span className="font-medium text-foreground">DQX is observability-only.</span> When enabled, DQX flags
+              suspect rows into a separate <code>dqx_warnings</code> audit table beside the QC gate; it never changes the
+              valid/reject decision and never takes the streaming job down. Off by default.
+            </p>
           </div>
         </div>
       </section>
@@ -518,6 +633,8 @@ const PIPELINE_PILL_COLORS: Record<string, string> = {
   violet: 'bg-violet-100 text-violet-800 dark:bg-violet-900/30 dark:text-violet-300',
   sky: 'bg-sky-100 text-sky-800 dark:bg-sky-900/30 dark:text-sky-300',
   red: 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300',
+  cyan: 'bg-cyan-100 text-cyan-800 dark:bg-cyan-900/30 dark:text-cyan-300',
+  rose: 'bg-rose-100 text-rose-800 dark:bg-rose-900/30 dark:text-rose-300',
 };
 
 function Pill({ color, children }: { color: keyof typeof PIPELINE_PILL_COLORS; children: ReactNode }) {

@@ -158,6 +158,9 @@ def _emit_targets(data: dict, deployer_email: str | None = None) -> str:
             ("schema", "uc_schema"),
             ("src_catalog", "src_catalog"),
             ("src_schema", "src_schema"),
+            # Industry Data Model (MVM) silver catalog. Defaults to the live
+            # ``uc_catalog`` below when unset (see fallback before the loop).
+            ("mvm_catalog", "mvm_catalog"),
             ("lakebase_catalog", "lakebase_catalog"),
             ("lakebase_schema", "lakebase_schema"),
             ("genie_space_id", "genie_space_id"),
@@ -184,6 +187,13 @@ def _emit_targets(data: dict, deployer_email: str | None = None) -> str:
             # untagged resources; otherwise leave it empty.
             ("remove_after", "remove_after"),
         ]
+        # mvm_catalog defaults to the live UC catalog. Installing a brand-new
+        # catalog needs metastore CREATE CATALOG (denied on many workspaces,
+        # e.g. FEVM serverless); reusing an owned catalog is the portable
+        # default. The MVM model's domain schemas (asset/production/quality/…)
+        # don't collide with the streaming schema.
+        if not str(prof.get("mvm_catalog") or "").strip():
+            prof = {**prof, "mvm_catalog": prof.get("uc_catalog", "")}
         for bundle_key, prof_key in var_map:
             val = prof.get(prof_key, "")
             if val is None:
@@ -226,6 +236,8 @@ def _emit_targets(data: dict, deployer_email: str | None = None) -> str:
                     app_sp,
                     prof.get("src_catalog", ""),
                     prof.get("src_schema", ""),
+                    dqx_enabled=bool(prof.get("dqx_enabled")),
+                    mvm_silver_enabled=bool(prof.get("mvm_silver_enabled")),
                 )
             )
 
@@ -387,6 +399,47 @@ def _solution_accelerator_job(
         "                  - \"${var.lakebase_catalog}\"",
         "                  - \"--lakebase-schema\"",
         "                  - \"${var.lakebase_schema}\"",
+        # ── Industry Data Model (MVM) install + initial silver populate ──────
+        # One-time (idempotent) provisioning of the governed silver layer the
+        # SQL / Genie agents + DQX referential check read. Pulls the model SQL
+        # live from the upstream repo and applies it via the SDK Statement
+        # Execution API (serverless-safe). Runs independently of init_uc; the
+        # populate step depends on BOTH the model (install) and the reference
+        # data (bootstrap_reference). The full install (metric views) can take
+        # tens of minutes — acceptable in one-time setup, never on app deploy.
+        "            - task_key: install_industry_data_model",
+        "              environment_key: default",
+        "              spark_python_task:",
+        "                python_file: ../scripts/install_industry_data_model.py",
+        "                parameters:",
+        "                  - \"--catalog\"",
+        "                  - \"${var.mvm_catalog}\"",
+        "                  - \"--warehouse-id\"",
+        "                  - \"${var.sql_warehouse_id}\"",
+        "                  - \"--host\"",
+        "                  - \"${workspace.host}\"",
+        # The governed schemas are created here, so the app SP is granted read
+        # here too — init_uc runs earlier, when they don't exist yet.
+        "                  - \"--app-client-id\"",
+        "                  - \"${var.app_client_id}\"",
+        "            - task_key: populate_silver_model",
+        "              depends_on:",
+        "                - task_key: install_industry_data_model",
+        "                - task_key: bootstrap_reference",
+        "              environment_key: default",
+        "              spark_python_task:",
+        "                python_file: ../agent_server/serving/silver_mapper.py",
+        "                parameters:",
+        "                  - \"--mvm-catalog\"",
+        "                  - \"${var.mvm_catalog}\"",
+        "                  - \"--src-catalog\"",
+        "                  - \"${var.catalog}\"",
+        "                  - \"--src-schema\"",
+        "                  - \"${var.schema}\"",
+        "                  - \"--warehouse-id\"",
+        "                  - \"${var.sql_warehouse_id}\"",
+        "                  - \"--host\"",
+        "                  - \"${workspace.host}\"",
         "          environments:",
         "            - environment_key: default",
         "              spec:",
@@ -481,7 +534,10 @@ def _streaming_producer_job(suffix: str = "", app_sp: str = "") -> list[str]:
     ]
 
 
-def _streaming_quality_sync_job(suffix: str = "", app_sp: str = "") -> list[str]:
+def _streaming_quality_sync_job(
+    suffix: str = "", app_sp: str = "", dqx_enabled: bool = False,
+    mvm_silver_enabled: bool = False,
+) -> list[str]:
     """Streaming Quality + Side-Outputs — classic single-node compute.
 
     Tier-2 analytics consumer. Reads bronze Delta tables (Zerobus-fed),
@@ -577,6 +633,26 @@ def _streaming_quality_sync_job(suffix: str = "", app_sp: str = "") -> list[str]
         # docstring for the latency trade-off rationale.
         "                  - \"--trigger-mode\"",
         "                  - \"availableNow\"",
+        # DQX augmentation: --mvm-catalog is always passed (harmless when DQX is
+        # off); --dqx-enabled "1" is emitted only for targets that opt in via
+        # ``dqx_enabled: true`` in project-settings. dqx_augment reads these off
+        # the env vars streaming_quality_sync._apply_cli_env promotes them to.
+        "                  - \"--mvm-catalog\"",
+        "                  - \"${var.mvm_catalog}\"",
+        *([
+            "                  - \"--dqx-enabled\"",
+            "                  - \"1\"",
+        ] if dqx_enabled else []),
+        # Streaming silver (design B): when on, each micro-batch is MERGE-upserted
+        # into the governed MVM fact tables from inside foreachBatch — the model
+        # rides this same Zerobus→bronze path at seconds latency, replacing the
+        # retired 30-min silver_model_refresh job. Emitted only for opted-in
+        # targets; deploys dark otherwise. Adds a 5th stream (quality_checks →
+        # quality.inspection_result) when enabled.
+        *([
+            "                  - \"--mvm-silver\"",
+            "                  - \"1\"",
+        ] if mvm_silver_enabled else []),
         "          tags:",
         "            project: line-manager-streaming",
         "            resource_group: production-line-copilot",
@@ -586,14 +662,19 @@ def _streaming_quality_sync_job(suffix: str = "", app_sp: str = "") -> list[str]
         "            - environment_key: default",
         "              spec:",
         "                environment_version: \"2\"",
-        # psycopg2-binary is REQUIRED on the driver. _make_partition_writer
-        # opens a Lakebase connection inside the foreachPartition closure
-        # (executor side) and the driver-side *_latest upsert also calls
-        # psycopg2 via _connect_with_token. databricks-sdk is needed for
-        # the OAuth token mint.
+        # psycopg2-binary is REQUIRED on the driver: the *_latest upsert connects
+        # to Lakebase via _connect_with_token inside foreachBatch. databricks-sdk
+        # is needed for the OAuth token mint.
         "                dependencies:",
         "                  - \"databricks-sdk>=0.89.0\"",
         "                  - \"psycopg2-binary>=2.9\"",
+        # databricks-labs-dqx provides DQEngine (freshness/range/referential
+        # checks). Imported lazily + fail-safe in dqx_augment, so a missing lib
+        # only DISABLES DQX silently — it must be present for DQX_ENABLED=1 to do
+        # anything. Cheap to always ship (only invoked when DQX_ENABLED=1).
+        # Pin >=0.15: the DQEngine ctor arg order and the freshness check name
+        # (is_data_fresh) both changed vs 0.10, and dqx_augment targets 0.15.
+        "                  - \"databricks-labs-dqx>=0.15\"",
     ]
 
 
@@ -648,6 +729,8 @@ def _resources_setup_plus_zerobus_streaming(
     app_sp: str = "",
     src_catalog: object = "",
     src_schema: object = "",
+    dqx_enabled: bool = False,
+    mvm_silver_enabled: bool = False,
 ) -> list[str]:
     """Full resource set for Zerobus-enabled targets.
 
@@ -671,8 +754,16 @@ def _resources_setup_plus_zerobus_streaming(
         "      jobs:",
         *_solution_accelerator_job(suffix, app_sp, src_catalog, src_schema),
         *_streaming_producer_job(suffix, app_sp),
-        *_streaming_quality_sync_job(suffix, app_sp),
+        *_streaming_quality_sync_job(
+            suffix, app_sp, dqx_enabled=dqx_enabled,
+            mvm_silver_enabled=mvm_silver_enabled,
+        ),
         *_history_ttl_job(suffix),
+        # NOTE: the MVM silver is populated by the streaming_quality_sync job's
+        # per-micro-batch MERGE (design B, --mvm-silver), NOT a separate refresh
+        # job. The old 30-min ``silver_model_refresh`` job was retired; a stale
+        # copy is dropped from the workspace on the next ``databricks bundle
+        # deploy``. Dimensions are seeded once by the setup job's populate step.
         # NOTE: the streaming_quality_sync job does the dual-write (Lakebase +
         # Delta) and owns quality validation. There is no separate syncer or
         # pipeline resource; a stale ``lakebase_syncer`` is dropped from the

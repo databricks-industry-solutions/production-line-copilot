@@ -3132,7 +3132,7 @@ wheels = [
 
 [[package]]
 name = "productionline-copilot-agent-server"
-version = "0.2.1"
+version = "0.3.0"
 source = { editable = "." }
 dependencies = [
     { name = "databricks-agents" },
@@ -3167,7 +3167,7 @@ dqx = [
 [package.metadata]
 requires-dist = [
     { name = "databricks-agents", specifier = ">=1.9" },
-    { name = "databricks-labs-dqx", marker = "extra == 'dqx'", specifier = ">=0.10" },
+    { name = "databricks-labs-dqx", marker = "extra == 'dqx'", specifier = ">=0.15" },
     { name = "databricks-langchain", specifier = ">=0.14" },
     { name = "databricks-sdk", specifier = ">=0.81.0" },
     { name = "databricks-sql-connector", specifier = ">=4.2" },

@@ -207,35 +207,9 @@ _TABLES: dict[str, str] = {
           resolution_notes  STRING
         ) USING DELTA {_CDF}
     """,
-    # ── HITL audit tables ────────────────────────────────────────────────
-    "decision_log": f"""
-        CREATE TABLE IF NOT EXISTS {{fqn}}.decision_log (
-          decision_id          STRING,
-          created_at           TIMESTAMP,
-          shift_id             STRING,
-          machine_id           STRING,
-          timestamp            STRING,
-          user_action          STRING,
-          specialist           STRING,
-          model_used           STRING,
-          response_time_ms     DOUBLE,
-          query                STRING,
-          recommendation       STRING,
-          reasoning_steps_json STRING,
-          trace_spans_json     STRING
-        ) USING DELTA {_CDF}
-    """,
-    "draft_artifacts": f"""
-        CREATE TABLE IF NOT EXISTS {{fqn}}.draft_artifacts (
-          artifact_id      STRING,
-          decision_id      STRING,
-          created_at       TIMESTAMP,
-          artifact_type    STRING,
-          title            STRING,
-          content_markdown STRING,
-          content_json     STRING
-        ) USING DELTA {_CDF}
-    """,
+    # NOTE: the decision_log / draft_artifacts tables were removed. The decision
+    # log is client-side (client/src/lib/decisionLogStorage.ts, localStorage), so
+    # the UC tables and their writer module had no reader and no writer.
     # ── Reference (Tier 2 OT enrichment) ────────────────────────────────
     "machine_registry": f"""
         CREATE TABLE IF NOT EXISTS {{fqn}}.machine_registry (
@@ -285,6 +259,20 @@ _TABLES: dict[str, str] = {
           FROM {fqn}.inventory_status_bronze
         )
         WHERE _rn = 1
+    """,
+    # ── DQX audit sink (Data Quality eXtended warnings) ───────────────────
+    # Stable, normalized audit table written by ``pipelines.dqx_augment`` when
+    # DQX is enabled (``DQX_ENABLED=1``). Created empty here (idempotent) so the
+    # Data Quality dashboard's DQX widgets always resolve, even before DQX is
+    # turned on. One row per (flagged bronze row × failed check).
+    "dqx_warnings": f"""
+        CREATE TABLE IF NOT EXISTS {{fqn}}.dqx_warnings (
+          bronze_table    STRING,
+          flagged_at      TIMESTAMP,
+          check_name      STRING,
+          check_function  STRING,
+          message         STRING
+        ) USING DELTA {_CDF}
     """,
 }
 
@@ -413,6 +401,11 @@ def main() -> None:
             cur.execute(f"GRANT SELECT ON SCHEMA {fqn} TO `{app_sp}`")
             cur.execute(f"GRANT SELECT, MODIFY ON TABLE {fqn}.scenario_commands TO `{app_sp}`")
             print(f"OK: grant USE CATALOG + SELECT ON SCHEMA + scenario_commands MODIFY -> app SP {app_sp[:8]}…")
+
+            # NOTE: the governed MVM schemas (asset/production/quality/inventory)
+            # are granted by install_industry_data_model.py, not here — this task
+            # runs before the model exists, so the grants would have nothing to
+            # apply to.
         else:
             print(
                 "WARN: --app-client-id not provided; skipping app SP grants. "

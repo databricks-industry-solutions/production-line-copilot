@@ -8,6 +8,7 @@ predicates decide which rows pass to gold and which are dropped into
 from __future__ import annotations
 
 import importlib
+import inspect
 
 import pytest
 
@@ -194,20 +195,18 @@ def test_qc_rules_cover_all_bronze_tables():
 # ── dual-write semantics (append history vs upsert latest) ────────────────
 
 
-def test_history_sql_uses_do_nothing_not_update():
-    """*_history tables are append-only — duplicates from Spark batch retries
-    must be silently ignored, NOT overwrite existing rows. ``DO NOTHING`` makes
-    retries safe (idempotent at-least-once delivery).
+def test_history_sink_stays_out_of_this_job():
+    """The producer owns the ``*_history`` write (lakebase_sink.py, ~200 ms).
 
-    This guards against an accidental find/replace turning history sinks into
-    upsert sinks, which would corrupt the playback cursor (last-write-wins
-    instead of append-only)."""
+    This job used to build that SQL and then discard it, which made the sink
+    look covered when nothing executed it. The append-only ON CONFLICT
+    semantics are genuinely tested against the producer in
+    tests/streaming_sim/test_lakebase_sink.py.
+    """
     mod = importlib.import_module("pipelines.streaming_quality_sync")
     for sql_name in ("_MS_HISTORY", "_KPI_HISTORY", "_EVT_HISTORY", "_INV_HISTORY"):
-        base_sql, _template = getattr(mod, sql_name)
-        assert "ON CONFLICT" in base_sql, f"{sql_name} must declare ON CONFLICT"
-        assert "DO NOTHING" in base_sql, f"{sql_name} must use DO NOTHING (append semantics)"
-        assert "DO UPDATE" not in base_sql, f"{sql_name} must NOT update on conflict"
+        assert not hasattr(mod, sql_name), f"{sql_name} is dead — the producer owns it"
+    assert "history" not in inspect.signature(mod._make_dual_sink).parameters
 
 
 def test_latest_sql_uses_do_update_not_nothing():
@@ -221,25 +220,15 @@ def test_latest_sql_uses_do_update_not_nothing():
         assert "DO UPDATE" in base_sql, f"{sql_name} must use DO UPDATE (upsert semantics)"
 
 
-def test_history_sql_targets_history_tables():
-    """Sanity check: the history SQL must INSERT into the *_history tables,
-    not the *_latest tables. Catches accidental copy/paste of SQL strings."""
-    mod = importlib.import_module("pipelines.streaming_quality_sync")
-    assert "ai_serving.machine_state_history" in mod._MS_HISTORY[0]
-    assert "ai_serving.line_kpi_history" in mod._KPI_HISTORY[0]
-    assert "ai_serving.event_log_history" in mod._EVT_HISTORY[0]
-    assert "ai_serving.inventory_status_history" in mod._INV_HISTORY[0]
-
-
-def test_history_sql_uses_execute_values_template():
-    """The history SQL must end with ``VALUES %s`` so psycopg2's
+def test_latest_sql_uses_execute_values_template():
+    """The latest SQL must end with ``VALUES %s`` so psycopg2's
     ``execute_values`` can splice multi-row tuples into one INSERT — this
     is the latency-critical path. The template (second tuple element) must
     use named ``%(...)s`` placeholders matching the SELECT columns so
     ``Row.asDict()`` works without extra mapping.
     """
     mod = importlib.import_module("pipelines.streaming_quality_sync")
-    for sql_name in ("_MS_HISTORY", "_KPI_HISTORY", "_EVT_HISTORY", "_INV_HISTORY"):
+    for sql_name in ("_MS_LATEST", "_KPI_LATEST", "_EVT_LATEST", "_INV_LATEST"):
         base_sql, template = getattr(mod, sql_name)
         assert "VALUES %s" in base_sql, f"{sql_name} must end its INSERT with 'VALUES %s'"
         assert template.startswith("(") and template.endswith(")"), (
@@ -248,6 +237,181 @@ def test_history_sql_uses_execute_values_template():
         assert "%(" in template, (
             f"{sql_name} template must use named %(col)s placeholders"
         )
+
+
+# ── streaming-silver MVM merge (design B) ─────────────────────────────────
+#
+# These exercise the governed-model upsert wiring WITHOUT Spark/Delta by
+# injecting a fake session + dataframe that record the SQL executed and the
+# temp-view lifecycle. They pin the three guarantees that matter for a change
+# to the critical streaming job: (1) it does ZERO work when disabled (no added
+# latency on the dark-deploy default), (2) it is idempotent + non-fatal, and
+# (3) a stream can feed 0..N governed facts via the single-source-of-truth map.
+
+
+class _FakeCatalog:
+    def __init__(self):
+        self.dropped: list[str] = []
+
+    def dropTempView(self, name):  # noqa: N802 (Spark API name)
+        self.dropped.append(name)
+
+
+class _FakeResult:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def collect(self):
+        return self._rows
+
+
+class _FakeSession:
+    """Records executed SQL; returns canned columns for introspection."""
+
+    def __init__(self, target_cols, fail_on_merge=False):
+        self._cols = target_cols
+        self.fail_on_merge = fail_on_merge
+        self.executed: list[str] = []
+        self.catalog = _FakeCatalog()
+
+    def sql(self, q):
+        self.executed.append(q)
+        if "information_schema.columns" in q:
+            return _FakeResult([[c] for c in self._cols])
+        if q.startswith("MERGE") and self.fail_on_merge:
+            raise RuntimeError("boom")
+        return _FakeResult([])
+
+    @property
+    def merges(self):
+        return [q for q in self.executed if q.startswith("MERGE")]
+
+    @property
+    def introspects(self):
+        return [q for q in self.executed if "information_schema.columns" in q]
+
+
+class _FakeDF:
+    def __init__(self, sess):
+        self.sparkSession = sess
+        self.views: list[str] = []
+
+    def createOrReplaceTempView(self, name):  # noqa: N802
+        self.views.append(name)
+
+
+@pytest.fixture()
+def sqs(monkeypatch):
+    """streaming_quality_sync module with a clean MVM cache + MVM_CATALOG set."""
+    mod = importlib.import_module("pipelines.streaming_quality_sync")
+    mod._MVM_COLS_CACHE.clear()
+    monkeypatch.setattr(mod, "MVM_CATALOG", "cat", raising=False)
+    yield mod
+    mod._MVM_COLS_CACHE.clear()
+
+
+# failure_record's installed columns (superset is fine; build_merge filters).
+_FR_COLS = {
+    "failure_record_id", "equipment_register_id", "production_line_id",
+    "failure_number", "failure_datetime", "failure_mode_description",
+    "record_status", "created_timestamp",
+}
+
+
+def test_mvm_merge_noop_when_disabled(sqs, monkeypatch):
+    """Latency guard: with MVM_SILVER_ENABLED off, the merge does NOTHING —
+    no introspect, no MERGE, no temp view. This is the dark-deploy default, so
+    the critical streaming job pays zero extra cost until explicitly opted in."""
+    monkeypatch.setattr(sqs, "MVM_SILVER_ENABLED", False, raising=False)
+    sess = _FakeSession(_FR_COLS)
+    df = _FakeDF(sess)
+    sqs._mvm_merge(df, "failure_record", batch_id=1)
+    assert sess.executed == []
+    assert df.views == []
+
+
+def test_mvm_merge_executes_and_cleans_up_when_enabled(sqs, monkeypatch):
+    monkeypatch.setattr(sqs, "MVM_SILVER_ENABLED", True, raising=False)
+    sess = _FakeSession(_FR_COLS)
+    df = _FakeDF(sess)
+    sqs._mvm_merge(df, "failure_record", batch_id=7)
+    assert len(sess.merges) == 1
+    assert sess.merges[0].startswith("MERGE INTO cat.asset.failure_record t")
+    # temp view created then dropped (no leak)
+    assert df.views == ["_mvm_src_failure_record_7"]
+    assert sess.catalog.dropped == ["_mvm_src_failure_record_7"]
+
+
+def test_mvm_merge_caches_introspection(sqs, monkeypatch):
+    """Column introspection hits information_schema at most once per key — a
+    per-batch query would add latency to every micro-batch."""
+    monkeypatch.setattr(sqs, "MVM_SILVER_ENABLED", True, raising=False)
+    sess = _FakeSession(_FR_COLS)
+    for b in (1, 2, 3):
+        sqs._mvm_merge(_FakeDF(sess), "failure_record", batch_id=b)
+    assert len(sess.introspects) == 1
+    assert len(sess.merges) == 3
+
+
+def test_mvm_merge_skips_when_target_not_installed(sqs, monkeypatch):
+    """Empty introspection (model not installed) -> no MERGE, nothing cached
+    (so a later batch after setup can pick it up)."""
+    monkeypatch.setattr(sqs, "MVM_SILVER_ENABLED", True, raising=False)
+    sess = _FakeSession(set())  # target has no columns
+    sqs._mvm_merge(_FakeDF(sess), "failure_record", batch_id=1)
+    assert sess.merges == []
+    assert "failure_record" not in sqs._MVM_COLS_CACHE
+
+
+def test_mvm_merge_skips_when_merge_key_absent(sqs, monkeypatch):
+    """If the surrogate key column is missing there's nothing to match on;
+    build_merge returns None and no MERGE runs (view still cleaned up)."""
+    monkeypatch.setattr(sqs, "MVM_SILVER_ENABLED", True, raising=False)
+    sess = _FakeSession({"failure_number", "record_status"})  # no *_id key
+    df = _FakeDF(sess)
+    sqs._mvm_merge(df, "failure_record", batch_id=1)
+    assert sess.merges == []
+    assert sess.catalog.dropped == ["_mvm_src_failure_record_1"]
+
+
+def test_mvm_merge_is_non_fatal_and_drops_view_on_error(sqs, monkeypatch):
+    """A MERGE failure must NEVER propagate (it would crash the streaming job)
+    and must still drop the temp view."""
+    monkeypatch.setattr(sqs, "MVM_SILVER_ENABLED", True, raising=False)
+    sess = _FakeSession(_FR_COLS, fail_on_merge=True)
+    df = _FakeDF(sess)
+    sqs._mvm_merge(df, "failure_record", batch_id=9)  # must not raise
+    assert sess.catalog.dropped == ["_mvm_src_failure_record_9"]
+
+
+def test_mvm_only_sink_loops_all_keys_and_is_non_fatal(sqs, monkeypatch):
+    """quality_checks feeds TWO governed facts; a failure on one must not stop
+    the other, and nothing propagates."""
+    monkeypatch.setattr(sqs, "MVM_SILVER_ENABLED", True, raising=False)
+    calls = []
+
+    def fake_merge(df, k, b):
+        calls.append(k)
+        if k == "ncr":
+            raise RuntimeError("boom")
+    monkeypatch.setattr(sqs, "_mvm_merge", fake_merge)
+    sink = sqs._make_mvm_only_sink("quality_checks", ("inspection_result", "ncr"))
+    sink(_FakeDF(_FakeSession(set())), 1)  # must not raise
+    assert calls == ["inspection_result", "ncr"]
+
+
+def test_stream_to_mvm_keys_are_stream_enabled_mappings():
+    """Every governed fact wired into the job must be a stream-enabled mapping
+    in silver_mapper — guards against a rename/drift silently disabling a
+    stream's MVM upsert."""
+    mod = importlib.import_module("pipelines.streaming_quality_sync")
+    from agent_server.serving import silver_mapper as sm
+    streamable = {m.key for m in sm.MAPPINGS if m.is_streaming}
+    for stream_name, keys in mod._STREAM_TO_MVM.items():
+        for k in keys:
+            assert k in streamable, f"{stream_name}->{k} is not a stream-enabled mapping"
+    # quality_checks fans out to both quality facts
+    assert set(mod._STREAM_TO_MVM["quality_checks"]) == {"inspection_result", "ncr"}
 
 
 def test_latest_per_key_collapses_to_one_row(spark):

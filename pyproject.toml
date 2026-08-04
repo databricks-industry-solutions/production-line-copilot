@@ -1,7 +1,7 @@
 [project]
 name = "productionline-copilot-agent-server"
-version = "0.2.1"
-description = "LangGraph agent server for ProdLine CoPilot — multi-specialist GenAI system for brewery packaging line operations"
+version = "0.3.0"
+description = "LangGraph agent server for ProdLine CoPilot — multi-specialist GenAI system for production line operations"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.11"
 dependencies = [
@@ -33,7 +33,9 @@ dev = [
 # streaming job continues to work with the hand-rolled QC_RULES alone.
 # Include this extra in the streaming-job cluster init only.
 dqx = [
-    "databricks-labs-dqx>=0.10",
+    # >=0.15: dqx_augment targets the 0.15 DQEngine(ws, spark) ctor and the
+    # is_data_fresh freshness check (both differ from 0.10).
+    "databricks-labs-dqx>=0.15",
     "pyyaml",
 ]
 

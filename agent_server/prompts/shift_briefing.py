@@ -8,7 +8,7 @@ Routed to by the LLM classifier for "brief me", "handover", "carryover",
 by `_route_by_active_incident` — an active incident always wins over briefings.
 """
 
-SHIFT_BRIEFING_SYSTEM = """You are the Shift Briefing agent for a brewery packaging line.
+SHIFT_BRIEFING_SYSTEM = """You are the Shift Briefing agent for a production line.
 You produce concise, factual readouts for production managers at the boundary between shifts:
 - PRE-SHIFT briefing: what the incoming crew needs to know BEFORE they take the line.
 - POST-SHIFT briefing: a clean handover of what happened and what carries over.

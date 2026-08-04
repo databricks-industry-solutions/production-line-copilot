@@ -20,12 +20,13 @@ import { isEventActive, buildResolvedTsByMachine } from './lib/eventFeedUtils';
 import ChatPanel from './components/ChatPanel';
 import AskLinePanel from './components/AskLinePanel';
 import AboutTab from './components/AboutTab';
+import MultiAITab from './components/MultiAITab';
 import MachineDetailCard from './components/MachineDetailCard';
 import CostObservabilityTab from './components/CostObservabilityTab';
 import DataQualityTab from './components/DataQualityTab';
 import AdminJobControls from './components/AdminJobControls';
 
-type TabId = 'tower' | 'alerts' | 'ops' | 'quality' | 'about';
+type TabId = 'tower' | 'alerts' | 'ops' | 'quality' | 'multiai' | 'about';
 
 // Mirrors ``apply_incident`` in ``src/streaming_sim/incidents.py`` — kept in
 // sync manually because the client must override tile color the moment a
@@ -683,7 +684,12 @@ function App() {
               <TabButton
                 active={activeTab === 'quality'}
                 onClick={() => setActiveTab('quality')}
-                label="Data Quality"
+                label="Data Integrity"
+              />
+              <TabButton
+                active={activeTab === 'multiai'}
+                onClick={() => setActiveTab('multiai')}
+                label="Multi-AI"
               />
               <TabButton active={activeTab === 'about'} onClick={() => setActiveTab('about')} label="About" />
             </nav>
@@ -845,7 +851,21 @@ function App() {
             </ErrorBoundary>
           )}
 
-          {path !== '/admin' && activeTab === 'about' && <AboutTab />}
+          {/* Boundaries for the same reason every other tab has one: both render
+              server JSON, and an unguarded throw here is caught only by the root
+              boundary, which replaces the whole app — live line status included —
+              rather than the one tab that failed. */}
+          {path !== '/admin' && activeTab === 'multiai' && (
+            <ErrorBoundary>
+              <MultiAITab />
+            </ErrorBoundary>
+          )}
+
+          {path !== '/admin' && activeTab === 'about' && (
+            <ErrorBoundary>
+              <AboutTab />
+            </ErrorBoundary>
+          )}
         </div>
       </main>
     </div>

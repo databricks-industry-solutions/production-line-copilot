@@ -151,6 +151,39 @@ createApp({
         });
       });
 
+      app.get('/api/ops/reconciliation', async (req, res) => {
+        const windowRaw = req.query.window_minutes;
+        const windowNum = Number(windowRaw ?? 15);
+        // why: bound the scan so a stray query string can't launch a full-history
+        // warehouse scan on every poll.
+        const windowMinutes = Number.isFinite(windowNum)
+          ? Math.max(1, Math.min(1440, Math.trunc(windowNum)))
+          : 15;
+        await proxyToAgent(res, `/ops/reconciliation?window_minutes=${windowMinutes}`, {
+          // Fans out to several warehouse queries plus Lakebase; a cold warehouse
+          // can take a while to wake.
+          timeoutMs: 60000,
+          errorMessage: 'reconciliation unavailable',
+        });
+      });
+
+      app.get('/api/ops/models', async (_req, res) => {
+        await proxyToAgent(res, '/ops/models', {
+          // First call may list the workspace's serving endpoints; the agent
+          // caches it for the life of the process, so only this one is slow.
+          timeoutMs: 30000,
+          errorMessage: 'model roster unavailable',
+        });
+      });
+
+      app.get('/api/ops/topology', async (_req, res) => {
+        await proxyToAgent(res, '/ops/topology', {
+          // Reads env only — no workspace calls, so this stays fast.
+          timeoutMs: 10000,
+          errorMessage: 'system topology unavailable',
+        });
+      });
+
       app.get('/api/ops/control/state', async (req, res) => {
         await proxyToAgent(res, '/ops/control/state', {
           timeoutMs: 120000,

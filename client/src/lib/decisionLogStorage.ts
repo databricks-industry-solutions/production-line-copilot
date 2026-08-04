@@ -3,15 +3,6 @@ interface ReasoningStep {
   detail: string;
 }
 
-interface TraceSpan {
-  name: string;
-  span_type: string;
-  status: string;
-  duration_ms: number;
-  inputs?: string;
-  outputs?: string;
-}
-
 export interface DecisionEntry {
   id: string;
   timestamp: string;
@@ -22,7 +13,6 @@ export interface DecisionEntry {
   reasoningSteps?: ReasoningStep[];
   responseTimeMs?: number;
   modelUsed?: string;
-  traceSpans?: TraceSpan[];
 }
 
 const STORAGE_KEY = 'line_manager_decision_log';
@@ -49,8 +39,7 @@ export function addDecision(
   userAction: 'accepted' | 'rejected' | 'noted' = 'noted',
   reasoningSteps?: ReasoningStep[],
   responseTimeMs?: number,
-  modelUsed?: string,
-  traceSpans?: TraceSpan[]
+  modelUsed?: string
 ) {
   const entries = loadLog();
   entries.push({
@@ -63,7 +52,6 @@ export function addDecision(
     reasoningSteps,
     responseTimeMs,
     modelUsed,
-    traceSpans,
   });
   saveLog(entries);
 }

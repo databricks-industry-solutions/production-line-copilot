@@ -34,7 +34,7 @@ Validates local tooling (Databricks CLI, Node 22+, `uv`, `psycopg2`) and workspa
 - **Lakebase Autoscale** project / branch / endpoint
 - **Zerobus Ingest** + server endpoint URL
 - **Producer service principal** + Databricks secret for `producer_client_secret_ref`
-- **Model serving endpoints**: defaults `databricks-gpt-5-mini` and `databricks-gpt-5`; set `model_specialist_endpoint` / `model_advanced_endpoint` in project-settings if your workspace serves them under different names
+- **Model serving endpoints**: each agent role prefers a vendor-specific Foundation Model API endpoint (six vendors — see `docs/ARCHITECTURE.md`), falling back to `databricks-gpt-5-mini` / `databricks-gpt-5` for anything your workspace doesn't serve. Set `model_specialist_endpoint` / `model_advanced_endpoint` if those two are named differently here, or `model_multi_vendor: false` to run everything on them
 - **Databricks CLI**, **Node.js 22+**, **`uv`**
 
 ### Permissions
@@ -58,7 +58,17 @@ Fill required fields, see [`config/README.md`](../../config/README.md). **`app.y
 | `app_client_id`                                         | Leave `SET_ME`, auto-captured after first deploy                                                                                       |
 | `src_catalog` / `src_schema`                            | **Empty by default**: setup job generates reference data. Set both only to copy from a seed schema.                                    |
 | `lakebase_catalog`                                      | Optional, required only for Synced Tables                                                                                              |
-| `model_specialist_endpoint` / `model_advanced_endpoint` | Optional, defaults are the GPT-5 Foundation Model APIs; override only if your workspace serves the LLMs under different endpoint names |
+| `model_specialist_endpoint` / `model_advanced_endpoint` | Optional. The **fallback tiers** a role lands on when its preferred per-role model isn't served here; override only if your workspace names the GPT-5 endpoints differently |
+| `model_multi_vendor`                                    | Optional, defaults `true`. Set `false` to ignore the per-role roster and run every role on the two tiers above                          |
+| `model_roles`                                           | Optional map of `role: endpoint`. Pins one role to a specific model; roles you omit keep the roster default. See the commented example in the file, and `--models` below |
+
+**Check which models your workspace serves** before or after deploying — every deploy prints this, and you can run it on its own:
+
+```bash
+python3 scripts/preflight.py dev --models
+```
+
+It lists each role, the endpoint that will answer for it, whether that came from the shipped default or your `model_roles` config, and whether this workspace actually serves it. Roles marked `MISSING` still work — they fall back to the tier endpoints — but they lose their preferred vendor, so enable those models under **Serving → Endpoints** or pin alternatives in `model_roles`.
 
 ---
 
@@ -170,7 +180,7 @@ Optional: `uv run python scripts/verify_lakebase.py` for a local Postgres smoke 
 
 ## Notebook order (optional)
 
-Notebooks in `notebooks/` **00 → 05** mirror the setup tasks. Prefer the bundle setup job for repeatable installs. Notebooks assume widgets from **`00_Parameters`** or a multi-task job passing the same parameters.
+Notebooks in `notebooks/` **00 → 07** mirror the setup tasks (**06** and **07** are the optional governed industry model). Prefer the bundle setup job for repeatable installs. Notebooks assume widgets from **`00_Parameters`** or a multi-task job passing the same parameters.
 
 Items not covered by notebooks alone (handled by bundle + `deploy.sh`):
 
@@ -178,6 +188,31 @@ Items not covered by notebooks alone (handled by bundle + `deploy.sh`):
 - Continuous **producer** + **`streaming_quality_sync`** jobs
 - App env derivation and deploy
 - Lakebase role registration
+
+---
+
+## The governed industry model (optional)
+
+Set `mvm_silver_enabled: true` to install the Databricks **Manufacturing**
+industry data model alongside the real-time path, and to keep it current from
+the same stream (seconds, not a batch window).
+
+Two things are worth knowing before you turn it on:
+
+- **It installs the whole model, not a subset.** That is 13 schemas, ~114
+  tables, and ~95 metric views. This accelerator's simulator populates **12
+  tables across 4 schemas** (`asset`, `production`, `quality`, `inventory`) —
+  everything else is created empty, because the model is installed as the
+  standard defines it rather than trimmed to the demo. Expect the install to
+  take tens of minutes; it runs once, in the setup job.
+- **The incident tables are empty at steady state.** `asset.failure_record`,
+  `quality.inspection_result`, and `quality.ncr` only fill when an incident
+  flows through the line, so a zero row count there is correct, not a fault.
+  The governed Genie space is configured to say so rather than invent rows.
+
+The **Data Integrity** tab in the app is where you verify the governed model
+agrees with the live path — the reconciliation panel sits beside the
+quality-gate dashboard there.
 
 ---
 

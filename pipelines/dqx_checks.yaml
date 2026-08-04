@@ -31,53 +31,64 @@ checks:
     name: machine_state__ts_present
     filter: 'true'
 
+  # Freshness. DQX >=0.15 replaced the removed ``is_older_than_n_seconds``
+  # with ``is_data_fresh`` (minute granularity). Threshold is 5 min, NOT 60 s:
+  # this analytics path drains via ``availableNow`` on a ~60 s cycle, so rows
+  # are inherently 30-90 s old when processed — a 60 s SLA would flag virtually
+  # every healthy row. 5 min catches genuine producer stalls / Zerobus backups
+  # without false positives. (Live-UI latency is owned by the producer's direct
+  # Lakebase dual-write, not this job.) Renamed stale_60s -> stale_5m.
   - criticality: warn
     check:
-      function: is_older_than_n_seconds
+      function: is_data_fresh
       arguments:
         column: ts
-        seconds: 60
-    name: machine_state__stale_60s
+        max_age_minutes: 5
+    name: machine_state__stale_5m
     filter: 'true'
 
-  # line_kpi — throughput must be non-negative
-  # QC_RULES covers this for inventory (``on_hand_qty >= 0``) but not for
-  # KPIs. A negative throughput_per_min points at a producer bug we want
-  # to catch in dev before it lands in gold_history.
+  # line_kpi — throughput must be non-negative.
+  # Column is ``total_throughput`` on line_kpi_bronze (NOT throughput_per_min,
+  # which lives on machine_state). A wrong column name makes DQX skip the check
+  # with an "invalid check columns" meta-warning rather than evaluating it.
   - criticality: warn
     check:
       function: is_not_less_than
       arguments:
-        column: throughput_per_min
+        column: total_throughput
         limit: 0
     name: line_kpi__throughput_non_negative
     filter: 'true'
 
-  # line_kpi — oee_pct plausible range (0..1)
-  # We ship oee_pct as a fraction (0..1) but a subtle producer bug could
-  # emit percent-values (0..100) and downstream aggregations would silently
-  # produce nonsense. Belt-and-suspenders on top of the producer schema.
+  # line_kpi — OEE plausible range.
+  # Column is ``oee_to_now`` (running OEE). The producer ships this as a
+  # PERCENTAGE (0..100), same as availability/performance/quality_to_now — not
+  # a 0..1 fraction. The check bounds must match: a value <0 or >100 indicates a
+  # real producer bug. (Name kept ``_in_unit_range`` for dashboard continuity.)
   - criticality: warn
     check:
       function: is_in_range
       arguments:
-        column: oee_pct
+        column: oee_to_now
         min_limit: 0
-        max_limit: 1
+        max_limit: 100
     name: line_kpi__oee_in_unit_range
     filter: 'true'
 
-  # ── Reserved for step 3 (Industry Data Model silver layer) ────────
-  # Uncomment after ``line_manager_silver_mvm.asset.equipment_register`` is
-  # installed and the silver mapper is populating machine_id from that table.
-  # Until then DQX would log a WARN and skip the check.
-  #
-  # - criticality: warn
-  #   check:
-  #     function: foreign_key
-  #     arguments:
-  #       columns: [machine_id]
-  #       ref_columns: [machine_id]
-  #       ref_table: line_manager_silver_mvm.asset.equipment_register
-  #   name: machine_state__machine_id_referential
-  #   filter: "true"
+  # ── Referential integrity against the Industry Data Model silver layer ──
+  # Enabled once the Manufacturing MVM is installed (notebook 06) and the
+  # silver mapper (notebook 07) populates ``asset.equipment_register`` — its
+  # ``asset_number`` column carries the simulator's ``machine_id``. The
+  # ``${MVM_CATALOG}`` token is substituted at load time by
+  # ``dqx_augment.load_checks`` (default ``line_manager_silver_mvm``). If the
+  # MVM catalog/table is absent, DQX logs a WARN and skips the check, so this
+  # is safe to ship enabled.
+  - criticality: warn
+    check:
+      function: foreign_key
+      arguments:
+        columns: [machine_id]
+        ref_columns: [asset_number]
+        ref_table: ${MVM_CATALOG}.asset.equipment_register
+    name: machine_state__machine_id_referential
+    filter: 'true'

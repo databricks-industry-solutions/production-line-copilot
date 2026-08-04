@@ -94,39 +94,58 @@ def _is_placeholder(value: object) -> bool:
 
 
 def _discover_serving_endpoints(prof: dict | None = None) -> list[str]:
-    """Return the model serving endpoint names to validate.
+    """Return the serving endpoints that MUST exist, or the deploy is broken.
 
-    If the deploy profile configures ``model_*_endpoint`` overrides, validate
-    exactly those (so a workspace that serves the models under different names
-    doesn't fail on the gpt-5 defaults). Otherwise fall back to the endpoint
-    names baked into agent.py.
+    Only the fallback tiers qualify. Every agent role prefers a vendor-specific
+    model, but a missing one degrades to its tier rather than failing, so the
+    tiers are the real hard requirement — see ``_roster_endpoints`` for the
+    soft ones.
     """
-    if prof:
-        configured = {
-            str(prof.get(k) or "").strip()
-            for k in (
-                "model_specialist_endpoint",
-                "model_advanced_endpoint",
-                "model_orchestrator_endpoint",
-            )
-        }
-        configured = {n for n in configured if n and n != "SET_ME"}
-        if configured:
-            return sorted(configured)
+    configured = {
+        str((prof or {}).get(k) or "").strip()
+        for k in ("model_specialist_endpoint", "model_advanced_endpoint", "model_orchestrator_endpoint")
+    }
+    configured = {n for n in configured if n and not _is_placeholder(n)}
 
-    if not AGENT_PY.is_file():
-        return ["databricks-gpt-5-mini", "databricks-gpt-5"]
+    # Union, not either/or. This used to return the configured names alone when
+    # there were any, so filling in one field switched off checking of the
+    # others: with only the specialist tier set, the advanced roles still
+    # resolved to `databricks-gpt-5` at runtime and preflight never asked
+    # whether it existed. The deploy passed clean and every advanced role then
+    # failed on its first model call.
+    defaults = {_runtime_tier_endpoint(tier) for tier in ("specialist", "advanced")}
+    return sorted(configured | {d for d in defaults if d})
 
-    text = AGENT_PY.read_text(encoding="utf-8")
-    names: set[str] = set()
-    for match in re.finditer(
-        r'os\.environ\.get\(\s*["\']MODEL_[^"\']+["\']\s*,\s*["\']([^"\']+)["\']\s*\)',
-        text,
-    ):
-        names.add(match.group(1))
-    for match in re.finditer(r'["\'](databricks-gpt-[^"\']+)["\']', text):
-        names.add(match.group(1))
-    return sorted(names)
+
+def _runtime_tier_endpoint(tier: str) -> str:
+    """What the app itself would fall back to for ``tier``, asked of the app.
+
+    Importing the roster rather than restating its defaults here: two copies of
+    the same constant is how preflight ends up verifying an endpoint the runtime
+    stopped using.
+    """
+    try:
+        from agent_server import model_roster
+
+        return str(model_roster._tier_endpoint(tier) or "").strip()
+    except Exception:  # noqa: BLE001 - preflight must run without the app importable
+        return {"specialist": "databricks-gpt-5-mini", "advanced": "databricks-gpt-5"}.get(tier, "")
+
+
+def _roster_endpoints() -> list[tuple[str, str]]:
+    """Return ``(endpoint, role)`` for each per-role preferred model.
+
+    Absence is a WARN, not a FAIL: the app falls back to the tier endpoint for
+    that one role. Reporting them individually is still worth it — a workspace
+    that serves none of them runs the whole roster on one vendor, and the
+    operator should learn that here rather than from the About tab.
+    """
+    try:
+        sys.path.insert(0, str(ROOT))
+        from agent_server.model_roster import ROSTER
+    except Exception:  # noqa: BLE001 - preflight must run without app deps
+        return []
+    return [(a.endpoint, a.role) for a in ROSTER]
 
 
 def _parse_secret_ref(ref: str) -> tuple[str | None, str | None]:
@@ -448,6 +467,33 @@ def run_api_checks(
                 )
             )
 
+    # Per-role models. Missing ones only cost that role its preferred vendor.
+    required = set(serving_endpoints)
+    degraded: list[str] = []
+    for endpoint, role in _roster_endpoints():
+        if endpoint in required:
+            continue
+        try:
+            w.serving_endpoints.get(endpoint)
+        except Exception:  # noqa: BLE001 - NotFound or no CAN_VIEW, same outcome
+            degraded.append(f"{role} → {endpoint}")
+    if degraded:
+        results.append(
+            CheckResult(
+                "per-role model roster",
+                Status.WARN,
+                f"{len(degraded)} role(s) will fall back to the tier endpoints: "
+                + "; ".join(degraded),
+                "Harmless — those roles use model_specialist_endpoint / "
+                "model_advanced_endpoint instead. Enable the models in Serving → "
+                "Endpoints to run the full multi-vendor roster.",
+            )
+        )
+    else:
+        results.append(
+            CheckResult("per-role model roster", Status.PASS, "all preferred models served")
+        )
+
     secret_ref = str(prof.get("producer_client_secret_ref") or "").strip()
     scope, key = _parse_secret_ref(secret_ref)
     if not scope:
@@ -500,7 +546,130 @@ def run_api_checks(
             )
         )
 
+    # Per-domain governed spaces. Reported as one line rather than four so a
+    # fully wired deployment stays quiet, and a partial one names what is
+    # missing — those specialists silently drop to sql_query otherwise.
+    #
+    # Whether "none wired" is news depends entirely on mvm_silver_enabled. With
+    # it off there is no governed model to point a space at, so seven
+    # SQL-only specialists are the design and warning would be noise. With it on,
+    # none wired is the loudest case there is and the earlier version of this
+    # check was silent for it — `if wired` skipped the empty list, so an
+    # environment where provisioning had never run looked identical to one where
+    # it had succeeded.
+    domains = ["asset", "quality", "inventory", "production"]
+    wired = [
+        d for d in domains
+        if (lambda v: v and v != "SET_ME" and not _is_placeholder(v))(
+            str(prof.get(f"genie_space_{d}") or "").strip()
+        )
+    ]
+    mvm_on = str(prof.get("mvm_silver_enabled", "")).strip().lower() in {"true", "1", "yes"}
+    if len(wired) == len(domains):
+        results.append(
+            CheckResult(
+                "governed domain spaces",
+                Status.PASS,
+                f"all {len(domains)} domain Genie spaces configured",
+            )
+        )
+    elif not mvm_on and not wired:
+        results.append(
+            CheckResult(
+                "governed domain spaces",
+                Status.PASS,
+                "none — mvm_silver_enabled is off for this environment",
+                "By design: no governed model here, so all specialists use "
+                "sql_query and the System Map draws them SQL-only. Set "
+                "mvm_silver_enabled: true and mvm_catalog to turn it on.",
+            )
+        )
+    else:
+        missing = [d for d in domains if d not in wired]
+        results.append(
+            CheckResult(
+                "governed domain spaces",
+                Status.WARN,
+                f"{len(wired)}/{len(domains)} wired — missing: {', '.join(missing)}",
+                "Those specialists fall back to sql_query. Deploy re-runs "
+                "provisioning; leave the field as SET_ME to have it recaptured.",
+            )
+        )
+
     return results, True
+
+
+def report_model_coverage(profile: str, prof: dict | None, tiers: list[str]) -> None:
+    """Print which model answers for each role here, and whether it is served.
+
+    Choosing a model per role only helps if you can see what your workspace
+    actually has. Six vendors is the default roster; a workspace serving four
+    of them still works, but the operator should learn that here — before
+    deploying — rather than from a fallback notice in the About tab.
+
+    Deliberately never exits non-zero. Missing per-role models are a
+    degradation, not a failure, and this is also useful as a read-only "what
+    would run?" command.
+    """
+    roster = _roster_endpoints()
+    if not roster:
+        print("model roster: unavailable (could not import agent_server.model_roster)")
+        return
+
+    overrides = (prof or {}).get("model_roles") or {}
+    served: set[str] | None = None
+    try:
+        from databricks.sdk import WorkspaceClient
+
+        w = WorkspaceClient(profile=profile)
+        served = {e.name for e in w.serving_endpoints.list() if e.name}
+    except Exception as exc:  # noqa: BLE001
+        print(f"    (could not list serving endpoints: {type(exc).__name__}: {exc})")
+
+    print(f"=== model roster: profile={profile} ===")
+    print(f"    fallback tiers: {', '.join(tiers)}")
+    print()
+    print(f"    {'ROLE':<22} {'MODEL':<34} {'SOURCE':<9} STATUS")
+
+    missing: list[str] = []
+    vendors: set[str] = set()
+    for endpoint, role in roster:
+        override = str(overrides.get(role) or "").strip()
+        target = override or endpoint
+        source = "config" if override else "default"
+        if served is None:
+            status = "unknown"
+        elif target in served:
+            status = "served"
+            vendors.add(_vendor_of(target))
+        else:
+            status = "MISSING → falls back to tier"
+            missing.append(role)
+        print(f"    {role:<22} {target:<34} {source:<9} {status}")
+
+    print()
+    if served is None:
+        print("    Coverage unknown — could not reach the workspace.")
+    elif missing:
+        print(
+            f"    {len(missing)} of {len(roster)} roles will fall back to the tier "
+            f"endpoints: {', '.join(missing)}"
+        )
+        print("    Harmless, but those roles lose their preferred vendor. Enable the")
+        print("    models under Serving → Endpoints, or pin alternatives via model_roles")
+        print("    in project-settings to keep the roster multi-vendor.")
+    else:
+        print(f"    All {len(roster)} roles served — {len(vendors)} vendors active.")
+
+
+def _vendor_of(endpoint: str) -> str:
+    try:
+        sys.path.insert(0, str(ROOT))
+        from agent_server.model_roster import describe
+
+        return describe(endpoint)[1]
+    except Exception:  # noqa: BLE001
+        return "unknown"
 
 
 def main() -> None:
@@ -511,6 +680,12 @@ def main() -> None:
         default=None,
         help="Databricks CLI profile (default: $DATABRICKS_PROFILE or DEFAULT)",
     )
+    parser.add_argument(
+        "--models",
+        action="store_true",
+        help="Only report which model each agent role will use, and whether this "
+        "workspace serves it. Never fails; run it to see provider coverage.",
+    )
     args = parser.parse_args()
 
     import os
@@ -520,6 +695,10 @@ def main() -> None:
     settings_path, data = _load_yaml()
     profile_name, prof = _find_profile_for_target(data, bundle_target)
     serving_endpoints = _discover_serving_endpoints(prof)
+
+    if args.models:
+        report_model_coverage(profile, prof, serving_endpoints)
+        raise SystemExit(0)
 
     print(f"=== preflight: env={args.env} target={bundle_target} profile={profile} ===")
     print(f"    settings: {settings_path.relative_to(ROOT)}")

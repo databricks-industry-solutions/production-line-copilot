@@ -60,7 +60,7 @@ in the config field noted in **[bold]**.
 | 3   | **Lakebase (Autoscale) database**          | Compute → **Database instances** → create a Postgres instance/project + `production` branch. Copy the **PG host** and build the endpoint path `projects/<project>/branches/production/endpoints/primary`.                                                                                                                | `lakebase_pg_host`, `lakebase_endpoint`                                    |
 | 4   | **Zerobus Ingest** entitlement             | Not created here, it's an **ingest entitlement** (account / preview-level). You can't script "enable Zerobus"; confirm it's enabled with your admin. The **endpoint URL is derivable** from workspace-id + region: `https://<workspace-id>.zerobus.<region>.cloud.databricks.com` (the provisioner derives it for you). | `zerobus_server_endpoint`                                                  |
 | 5   | **Producer service principal + secret**    | Settings → **Identity and access** → _Service principals_ → create one; generate an **OAuth secret**. Put the secret in a scope: `databricks secrets create-scope line-manager` then `databricks secrets put-secret line-manager zerobus-client-secret`.                                                                 | `producer_client_id`, `producer_client_secret_ref`                         |
-| 6   | **Model serving endpoints**                | Usually already present as the pay-per-token **Foundation Model APIs** (`databricks-gpt-5-mini`, `databricks-gpt-5`). Check **Serving → Endpoints**. If yours are named differently, set the override fields, no code edit needed.                                                                                      | `model_specialist_endpoint`, `model_advanced_endpoint` (defaults provided) |
+| 6   | **Model serving endpoints**                | Usually already present as the pay-per-token **Foundation Model APIs**. Each agent role prefers a vendor-specific model (Anthropic / OpenAI / Google / Meta / Alibaba / Zhipu); anything your workspace doesn't serve falls back to the two tier endpoints below, so partial coverage is fine. Preflight WARNs and names the roles that will degrade. Only override the tiers if your workspace serves `databricks-gpt-5-mini` / `databricks-gpt-5` under different names.  | `model_specialist_endpoint`, `model_advanced_endpoint` (defaults provided) |
 
 **Local tooling:** Databricks CLI, Node.js 22+, `uv`, project deps (`uv sync`).
 
@@ -97,6 +97,14 @@ python3 scripts/preflight.py dev    # or prod
 ```
 
 `scripts/preflight.py` validates CLI auth, required config, warehouse, UC catalog, serving endpoints, secret scope, Lakebase fields, Node, `uv`, and `psycopg2`. Fix any **FAIL** before deploying.
+
+To see the model side on its own — which vendor answers for which agent role, and whether this workspace serves it:
+
+```bash
+python3 scripts/preflight.py dev --models
+```
+
+The same table prints on every `deploy.sh` run. It never fails a deploy: a role whose preferred model is missing falls back to the tier endpoints. Pin different choices with the `model_roles` map in project-settings.
 
 ### 3. Config: `config/project-settings.local.yaml` only
 
@@ -147,8 +155,12 @@ Branch guard: **prod** requires `main` (override `DEPLOY_IGNORE_BRANCH=1`); **de
 | `03_Bootstrap_Demo_Data` | Reference data. Default (empty `src_catalog`/`src_schema`) generates synthetic data in-workspace; set both to COPY from a source schema instead. |
 | `04_Deploy_App` | The app itself deploys via the Asset Bundle. Run `./scripts/deploy.sh dev` (or `databricks bundle deploy` + `databricks apps deploy`) from a terminal/CI. Databricks Apps are not deployed from a notebook. |
 | `05_Validate` | Row-count checks on the streaming tables + an app smoke checklist. |
+| `06_Install_Industry_Data_Model` | Optional: installs the governed Manufacturing model (schemas + tables + metric views) via `scripts/install_industry_data_model.py`. Only needed if you want the governed layer and the reconciliation panel on the Data Integrity tab. |
+| `07_Populate_Silver_Model` | Optional: seeds the governed dimensions from reference data. The fact tables are then kept current continuously by the streaming job, not by re-running this. |
 
 Each script-running notebook installs its Python dependencies with `%pip` and locates `scripts/` via `REPO_ROOT`, so it runs regardless of the notebook's working directory. The one step that stays on the CLI is the **app deploy** (04); everything else (data + UC + Lakebase) runs in-notebook. The bundle's `line-manager-solution-accelerator-setup` job runs these same data steps automatically during `deploy.sh`, so you only need the notebooks if you want the guided, step-by-step flow.
+
+Notebooks 06 and 07 are the governed-model steps. `deploy.sh` runs them for you when `mvm_silver_enabled: true`; skip them entirely if you only want the real-time path.
 
 ### 5. Data init is automatic; confirm streaming jobs
 

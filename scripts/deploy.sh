@@ -234,9 +234,33 @@ export DEPLOYER_EMAIL="$DEPLOY_USER"
 APP_YAML_BACKUP=""
 BUNDLE_TARGETS_BACKUP=""
 DASHBOARD_BACKUP=""
+
+# Restoring from a backup is only as good as the file we backed up. If an
+# earlier deploy died before its trap ran, it left a RENDERED template on disk;
+# this run then backs that up and faithfully restores the pollution, so one
+# missed trap pins the committed template to a catalog forever. For files that
+# were clean against HEAD when we started, git is the authoritative copy — use
+# it, so the loop can't perpetuate.
+_was_clean_at_start() {
+  [[ "${IN_GIT_REPO:-0}" == "1" ]] || return 1
+  git -C "$ROOT_DIR" diff --quiet HEAD -- "$1" 2>/dev/null
+}
+_restore_template() {
+  local rel="$1" backup="$2" clean_at_start="$3"
+  if [[ "$clean_at_start" == "1" ]]; then
+    git -C "$ROOT_DIR" checkout -- "$rel" 2>/dev/null && return 0
+  fi
+  [[ -n "$backup" && -f "$backup" ]] && cp "$backup" "$ROOT_DIR/$rel"
+}
+IN_GIT_REPO=0
+git -C "$ROOT_DIR" rev-parse --git-dir >/dev/null 2>&1 && IN_GIT_REPO=1
+APP_YAML_WAS_CLEAN=0; _was_clean_at_start app.yaml && APP_YAML_WAS_CLEAN=1
+DASHBOARD_WAS_CLEAN=0
+_was_clean_at_start dashboards/data_quality.lvdash.json && DASHBOARD_WAS_CLEAN=1
+
 cleanup() {
   if [[ -n "$APP_YAML_BACKUP" && -f "$APP_YAML_BACKUP" ]]; then
-    cp "$APP_YAML_BACKUP" "$ROOT_DIR/app.yaml"
+    _restore_template app.yaml "$APP_YAML_BACKUP" "$APP_YAML_WAS_CLEAN"
     rm -f "$APP_YAML_BACKUP"
   fi
   if [[ -n "$BUNDLE_TARGETS_BACKUP" && -f "$BUNDLE_TARGETS_BACKUP" ]]; then
@@ -244,11 +268,29 @@ cleanup() {
     rm -f "$BUNDLE_TARGETS_BACKUP"
   fi
   if [[ -n "$DASHBOARD_BACKUP" && -f "$DASHBOARD_BACKUP" ]]; then
-    cp "$DASHBOARD_BACKUP" "$ROOT_DIR/dashboards/data_quality.lvdash.json"
+    _restore_template dashboards/data_quality.lvdash.json \
+      "$DASHBOARD_BACKUP" "$DASHBOARD_WAS_CLEAN"
     rm -f "$DASHBOARD_BACKUP"
+  fi
+  # Last line of defence: a rendered template must never survive the deploy that
+  # rendered it. Say so loudly rather than let it get committed by accident.
+  if [[ "${IN_GIT_REPO:-0}" == "1" ]]; then
+    local leaked
+    leaked=$(git -C "$ROOT_DIR" diff --name-only HEAD -- \
+      app.yaml dashboards/data_quality.lvdash.json 2>/dev/null)
+    if [[ -n "$leaked" ]]; then
+      echo "WARN: deploy left rendered template(s) modified:" >&2
+      echo "$leaked" | sed 's/^/        /' >&2
+      echo "      Restore with: git checkout -- $(echo "$leaked" | tr '\n' ' ')" >&2
+    fi
   fi
 }
 trap cleanup EXIT
+# An interrupted deploy must still restore the templates. Exiting from these
+# handlers runs the EXIT trap above exactly once; without them, Ctrl-C leaves a
+# rendered dashboard/app.yaml committed to one workspace's catalog.
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # ── 1. Sync project-settings → bundle-targets + render dashboards ──────────
 # Back up the committed (placeholder-carrying) bundle-targets.yaml AND the
@@ -339,6 +381,40 @@ if unfilled:
 print(f"SET_ME guard passed: all required fields filled for {bundle_target!r}.")
 PY
 
+# ── 1b-ii. Seed-catalog reachability ─────────────────────────────────────
+# src_catalog/src_schema are OPTIONAL: empty means the setup job generates
+# reference data in-workspace. When they ARE set, the setup job copies the
+# dimension tables from that seed schema — and if the catalog isn't readable
+# here, it fails with INSUFFICIENT_PERMISSIONS in `bootstrap_reference`, which
+# runs ~15 minutes into the job, AFTER init_uc and the industry-model install.
+# Checking reachability now turns a long, late, cryptic failure into an
+# immediate one that names the fix.
+SRC_CATALOG=$(python3 - "$ROOT_DIR/$PROJECT_SETTINGS_YAML" "$BUNDLE_TARGET" <<'PY'
+import sys
+
+import yaml
+
+path, bundle_target = sys.argv[1], sys.argv[2]
+doc = yaml.safe_load(open(path, encoding="utf-8")) or {}
+for prof in (doc.get("profiles") or {}).values():
+    if (prof or {}).get("bundle_target") == bundle_target:
+        print(str((prof or {}).get("src_catalog") or "").strip())
+        break
+PY
+)
+if [[ -n "$SRC_CATALOG" && "$SRC_CATALOG" != "SET_ME" ]]; then
+  echo "=== Seed-catalog check: reference data will be COPIED from '$SRC_CATALOG' ==="
+  if ! databricks catalogs get "$SRC_CATALOG" --profile "$PROFILE" >/dev/null 2>&1; then
+    echo >&2
+    echo "ERROR: src_catalog '$SRC_CATALOG' is not readable with profile '$PROFILE'." >&2
+    echo "       The setup job's bootstrap_reference step would fail against it." >&2
+    echo "       Fix: clear src_catalog/src_schema in $PROJECT_SETTINGS_YAML for" >&2
+    echo "       '$BUNDLE_TARGET' to GENERATE reference data in-workspace instead," >&2
+    echo "       or point them at a seed schema this workspace can read." >&2
+    exit 2
+  fi
+fi
+
 # ── 1c. Derive shared app env from project-settings (single source of truth) ──
 # UC catalog/schema, Lakebase host + endpoint, shift id, and Genie space id live
 # in project-settings; render them into app.<env>.local.yaml so users never keep
@@ -359,16 +435,27 @@ python3 scripts/render_app_yaml.py "$ENV" --settings "$ROOT_DIR/$PROJECT_SETTING
 # so PGUSER in app.yaml is not needed at runtime.
 LAKEBASE_PG_HOST=$(awk '/^  - name: PGHOST/{getline; gsub(/[ '"'"'"]/,""); sub(/^value:/,""); print; exit}' "$ROOT_DIR/$APP_SOURCE_YAML")
 
-# init_lakebase_role.py needs psycopg2 (a project dependency). The system
-# python3 used for the lightweight YAML steps above usually lacks it, so pick an
-# interpreter that has it: prefer the project venv, then uv, then system python3.
+# Some steps need project dependencies (psycopg2 for init_lakebase_role.py, the
+# Databricks SDK for the roster check). The system python3 used for the
+# lightweight YAML steps above usually lacks them, so pick an interpreter that
+# has them: prefer the project venv, then uv, then system python3.
 if [[ -x "$ROOT_DIR/.venv/bin/python" ]]; then
-  LAKEBASE_PY=("$ROOT_DIR/.venv/bin/python")
+  PROJECT_PY=("$ROOT_DIR/.venv/bin/python")
 elif command -v uv >/dev/null 2>&1; then
-  LAKEBASE_PY=(uv run --quiet python)
+  PROJECT_PY=(uv run --quiet python)
 else
-  LAKEBASE_PY=(python3)
+  PROJECT_PY=(python3)
 fi
+
+# Which model answers for which agent role, and whether this workspace serves
+# it. Printed on every deploy, not just under RUN_PREFLIGHT: the roster spans
+# six vendors and a workspace missing one silently degrades that role to a
+# fallback tier. That is a supported outcome, but the operator should see it
+# here rather than discover it in the About tab. Never fatal.
+echo "=== model roster coverage ==="
+"${PROJECT_PY[@]}" scripts/preflight.py "$ENV" --models --profile "$PROFILE" || {
+  echo "WARN: model roster check failed — continuing (deploy is unaffected)." >&2
+}
 
 _profile_field() {
   # Echo a field from the deploy target's profile in project-settings.
@@ -402,7 +489,7 @@ register_sp() {
     return 0
   fi
   echo "=== init_lakebase_role.py — register $label ($sp_id) on project $LAKEBASE_PROJECT/$LAKEBASE_BRANCH ==="
-  "${LAKEBASE_PY[@]}" scripts/init_lakebase_role.py \
+  "${PROJECT_PY[@]}" scripts/init_lakebase_role.py \
     --profile "$PROFILE" \
     --project "$LAKEBASE_PROJECT" \
     --branch "$LAKEBASE_BRANCH" \
@@ -462,19 +549,22 @@ print(f"Wrote app_client_id/lakebase_pg_user for profile {pname!r}.")
 PY
 }
 
-# Write genie_space_id for the deploy target's profile into
+# Write a genie space id for the deploy target's profile into
 # project-settings.local.yaml (same line-based, profile-scoped rewrite as
 # write_app_client_id). Used after auto-creating a Genie space on a fresh env.
+# $1 = space id; $2 = key to write (default genie_space_id; the governed MVM
+# space uses mvm_genie_space_id).
 write_genie_space_id() {
   local space_id="$1"
+  local key="${2:-genie_space_id}"
   local local_settings="$ROOT_DIR/config/project-settings.local.yaml"
   if [[ ! -f "$local_settings" ]]; then
     cp "$ROOT_DIR/config/project-settings.yaml" "$local_settings"
     echo "=== Created config/project-settings.local.yaml from template ==="
   fi
-  python3 - "$local_settings" "$BUNDLE_TARGET" "$space_id" <<'PY'
+  python3 - "$local_settings" "$BUNDLE_TARGET" "$space_id" "$key" <<'PY'
 import re, sys, yaml
-path, target, space_id = sys.argv[1], sys.argv[2], sys.argv[3]
+path, target, space_id, key = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 lines = open(path, encoding="utf-8").read().split("\n")
 doc = yaml.safe_load("\n".join(lines)) or {}
 pname = None
@@ -485,12 +575,18 @@ for name, prof in (doc.get("profiles") or {}).items():
 if not pname:
     sys.exit(0)
 out, in_block, block_indent, wrote = [], False, None, False
+# Where the profile block ends, and how its keys are indented — needed to APPEND
+# a key the file predates. A local settings file copied from an older template
+# has no genie_space_<domain> line to rewrite, and silently skipping it would
+# leave the space provisioned but never handed to the app.
+last_block_idx, item_indent = None, None
 for line in lines:
     hm = re.match(r"^(\s+)([A-Za-z0-9_.-]+):\s*$", line)
     if hm and hm.group(2) == pname:
         in_block = True
         block_indent = len(hm.group(1))
         out.append(line)
+        last_block_idx = len(out) - 1
         continue
     if in_block:
         cur = re.match(r"^(\s*)\S", line)
@@ -498,15 +594,31 @@ for line in lines:
         if line.strip() and cur_indent <= block_indent:
             in_block = False
         else:
-            pk = re.match(r"^(\s+)(genie_space_id):\s*.*$", line)
+            if line.strip() and item_indent is None:
+                item_indent = cur_indent
+            # Match the exact key only (mvm_genie_space_id must NOT be caught by
+            # the genie_space_id write and vice versa).
+            pk = re.match(rf"^(\s+)({re.escape(key)}):\s*.*$", line)
             if pk:
                 out.append(f'{pk.group(1)}{pk.group(2)}: "{space_id}"')
                 wrote = True
+                last_block_idx = len(out) - 1
                 continue
+            out.append(line)
+            if line.strip():
+                last_block_idx = len(out) - 1
+            continue
     out.append(line)
+if not wrote and last_block_idx is not None:
+    indent = " " * (item_indent if item_indent is not None else (block_indent or 0) + 2)
+    out.insert(last_block_idx + 1, f'{indent}{key}: "{space_id}"')
+    wrote = True
+    appended = True
+else:
+    appended = False
 open(path, "w", encoding="utf-8").write("\n".join(out))
-print(f"Wrote genie_space_id for profile {pname!r}." if wrote
-      else f"WARN: no genie_space_id key found in profile {pname!r} to update.")
+print(f"{'Appended' if appended else 'Wrote'} {key} for profile {pname!r}." if wrote
+      else f"WARN: no {key} key found in profile {pname!r} to update.")
 PY
 }
 
@@ -592,16 +704,25 @@ fi
 # ── 4. Capture the app SP (chicken-and-egg fix) ─────────────────────────
 NEEDS_REDEPLOY=0
 CURRENT_APP_SP=$(_profile_field app_client_id)
-if [[ -z "$CURRENT_APP_SP" || "$CURRENT_APP_SP" == "SET_ME" ]]; then
-  echo "=== Capturing app SP from 'databricks apps get $APP_NAME' ==="
-  CAPTURED_SP=$(databricks apps get "$APP_NAME" --profile "$PROFILE" --output json 2>/dev/null \
-    | python3 -c 'import json,sys
+# Always ASK the workspace who the app SP is, rather than trusting a stored id.
+# `bundle destroy` deletes the app and its service principal but leaves
+# app_client_id populated in project-settings.local.yaml, so a destroy/redeploy
+# cycle would otherwise graft every grant (UC, Lakebase role, Genie CAN_RUN,
+# job permissions) onto a principal that no longer exists — and still exit 0,
+# with the new app holding no access at all. Comparing makes that self-healing.
+echo "=== Resolving app SP from 'databricks apps get $APP_NAME' ==="
+CAPTURED_SP=$(databricks apps get "$APP_NAME" --profile "$PROFILE" --output json 2>/dev/null \
+  | python3 -c 'import json,sys
 try:
     print(json.load(sys.stdin).get("service_principal_client_id") or "")
 except Exception:
     print("")' 2>/dev/null || echo "")
-  if [[ -n "$CAPTURED_SP" ]]; then
-    echo "=== Captured app SP: $CAPTURED_SP — writing to project-settings.local.yaml ==="
+if [[ -n "$CAPTURED_SP" && "$CAPTURED_SP" != "$CURRENT_APP_SP" ]]; then
+    if [[ -n "$CURRENT_APP_SP" && "$CURRENT_APP_SP" != "SET_ME" ]]; then
+      echo "=== App SP changed ($CURRENT_APP_SP -> $CAPTURED_SP) — the app was recreated ==="
+    else
+      echo "=== Captured app SP: $CAPTURED_SP — writing to project-settings.local.yaml ==="
+    fi
     write_app_client_id "$CAPTURED_SP"
     APP_SP_ID="$CAPTURED_SP"
     NEEDS_REDEPLOY=1
@@ -620,11 +741,15 @@ except Exception:
     PROJECT_SETTINGS_YAML="config/project-settings.local.yaml"
     echo "=== Re-sync bundle-targets with captured app SP ==="
     python3 scripts/sync_project_settings.py --deployer-email "$DEPLOYER_EMAIL" --target "$BUNDLE_TARGET"
-  else
-    echo "WARN: could not capture app SP from apps get — SP job grants + Lakebase role skipped." >&2
-  fi
-else
+elif [[ -n "$CAPTURED_SP" ]]; then
+  APP_SP_ID="$CAPTURED_SP"          # unchanged — stored id is still correct
+elif [[ -n "$CURRENT_APP_SP" && "$CURRENT_APP_SP" != "SET_ME" ]]; then
+  # The app exists per config but `apps get` told us nothing (CLI hiccup, or the
+  # app is mid-create). Fall back to the stored id rather than dropping grants.
   APP_SP_ID="$CURRENT_APP_SP"
+  echo "WARN: could not read app SP from 'apps get' — falling back to stored $CURRENT_APP_SP." >&2
+else
+  echo "WARN: could not capture app SP from apps get — SP job grants + Lakebase role skipped." >&2
 fi
 
 # ── 4a. Register App + Producer SPs as Lakebase roles (idempotent) ──────
@@ -842,6 +967,113 @@ if [[ "${RUN_SETUP:-0}" == "1" ]]; then
       python3 scripts/genie_space_config_streaming.py "${GENIE_ARGS[@]}" --space-id "$GENIE_ID" \
         || echo "WARN: Genie space refresh failed — space kept its previous config." >&2
     fi
+  fi
+fi
+
+# ── 7b. Governed MVM Genie space (only when streaming silver is on) ────────
+# The governed space is a SEPARATE Genie space over the MVM silver model
+# (asset/production/quality/inventory). It only makes sense when the model is
+# populated, i.e. mvm_silver_enabled=true. Same create-or-refresh pattern as
+# the streaming space, but it does NOT rewire the app (the in-app agent keeps
+# using the streaming/mobile space; this governed space is a standalone
+# analyst/auditor surface). Grants the app SP CAN_RUN idempotently.
+# mvm_silver_enabled is a YAML boolean, so _profile_field (which calls .strip())
+# can't read it — coerce to a lowercase "true"/"false" string inline instead.
+MVM_SILVER=$(python3 -c "
+import yaml
+with open('$ROOT_DIR/$PROJECT_SETTINGS_YAML') as f:
+    d = yaml.safe_load(f)
+for prof in (d.get('profiles') or {}).values():
+    if prof.get('bundle_target') == '$BUNDLE_TARGET':
+        print(str(prof.get('mvm_silver_enabled', False)).lower()); break
+" 2>/dev/null || echo "false")
+MVM_CAT=$(_profile_field mvm_catalog)
+MVM_GENIE_ID=$(_profile_field mvm_genie_space_id)
+if [[ "$MVM_SILVER" == "true" && -n "$WAREHOUSE_ID" && -n "$MVM_CAT" && "$MVM_CAT" != "SET_ME" ]]; then
+  MVM_GENIE_ARGS=(--profile "$PROFILE" --warehouse-id "$WAREHOUSE_ID" --catalog "$MVM_CAT")
+  if [[ -z "$MVM_GENIE_ID" || "$MVM_GENIE_ID" == "SET_ME" ]]; then
+    echo "=== Creating governed MVM Genie space (fresh) ==="
+    MVM_GENIE_OUT=$(python3 scripts/genie_space_config_mvm.py "${MVM_GENIE_ARGS[@]}" \
+      --parent-path "/Users/$DEPLOY_USER" 2>&1) || {
+      echo "$MVM_GENIE_OUT" >&2
+      echo "WARN: governed MVM Genie space create failed — governed analytics unavailable until fixed." >&2
+      MVM_GENIE_OUT=""
+    }
+    [[ -n "$MVM_GENIE_OUT" ]] && echo "$MVM_GENIE_OUT"
+    NEW_MVM_GENIE_ID=$(printf '%s\n' "$MVM_GENIE_OUT" | awk -F= '/^GENIE_SPACE_ID=/{print $2; exit}')
+    if [[ -n "$NEW_MVM_GENIE_ID" ]]; then
+      write_genie_space_id "$NEW_MVM_GENIE_ID" mvm_genie_space_id
+      MVM_GENIE_ID="$NEW_MVM_GENIE_ID"
+    fi
+  else
+    echo "=== Refreshing governed MVM Genie space $MVM_GENIE_ID (curated config) ==="
+    python3 scripts/genie_space_config_mvm.py "${MVM_GENIE_ARGS[@]}" --space-id "$MVM_GENIE_ID" \
+      || echo "WARN: governed MVM Genie refresh failed — space kept its previous config." >&2
+  fi
+  if [[ -n "$MVM_GENIE_ID" && "$MVM_GENIE_ID" != "SET_ME" && -n "${APP_SP_ID:-}" ]]; then
+    echo "=== Granting app SP $APP_SP_ID CAN_RUN on governed MVM Genie space $MVM_GENIE_ID ==="
+    MVM_GENIE_PERMS_JSON=$(printf '{"access_control_list":[{"service_principal_name":"%s","permission_level":"CAN_RUN"}]}' "$APP_SP_ID")
+    databricks api patch "/api/2.0/permissions/genie/$MVM_GENIE_ID" --profile "$PROFILE" \
+      --json "$MVM_GENIE_PERMS_JSON" >/dev/null \
+      || echo "WARN: could not grant app SP CAN_RUN on governed MVM Genie space — grant manually." >&2
+  fi
+
+  # ── 7c. Per-domain governed Genie spaces ────────────────────────────────
+  # One narrow space per schema of the governed model. Unlike the combined
+  # space above, these ARE wired into the app: each specialist is handed the
+  # tool for its own domain (agent_server/tools/governed_domain_query.py).
+  # Same create-or-refresh-then-grant pattern, run per domain. A domain that
+  # fails to provision leaves its id empty, and the specialist simply falls
+  # back to sql_query rather than getting a tool that always errors.
+  DOMAIN_SPACES_CREATED=0
+  for DOMAIN in asset quality inventory production; do
+    DOMAIN_FIELD="genie_space_${DOMAIN}"
+    DOMAIN_ID=$(_profile_field "$DOMAIN_FIELD")
+    if [[ -z "$DOMAIN_ID" || "$DOMAIN_ID" == "SET_ME" ]]; then
+      echo "=== Creating governed Genie space for domain '$DOMAIN' (fresh) ==="
+      DOMAIN_OUT=$(python3 scripts/genie_space_config_mvm.py "${MVM_GENIE_ARGS[@]}" \
+        --domain "$DOMAIN" --parent-path "/Users/$DEPLOY_USER" 2>&1) || {
+        echo "$DOMAIN_OUT" >&2
+        echo "WARN: governed '$DOMAIN' Genie space create failed — that specialist falls back to sql_query." >&2
+        DOMAIN_OUT=""
+      }
+      [[ -n "$DOMAIN_OUT" ]] && echo "$DOMAIN_OUT"
+      NEW_DOMAIN_ID=$(printf '%s\n' "$DOMAIN_OUT" | awk -F= '/^GENIE_SPACE_ID=/{print $2; exit}')
+      if [[ -n "$NEW_DOMAIN_ID" ]]; then
+        write_genie_space_id "$NEW_DOMAIN_ID" "$DOMAIN_FIELD"
+        DOMAIN_ID="$NEW_DOMAIN_ID"
+        DOMAIN_SPACES_CREATED=1
+      fi
+    else
+      echo "=== Refreshing governed '$DOMAIN' Genie space $DOMAIN_ID ==="
+      python3 scripts/genie_space_config_mvm.py "${MVM_GENIE_ARGS[@]}" \
+        --domain "$DOMAIN" --space-id "$DOMAIN_ID" \
+        || echo "WARN: governed '$DOMAIN' Genie refresh failed — space kept its previous config." >&2
+    fi
+    if [[ -n "$DOMAIN_ID" && "$DOMAIN_ID" != "SET_ME" && -n "${APP_SP_ID:-}" ]]; then
+      DOMAIN_PERMS_JSON=$(printf '{"access_control_list":[{"service_principal_name":"%s","permission_level":"CAN_RUN"}]}' "$APP_SP_ID")
+      databricks api patch "/api/2.0/permissions/genie/$DOMAIN_ID" --profile "$PROFILE" \
+        --json "$DOMAIN_PERMS_JSON" >/dev/null \
+        || echo "WARN: could not grant app SP CAN_RUN on '$DOMAIN' Genie space — grant manually." >&2
+    fi
+  done
+
+  # Newly created ids land in project-settings AFTER step 5 already deployed
+  # the app, so the running app has no GENIE_SPACE_<DOMAIN> and would build no
+  # domain tools. Re-render and redeploy, exactly as the streaming space does.
+  # Refreshes alone need no redeploy — the ids did not change.
+  if [[ "$DOMAIN_SPACES_CREATED" == "1" ]]; then
+    echo "=== Re-rendering app config with the new domain Genie space ids ==="
+    python3 scripts/render_app_yaml.py "$ENV" --settings "$ROOT_DIR/$PROJECT_SETTINGS_YAML" \
+      || echo "WARN: re-render failed — domain tools stay unbuilt until the next deploy." >&2
+    # render_app_yaml writes app.<env>.local.yaml, but the bundle uploads
+    # app.yaml. Without the swap the redeploy ships the pre-render file and the
+    # app comes up with no domain space ids — which it did, once.
+    do_app_yaml_swap
+    run_bundle_deploy
+    databricks apps deploy "$APP_NAME" --profile "$PROFILE" \
+      ${APP_SRC_PATH:+--source-code-path "$APP_SRC_PATH"} \
+      || echo "WARN: app redeploy after domain Genie wiring failed — re-run deploy to pick up the space ids." >&2
   fi
 fi
 

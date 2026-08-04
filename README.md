@@ -16,11 +16,24 @@ ProdLine CoPilot simulates a 19-machine bottling/packaging line in real time. An
 
 **The demo story:** You're a line manager. The line is running normally at ~82 % OEE. You trigger an incident (e.g. filler breakdown). Watch the cascade ripple across the line in real time. Ask the AI assistant what happened, get root-cause analysis and action items, then resolve.
 
+## System Map
+
+One app, two branches. The **Control Tower** is what the line is doing right now — streamed and deterministic, with no model in the path. The **Specialist Copilot** is where you ask a question and a router hands it to the one specialist that owns the problem. Each specialist reaches its own governed Genie space, because narrow scope is what keeps Genie accurate.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/media/system_map_dark.png">
+  <img alt="System Map: ProdLine CoPilot splits into a Control Tower branch of four streamed operational tabs, and a Specialist Copilot branch where an orchestrator routes to eight specialist agents, each labelled with its governed Genie domain, its optimizers and its model." src="docs/media/system_map.png">
+</picture>
+
+Five Genie spaces in all: four over the governed manufacturing model — `asset`, `quality`, `inventory`, `production` — each curated and permissioned separately, plus **line ops** over the live streaming tables where `line_kpi` lands roughly a row per second. The two specialists that reason across a whole shift read line ops as well, and all eight read the live tables with direct SQL, because Genie is a round trip and a shift is not.
+
+Line ops is deliberately the other shape from a governed domain — 14 curated tables against two to four — because the split follows grant boundaries and the live schema has none to follow: it is one schema behind a surface where anyone can ask anything about the current shift.
+
+This is the real component, screenshotted from the app's About tab, where it reads the deployed wiring from `GET /ops/topology` — a domain that did not provision is drawn as SQL-only rather than showing a Genie badge it does not have. Regenerate with `node scripts/dev/capture_system_map.mjs`.
+
 ## Architecture
 
-![ProdLine CoPilot reference architecture](docs/media/architecture-high-level.png)
-
-Synthetic line telemetry streams through Zerobus into Unity Catalog, syncs to a Lakebase serving layer, and drives a Databricks App (Node/Express + React) whose GenAI specialists reason over the live state. Full technical reference (cascade engine, tech stack, the 8 specialists, endpoints, and the OEE model) lives in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+Synthetic line telemetry streams through Zerobus into Unity Catalog, syncs to a Lakebase serving layer, and drives a Databricks App whose GenAI specialists reason over the live state. The full reference — the annotated reference-architecture diagram, cascade engine, tech stack, the 8 specialists, endpoints, and the OEE model — lives in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Why It Matters
 
@@ -46,7 +59,7 @@ Each downtime minute, OEE point, and MTTR reduction carries a line-specific doll
 
 ### Prerequisites
 
-Provision in your workspace (the bundle does **not** create these): Unity Catalog catalog, SQL warehouse, Lakebase Autoscale endpoint, Zerobus Ingest + endpoint URL, producer service principal + secret, and model serving endpoints (defaults `databricks-gpt-5-mini` + `databricks-gpt-5`; override the names in `project-settings` if your workspace differs). Locally: Databricks CLI, Node.js 22+, `uv`, Python 3.11+. See [`docs/solution-accelerator/DEPLOY.md`](docs/solution-accelerator/DEPLOY.md#1-provision-prerequisites-you-not-created-by-the-bundle) for a step-by-step "what to create" table.
+Provision in your workspace (the bundle does **not** create these): Unity Catalog catalog, SQL warehouse, Lakebase Autoscale endpoint, Zerobus Ingest + endpoint URL, producer service principal + secret, and model serving endpoints. Each agent role runs on a model picked for its workload across six vendors (Anthropic, OpenAI, Google, Meta, Alibaba, Zhipu) on the Foundation Model APIs; any model your workspace doesn't serve falls back to `databricks-gpt-5-mini` / `databricks-gpt-5`, so nothing breaks if you only have some of them. Locally: Databricks CLI, Node.js 22+, `uv`, Python 3.11+. See [`docs/solution-accelerator/DEPLOY.md`](docs/solution-accelerator/DEPLOY.md#1-provision-prerequisites-you-not-created-by-the-bundle) for a step-by-step "what to create" table.
 
 ### Deploy
 
@@ -69,7 +82,13 @@ DATABRICKS_PROFILE=<profile> ./scripts/deploy.sh prod    # -> production-line-co
 - **First deploy (fresh workspace):** auto-detects the empty schema and provisions everything: UC schema + tables, reference data, synced tables, the curated **Genie space**, the app service principal (auto-captured + granted), Lakebase roles, and the Data Quality dashboard.
 - **Later deploys:** code-only. It pushes new app/job code and skips provisioning.
 
-The `streaming-producer` and `streaming-quality-sync` jobs ship **unpaused**, so live data starts flowing on its own; gold tables and the Data Quality dashboard fill within a few minutes. Then open the deployed **production-line-copilot-dev** App to see the live line and the GenAI assistant. To tear an environment down later, run `scripts/cleanup.sh <dev|prod>`.
+The `streaming-producer` and `streaming-quality-sync` jobs ship **unpaused**, so live data starts flowing on its own; gold tables and the Data Quality dashboard fill within a few minutes. Then open the deployed **production-line-copilot-dev** App to see the live line and the GenAI assistant. To tear an environment down later, run `scripts/cleanup.sh <dev|prod>`. That
+removes the bundle resources, deletes the Genie spaces it created, and resets
+the ids `deploy.sh` wrote back into your local settings, so the next deploy
+starts clean. Unity Catalog data is kept unless you add `--purge-data`, which
+also drops the streaming schema (and with it the streaming checkpoints) and the
+governed model's schemas. The UC catalog, Lakebase instance, SQL warehouse, and
+secret scopes are prerequisites and are never removed.
 
 **Options:** `RUN_SETUP=1` forces re-provisioning; `RUN_SETUP=0` skips it. `RUN_PREFLIGHT=1` runs preflight checks first. Prod enforces the `main` branch (override `DEPLOY_IGNORE_BRANCH=1`).
 

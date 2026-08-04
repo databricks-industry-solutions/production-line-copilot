@@ -113,8 +113,8 @@ Acceptance: diagram renders on the public repo landing page.
 Impact: Med. Effort: M.
 
 Context: `evaluations/` already has `run_eval.py`, `judges.py`, `dataset.py`,
-`scenarios.py`, and `data/seed_v1.jsonl`. `agent_server/agent.py` captures
-MLflow trace spans via `_capture_mlflow_trace_spans()`.
+`scenarios.py`, and `data/seed_v1.jsonl`. Every chat answer carries a link to
+its own MLflow trace via `agent_server/trace_link.py`.
 
 Tasks:
 - Grow the eval dataset (`seed_v1.jsonl`) with cases per specialist and per

@@ -7,16 +7,45 @@ import logging
 import os
 import threading
 import time
+from contextlib import contextmanager
 
 logger = logging.getLogger(__name__)
 
-_lock = threading.Lock()
+# One reentrant lock guards BOTH the connection's lifecycle and the statements
+# run on it. They were briefly separate locks, which was worse in two ways: a
+# thread could hold the statement lock and then wait for the lifecycle lock
+# while another thread did the reverse (a deadlock waiting for the right
+# interleaving), and only reads were serialised, so a writer's INSERT could
+# still land between a reader's failed statement and the rollback that cleans
+# up after it — silently discarding the write, since both share one
+# transaction. A single lock costs nothing here: every caller already funnels
+# through ``get_connection`` before running anything, and the shared
+# connection can only execute one statement at a time regardless. Slow scans
+# belong on ``new_readonly_connection`` and never take this lock.
+_lock = threading.RLock()
 _connection = None
-_available = True
-_retry_count = 0
-_MAX_RETRIES = 5
 _last_token_time = 0.0
 _TOKEN_REFRESH_SECONDS = 3000
+
+# ── Circuit breaker ────────────────────────────────────────────────────────
+# A failed connect is expensive: the primary attempt waits out connect_timeout,
+# the workspace-token fallback waits it out again, and each mints an OAuth
+# token first. Retrying that on EVERY call during an outage turns a Lakebase
+# blip into ~20s of latency per request — and because the SSE generator calls
+# these reads synchronously, that latency lands on the shared event loop and
+# stalls every other client too.
+#
+# So after a run of consecutive connect failures we stop trying for a while and
+# return None immediately. Callers already treat None as "live plane
+# unavailable" and degrade honestly; failing fast is both cheaper and truer
+# than blocking. The cooldown backs off so a long outage costs almost nothing,
+# and any success resets it.
+_CONNECT_FAILURES_BEFORE_OPEN = 3
+_BREAKER_COOLDOWN_START_S = 5.0
+_BREAKER_COOLDOWN_MAX_S = 120.0
+_consecutive_failures = 0
+_breaker_open_until = 0.0
+_breaker_cooldown_s = _BREAKER_COOLDOWN_START_S
 
 _INIT_SQL = """
 CREATE SCHEMA IF NOT EXISTS ai_chatbot;
@@ -225,42 +254,93 @@ def _init_tables(conn):
     global _tables_initialized
     if _tables_initialized:
         return
+    old_autocommit = conn.autocommit
     try:
-        old_autocommit = conn.autocommit
         conn.autocommit = True
         with conn.cursor() as cur:
             for stmt in _INIT_SQL.strip().split(";"):
                 stmt = stmt.strip()
                 if stmt:
                     cur.execute(stmt)
-        conn.autocommit = old_autocommit
         _tables_initialized = True
         logger.info("Lakebase tables initialized")
     except Exception:
         logger.warning("Could not auto-initialize Lakebase tables (may already exist)")
+    finally:
+        # Restore in a finally: the old code restored only on the success path,
+        # so a failed init (routine when the app SP can't CREATE) silently left
+        # the shared connection in autocommit mode. Every caller's transaction
+        # semantics then depended on whether init happened to succeed.
+        try:
+            conn.autocommit = old_autocommit
+        except Exception:  # noqa: BLE001 - connection already dead; nothing to restore
+            pass
+
+
+def _record_connect_failure() -> None:
+    """Trip the breaker once failures stop looking like a one-off blip."""
+    global _consecutive_failures, _breaker_open_until, _breaker_cooldown_s
+    _consecutive_failures += 1
+    if _consecutive_failures >= _CONNECT_FAILURES_BEFORE_OPEN:
+        _breaker_open_until = time.monotonic() + _breaker_cooldown_s
+        logger.warning(
+            "Lakebase circuit breaker OPEN for %.0fs after %d consecutive connect "
+            "failures — live reads will return empty until it closes",
+            _breaker_cooldown_s, _consecutive_failures,
+        )
+        _breaker_cooldown_s = min(_breaker_cooldown_s * 2, _BREAKER_COOLDOWN_MAX_S)
+
+
+def _record_connect_success() -> None:
+    global _consecutive_failures, _breaker_open_until, _breaker_cooldown_s
+    if _consecutive_failures or _breaker_open_until:
+        logger.info("Lakebase reachable again — circuit breaker reset")
+    _consecutive_failures = 0
+    _breaker_open_until = 0.0
+    _breaker_cooldown_s = _BREAKER_COOLDOWN_START_S
+
+
+def breaker_is_open() -> bool:
+    """True while we are deliberately not attempting to reach Lakebase."""
+    return time.monotonic() < _breaker_open_until
 
 
 def get_connection():
-    """Get a reusable Postgres connection. Returns None if PG is not configured."""
-    global _connection, _available, _last_token_time
+    """Get a reusable Postgres connection. Returns None if PG is not configured.
 
-    if not _is_pg_configured() or (not _available and _retry_count >= _MAX_RETRIES):
+    Also returns None immediately while the circuit breaker is open, so a
+    Lakebase outage costs a dictionary lookup rather than two connect timeouts.
+    """
+    global _connection, _last_token_time
+
+    if not _is_pg_configured() or breaker_is_open():
         return None
 
     with _lock:
         now = time.monotonic()
 
         if _connection is not None and (now - _last_token_time) < _TOKEN_REFRESH_SECONDS:
-            try:
-                with _connection.cursor() as cur:
-                    cur.execute("SELECT 1")
-                return _connection
-            except Exception:
+            for probe in (1, 2):
                 try:
-                    _connection.close()
+                    with _connection.cursor() as cur:
+                        cur.execute("SELECT 1")
+                    return _connection
                 except Exception:
-                    pass
-                _connection = None
+                    # An aborted transaction left by some other caller fails
+                    # this probe too, and a rollback fixes it in microseconds
+                    # — worth trying before paying for a reconnect.
+                    if probe == 1:
+                        try:
+                            _connection.rollback()
+                            continue
+                        except Exception:  # noqa: BLE001
+                            pass
+                    break
+            try:
+                _connection.close()
+            except Exception:
+                pass
+            _connection = None
 
         if _connection is not None:
             try:
@@ -304,6 +384,7 @@ def get_connection():
 
             _connection.autocommit = False
             _last_token_time = now
+            _record_connect_success()
             logger.info("Lakebase connection established to %s as %s", host, user)
 
             _init_tables(_connection)
@@ -318,8 +399,175 @@ def get_connection():
                 msg,
                 _get_pg_user(),
             )
-            _available = False
+            _record_connect_failure()
             return None
+
+
+def _discard_connection() -> None:
+    """Drop the pooled connection so the next caller builds a fresh one."""
+    global _connection
+    with _lock:
+        if _connection is not None:
+            try:
+                _connection.close()
+            except Exception:  # noqa: BLE001
+                pass
+            _connection = None
+
+
+def _reset_after_error(conn) -> None:
+    """Return a connection to a usable state after a failed statement.
+
+    The pooled connection runs with ``autocommit = False`` and is shared by
+    every handler, so a statement that errors leaves an ABORTED transaction
+    open: Postgres then rejects everything else on that connection with
+    ``InFailedSqlTransaction``. Verified against a live Lakebase — one handler's
+    bad read made an unrelated handler's ``SELECT 1`` fail. Rolling back here
+    keeps one caller's failure from becoming everyone's.
+    """
+    with _lock:
+        try:
+            conn.rollback()
+        except Exception:  # noqa: BLE001 - connection is gone; the retry reconnects
+            pass
+
+
+def query(sql: str, params: tuple | None = None, *, fetch: str = "all"):
+    """Run a read query, retrying once on a broken connection.
+
+    Returns a list of dicts (``fetch="all"``), a single dict/None
+    (``fetch="one"``), or None when Lakebase is unreachable — callers already
+    treat that as "live plane unavailable" and degrade rather than serve stale
+    data.
+
+    The retry exists because the pooled connection can die between
+    ``get_connection``'s health check and the statement that follows: token
+    expiry, the pooler recycling a backend, an ordinary network blip. Those are
+    transient by definition, so surfacing them to the UI is needless. A retry
+    also handles the poisoned-connection case, since the first attempt rolls
+    back and discards before the second reconnects.
+
+    Errors that are NOT connection problems (bad SQL, missing table) are raised
+    after a rollback: retrying cannot help, and swallowing them would hide real
+    bugs behind an empty panel.
+    """
+    import psycopg2
+
+    for attempt in (1, 2):
+        conn = get_connection()
+        if conn is None:
+            return None
+        try:
+            with _lock, conn.cursor() as cur:
+                cur.execute(sql, params)
+                if cur.description is None:
+                    return None
+                if fetch == "one":
+                    row = cur.fetchone()
+                    return dict(row) if row else None
+                return [dict(r) for r in cur.fetchall()]
+        except (psycopg2.OperationalError, psycopg2.InterfaceError) as exc:
+            # The connection itself is broken — rolling it back is pointless,
+            # but it must not be handed to the next caller.
+            _discard_connection()
+            if attempt == 2:
+                logger.warning(
+                    "Lakebase query failed after reconnect (%s: %s)",
+                    type(exc).__name__, str(exc)[:200],
+                )
+                _record_connect_failure()
+                return None
+            logger.info(
+                "Lakebase connection broke mid-query (%s) — reconnecting and retrying once",
+                type(exc).__name__,
+            )
+        except Exception:
+            # A real query error. Roll back so the shared connection stays
+            # usable for everyone else, then let the caller see it.
+            _reset_after_error(conn)
+            raise
+    return None
+
+
+@contextmanager
+def transaction():
+    """Run a write as one unit on the shared connection, exclusively.
+
+    Yields a cursor, or ``None`` when Lakebase is unreachable — callers must
+    check, exactly as they do with ``get_connection``. Commits when the block
+    completes, rolls back when it raises, and always closes the cursor.
+
+    Holding the lock across the WHOLE unit (not just each statement) is the
+    point. Every caller shares one connection and therefore one transaction,
+    so a read that slipped in between a writer's INSERT and its COMMIT would
+    join that transaction — and the rollback that read must perform when it
+    fails would take the INSERT down with it, with no error anywhere: the
+    writer's later ``commit()`` succeeds having committed nothing. Reads now
+    run on worker threads, so that interleaving is reachable.
+
+    Do not call ``query`` or ``get_connection`` from inside the block: the
+    lock is reentrant so it will not deadlock, but a read nested inside a
+    write unit is rolled back with it, which is rarely what the caller means.
+    """
+    conn = get_connection()
+    if conn is None:
+        yield None
+        return
+    with _lock:
+        cur = conn.cursor()
+        try:
+            yield cur
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:  # noqa: BLE001 - connection already gone
+                pass
+            raise
+        finally:
+            try:
+                cur.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def new_readonly_connection():
+    """Open a SEPARATE, autocommit connection for read-only analytics.
+
+    ``get_connection`` hands back one process-wide connection that every
+    handler shares, which is fine for the short writes it was built for but
+    wrong for slow read-only scans:
+
+      * psycopg2 serializes statements per connection, so a multi-second COUNT
+        would block the live SSE reads that share it;
+      * a failed query has to be rolled back, and on a shared connection that
+        rollback would discard another handler's uncommitted work.
+
+    Autocommit means no transaction is left open when the caller is done.
+    Returns None when Lakebase isn't configured. The caller owns the handle and
+    must close it.
+    """
+    if not _is_pg_configured():
+        return None
+    try:
+        import psycopg2
+        from psycopg2.extras import RealDictCursor
+
+        conn = psycopg2.connect(
+            host=os.environ.get("PGHOST", "localhost"),
+            port=int(os.environ.get("PGPORT", "5432")),
+            user=_get_pg_user(),
+            password=_get_pg_password(),
+            dbname=os.environ.get("PGDATABASE", "databricks_postgres"),
+            sslmode=os.environ.get("PGSSLMODE", "require"),
+            cursor_factory=RealDictCursor,
+            connect_timeout=10,
+        )
+        conn.autocommit = True
+        return conn
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("read-only Lakebase connection failed: %s", str(exc)[:200])
+        return None
 
 
 def close_pool():

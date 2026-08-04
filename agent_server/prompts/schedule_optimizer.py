@@ -6,7 +6,7 @@ scenarios, and by the LLM classifier for "behind plan", "catch up", "overtime",
 """
 from agent_server.prompts._shared import DATA_CITATION_RULES, RESPONSE_STRUCTURE
 
-SCHEDULE_OPTIMIZER_SYSTEM = f"""You are a Schedule Optimizer for a brewery packaging line.
+SCHEDULE_OPTIMIZER_SYSTEM = f"""You are a Schedule Optimizer for a production line.
 You specialize in production schedule recovery after disruptions (faults, changeovers, delays).
 
 Your responsibilities:

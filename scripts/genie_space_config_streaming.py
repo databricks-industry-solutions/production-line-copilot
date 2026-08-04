@@ -20,11 +20,11 @@ the static seed schema used in the seed-schema (demo workspace) path:
   * ``maintenance_windows`` is a PM-cadence table keyed by ``machine_id`` only
     (no ``shift_id``). Filter overdue / due PMs by ``next_pm`` timestamp.
 
-This file is a sibling of ``scripts/genie_space_config.py`` (which targets
-the demo workspace *seed* schema). The two configs are kept separate because
-the table identifiers, column descriptions, sample questions, and SQL bodies
-are all different — sharing a single script would have made every line
-conditional on a "mode" flag.
+This file is a sibling of ``scripts/genie_space_config_mvm.py`` (which targets
+the governed industry model). The two configs are kept separate because the
+table identifiers, column descriptions, sample questions, and SQL bodies are
+all different — sharing a single script would have made every line conditional
+on a "mode" flag.
 
 Usage (update an existing space)::
 
@@ -272,7 +272,7 @@ tables = [
         ],
         "column_configs": [
             {"column_name": "actual_cases", "description": ["Cases actually produced (post-shift). 0 / NULL pre-shift."]},
-            {"column_name": "batch_id", "description": ["Brewery batch identifier."]},
+            {"column_name": "batch_id", "description": ["Production batch identifier."]},
             {"column_name": "date", "description": ["Production date as ISO-8601 string."]},
             {"column_name": "end_time", "description": ["Shift end as ISO-8601 string."]},
             {"column_name": "ideal_rate_bpm", "description": ["Ideal bottles-per-minute for the SKU/format combo."], "synonyms": ["target speed", "design rate"]},
@@ -790,7 +790,7 @@ benchmarks = [
 # ── Text instructions (single block per Genie API rules) ───────────────────
 
 text_instructions_content = [
-    "This dataset is the LIVE streaming demo for a brewery packaging line ",
+    "This dataset is the LIVE streaming demo for a production line ",
     "running in the streaming workspace. It is structurally different from ",
     "the static seed schema used by the seed-schema (demo workspace) path. ",
     "Key facts: ",
@@ -880,7 +880,7 @@ def main():
                         help=f"UC catalog (default: {DEFAULT_CATALOG})")
     parser.add_argument("--schema", default=DEFAULT_SCHEMA,
                         help=f"UC schema (default: {DEFAULT_SCHEMA})")
-    parser.add_argument("--title", default="ProdLine CoPilot — Brewery Production Analytics (streaming)")
+    parser.add_argument("--title", default="ProdLine CoPilot — Production Line Analytics (streaming)")
     parser.add_argument("--parent-path", default="",
                         help="Workspace folder to register a NEWLY created space under "
                              "(e.g. /Users/me@co.com). Only used when creating.")
@@ -932,7 +932,7 @@ def main():
         "warehouse_id": args.warehouse_id,
         "title": args.title,
         "description": (
-            "Live streaming brewery packaging line analytics for the streaming workspace. "
+            "Live streaming production line analytics for the streaming workspace. "
             "Covers OEE, machine state, events, quality, inventory, and PM scheduling. "
             "Includes pre-shift briefing, post-shift summary, and carryover-risk SQLs "
             "tailored to the streaming schema (line_kpi, machine_state, event_log, "

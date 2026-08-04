@@ -57,5 +57,8 @@ def compute_tier1_line_kpi_row(
         "performance_to_now": performance_to_now,
         "quality_to_now": quality_to_now,
         "oee_to_now": oee_to_now,
-        "cumulative_cases": float(cumulative_cases),
+        # Cases are a discrete count: floor the float accumulator to a whole
+        # number on emit so the Cases tile never shows fractional cases (schema
+        # is DOUBLE, so we keep the float type but pin it to an integer value).
+        "cumulative_cases": float(int(cumulative_cases)),
     }

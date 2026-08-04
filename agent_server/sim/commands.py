@@ -70,18 +70,6 @@ def build_scenario_command(
     )
 
 
-def _get_conn():
-    """Lazy import + return the shared Lakebase psycopg2 connection.
-
-    Returns None when Lakebase is not configured (smoke tests, local dev
-    without PGHOST) — callers must handle that case so the API degrades
-    gracefully instead of crashing.
-    """
-    from agent_server.memory.pg_pool import get_connection
-
-    return get_connection()
-
-
 def persist_scenario_command(cmd: ScenarioCommand) -> None:
     """Insert a pre-built ScenarioCommand into Lakebase ``scenario_commands``.
 
@@ -91,16 +79,17 @@ def persist_scenario_command(cmd: ScenarioCommand) -> None:
     tail latency target is <100 ms and a fresh Postgres connection can take
     ~50 ms when the pool needs to refresh the OAuth token.
     """
-    conn = _get_conn()
-    if conn is None:
-        logger.warning(
-            "persist_scenario_command skipped: Lakebase unavailable "
-            "(command_id=%s scenario_id=%s shift_id=%s)",
-            cmd.command_id, cmd.scenario_id, cmd.shift_id,
-        )
-        return
+    from agent_server.memory.pg_pool import transaction
+
     try:
-        with conn.cursor() as cur:
+        with transaction() as cur:
+            if cur is None:
+                logger.warning(
+                    "persist_scenario_command skipped: Lakebase unavailable "
+                    "(command_id=%s scenario_id=%s shift_id=%s)",
+                    cmd.command_id, cmd.scenario_id, cmd.shift_id,
+                )
+                return
             cur.execute(
                 f"""
                 INSERT INTO {_TABLE} (
@@ -124,14 +113,7 @@ def persist_scenario_command(cmd: ScenarioCommand) -> None:
                     "params": json.dumps(cmd.params),
                 },
             )
-        conn.commit()
     except Exception:
-        # Roll back so a stale transaction doesn't poison the connection
-        # for the next caller — pg_pool reuses one connection across the app.
-        try:
-            conn.rollback()
-        except Exception:
-            pass
         logger.exception(
             "persist_scenario_command failed (command_id=%s scenario_id=%s)",
             cmd.command_id, cmd.scenario_id,
@@ -187,15 +169,16 @@ def resolve_command(
     the audit row stays intact even if the producer never reaches the
     terminal transition (e.g. demo restart).
     """
-    conn = _get_conn()
-    if conn is None:
-        logger.warning(
-            "resolve_command skipped: Lakebase unavailable (command_id=%s)",
-            command_id,
-        )
-        return
+    from agent_server.memory.pg_pool import transaction
+
     try:
-        with conn.cursor() as cur:
+        with transaction() as cur:
+            if cur is None:
+                logger.warning(
+                    "resolve_command skipped: Lakebase unavailable (command_id=%s)",
+                    command_id,
+                )
+                return
             cur.execute(
                 f"""
                 UPDATE {_TABLE}
@@ -210,12 +193,7 @@ def resolve_command(
                     "resolution_notes": resolution_notes or "",
                 },
             )
-        conn.commit()
     except Exception:
-        try:
-            conn.rollback()
-        except Exception:
-            pass
         logger.exception("resolve_command failed (command_id=%s)", command_id)
         raise
 
@@ -229,38 +207,27 @@ def list_recent_commands(limit: int = 50) -> list[dict[str, Any]]:
     ``idx_scenario_commands_status_created`` index keeps the SELECT under
     5 ms even after weeks of accumulated history.
     """
-    conn = _get_conn()
-    if conn is None:
-        logger.warning("list_recent_commands: Lakebase unavailable; returning empty list")
-        return []
+    from agent_server.memory.pg_pool import query
+
     try:
-        with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                SELECT
-                    command_id, created_at, created_by, shift_id, scenario_id,
-                    target_machine_id, severity, status, resolved_at, resolved_by
-                FROM {_TABLE}
-                ORDER BY created_at DESC
-                LIMIT %s
-                """,
-                (int(limit),),
-            )
-            # pg_pool's connection uses ``RealDictCursor``, so each row is
-            # already a dict keyed by column name.
-            return [
-                {k: _json_safe_value(v) for k, v in dict(r).items()}
-                for r in cur.fetchall()
-            ]
+        rows = query(
+            f"""
+            SELECT
+                command_id, created_at, created_by, shift_id, scenario_id,
+                target_machine_id, severity, status, resolved_at, resolved_by
+            FROM {_TABLE}
+            ORDER BY created_at DESC
+            LIMIT %s
+            """,
+            (int(limit),),
+        )
     except Exception:
-        # Don't roll back here — SELECTs don't need a rollback and we
-        # don't want to disrupt any concurrent INSERT/UPDATE waiting on
-        # the same singleton connection. Returning [] is the same fallback
-        # the previous UC implementation used on warehouse blips.
-        try:
-            # Discard any pending error state so the next caller can proceed.
-            conn.rollback()
-        except Exception:
-            pass
+        # ``query`` retries a broken connection and rolls back a failed
+        # statement, so anything reaching here is a real query error. Returning
+        # [] is the same fallback the previous UC implementation used.
         logger.exception("list_recent_commands query failed")
         return []
+    if rows is None:
+        logger.warning("list_recent_commands: Lakebase unavailable; returning empty list")
+        return []
+    return [{k: _json_safe_value(v) for k, v in r.items()} for r in rows]

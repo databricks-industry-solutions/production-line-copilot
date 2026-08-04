@@ -9,7 +9,7 @@ the UI expects.
 Keep the bullet contract here in sync with `prompts/_shared.py::RESPONSE_STRUCTURE`.
 """
 
-SYNTHESIS_TEMPLATE = """You are formatting a specialist's analysis into a structured, scannable readout for a brewery line manager who will read it on a tablet in under 30 seconds.
+SYNTHESIS_TEMPLATE = """You are formatting a specialist's analysis into a structured, scannable readout for a production line manager who will read it on a tablet in under 30 seconds.
 
 Specialist used: {specialist}
 Specialist analysis:

@@ -115,7 +115,7 @@ function KPIStrip({
 
   const summary = useMemo(() => {
     if (!kpi) return null;
-    const cases = toNumber(kpi.cumulative_cases);
+    const cases = Math.floor(toNumber(kpi.cumulative_cases));
     const stopped = toNumber(kpi.machines_stopped);
 
     // Build {machine_id -> latest 'resolved' ts} so we can close out
@@ -311,7 +311,7 @@ function KPIStrip({
           <CardContent className="p-0">
             <p className="text-[11px] text-muted-foreground mb-0.5">Cases</p>
             <p className="text-lg font-bold">
-              {toNumber(kpi.cumulative_cases).toLocaleString()}
+              {Math.floor(toNumber(kpi.cumulative_cases)).toLocaleString()}
               {plannedCases > 0 && (
                 <span className="text-xs font-normal text-muted-foreground ml-1">
                   {casesRatioValid

@@ -47,3 +47,57 @@ def test_boundary_just_over_150pct_is_suppressed():
     # 12,601 / 8,400 = 150.01% → treated as anomalous.
     out = _quick_snapshot(_ctx(12_601))
     assert "% of plan" not in out
+
+
+class TestNullsFromTheLiveTables:
+    """A NULL column must not take down the whole answer.
+
+    Both live readers do ``SELECT *``, so a nullable column arrives as a
+    present key holding ``None`` — which is why the ``.get(key, 0)`` defaults
+    here and the ``setdefault`` in ``_normalize_line_kpi_row`` both looked like
+    they covered this and neither did. ``float(None)`` raised ``TypeError``
+    out of ``_quick_snapshot``, which is called unguarded on the request path,
+    so one NULL in one column returned a raw Python error to the user instead
+    of an answer.
+
+    The existing tests above never caught it because they build fully
+    populated KPI dicts, which is exactly the shape the bug is not.
+    """
+
+    def test_a_null_kpi_metric_does_not_raise(self):
+        ctx = _ctx(4200)
+        ctx["current_kpi"]["availability_to_now"] = None
+        assert "OEE:" in _quick_snapshot(ctx)
+
+    def test_a_null_metric_reads_as_zero_not_none(self):
+        ctx = _ctx(4200)
+        ctx["current_kpi"]["performance_to_now"] = None
+        out = _quick_snapshot(ctx)
+        assert "P: 0.0%" in out
+        assert "None" not in out
+
+    def test_every_kpi_metric_null_at_once(self):
+        ctx = _ctx(4200)
+        for key in ("availability_to_now", "performance_to_now", "quality_to_now"):
+            ctx["current_kpi"][key] = None
+        assert "None" not in _quick_snapshot(ctx)
+
+    def test_a_null_oee_skips_the_line_rather_than_rendering_none(self):
+        # oee gates the whole line, and None means "no reading", not "zero".
+        ctx = _ctx(4200)
+        ctx["current_kpi"]["oee_to_now"] = None
+        out = _quick_snapshot(ctx)
+        assert "OEE:" not in out
+        assert "None" not in out
+
+    def test_a_null_event_description_does_not_raise(self):
+        # `.get('description', '')[:80]` on a present-but-null column was
+        # `None[:80]` — TypeError: 'NoneType' object is not subscriptable.
+        ctx = _ctx(4200)
+        ctx["active_events"] = [
+            {"machine_id": "FILLER-01", "event_type": "breakdown",
+             "severity": "high", "description": None},
+        ]
+        out = _quick_snapshot(ctx)
+        assert "FILLER-01" in out
+        assert "None" not in out

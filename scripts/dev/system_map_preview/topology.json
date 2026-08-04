@@ -1,0 +1,67 @@
+{
+    "domains": [
+        {
+            "domain": "asset",
+            "label": "Asset",
+            "configured": true,
+            "tool": "governed_asset_query",
+            "entities": [
+                "equipment_register",
+                "location",
+                "pm_schedule",
+                "failure_record"
+            ],
+            "specialists": [
+                "maintenance_predictor",
+                "downtime_analyst"
+            ]
+        },
+        {
+            "domain": "quality",
+            "label": "Quality",
+            "configured": true,
+            "tool": "governed_quality_query",
+            "entities": [
+                "inspection_result",
+                "ncr"
+            ],
+            "specialists": [
+                "quality_specialist"
+            ]
+        },
+        {
+            "domain": "inventory",
+            "label": "Inventory",
+            "configured": true,
+            "tool": "governed_inventory_query",
+            "entities": [
+                "material_master",
+                "stock_balance"
+            ],
+            "specialists": [
+                "supply_chain_advisor"
+            ]
+        },
+        {
+            "domain": "production",
+            "label": "Production",
+            "configured": true,
+            "tool": "governed_production_query",
+            "entities": [
+                "production_line",
+                "work_center",
+                "schedule",
+                "run"
+            ],
+            "specialists": [
+                "oee_coach",
+                "schedule_optimizer",
+                "strategic_advisor"
+            ]
+        }
+    ],
+    "configured": 4,
+    "total": 4,
+    "streaming_space": true,
+    "mvm_silver_enabled": true
+}

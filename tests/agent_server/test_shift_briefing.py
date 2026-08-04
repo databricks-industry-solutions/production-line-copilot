@@ -73,12 +73,10 @@ def test_specialist_module_uses_lean_toolbox():
             f"shift_briefing must not import {forbidden} — briefings summarise, "
             "they don't optimise/diagnose"
         )
-    # Mini endpoint — not the heavyweight model. Allow either the literal default
-    # or env-var indirection (MODEL_SPECIALIST), but reject any direct reference
-    # to the full gpt-5 / advanced endpoint.
-    assert '"databricks-gpt-5-mini"' in src or 'MODEL_SPECIALIST' in src
-    assert 'MODEL_ADVANCED' not in src
-    assert '"databricks-gpt-5"' not in src
+    # The model comes from the roster, not a hardcoded endpoint, so the factory
+    # and the "via <model>" badge in the UI can never disagree.
+    assert 'resolve("shift_briefing")' in src
+    assert "os.environ.get(" not in src, "endpoint selection belongs in model_roster"
 
 
 def test_agent_module_registers_shift_briefing():
@@ -91,8 +89,6 @@ def test_agent_module_registers_shift_briefing():
 
     assert "from agent_server.specialists.shift_briefing import create_shift_briefing" in src
     assert '"shift_briefing": create_shift_briefing()' in src
-    # Mini model for briefings (summarisation).
-    assert '"shift_briefing": os.environ.get("MODEL_SPECIALIST"' in src
     # Classifier must accept the new specialist name.
     assert '"shift_briefing"' in src
     # Must extend _trim_context to give briefings the handover fields.
@@ -115,6 +111,7 @@ def test_specialist_factory_creates_react_agent():
     _require_langchain()
 
     import agent_server.specialists.shift_briefing as briefing_mod
+    from agent_server.model_roster import resolve
     from agent_server.prompts.shift_briefing import SHIFT_BRIEFING_SYSTEM
 
     with patch.object(briefing_mod, "ChatDatabricks") as mock_llm, \
@@ -125,7 +122,7 @@ def test_specialist_factory_creates_react_agent():
     assert agent is mock_factory.return_value
     mock_llm.assert_called_once()
     _, llm_kwargs = mock_llm.call_args
-    assert llm_kwargs["endpoint"] == "databricks-gpt-5-mini"
+    assert llm_kwargs["endpoint"] == resolve("shift_briefing")
 
     _, factory_kwargs = mock_factory.call_args
     tools = factory_kwargs["tools"]
@@ -180,13 +177,21 @@ def test_specialist_registered_in_get_specialists():
     assert specialists["shift_briefing"] is fake_specialists["shift_briefing"]
 
 
-def test_model_map_assigns_mini_model():
-    """Briefings are summarisation work — the mini endpoint is the right default."""
+def test_briefings_stay_on_the_light_tier():
+    """Briefings summarise; they must not be given the deep-reasoning budget.
+
+    The specific model is the roster's business, but the tier is this module's:
+    a briefing is read at every shift change, so latency and format discipline
+    beat depth. Promoting it to the advanced tier would be a regression even
+    though it would score fine on quality.
+    """
     _require_langchain()
     from agent_server.agent import MODEL_MAP
+    from agent_server.model_roster import ROSTER
 
     assert "shift_briefing" in MODEL_MAP
-    assert "mini" in MODEL_MAP["shift_briefing"]
+    assignment = next(a for a in ROSTER if a.role == "shift_briefing")
+    assert assignment.tier == "specialist"
 
 
 def test_trim_context_for_shift_briefing_includes_handover_fields():

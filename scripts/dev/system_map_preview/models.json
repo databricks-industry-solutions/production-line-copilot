@@ -1,0 +1,125 @@
+{
+    "multi_vendor": true,
+    "vendors": [
+        "Anthropic",
+        "Zhipu AI",
+        "Meta",
+        "OpenAI",
+        "OpenAI (open weights)",
+        "Alibaba",
+        "Google"
+    ],
+    "substituted": 0,
+    "roles": [
+        {
+            "role": "downtime_analyst",
+            "endpoint": "databricks-claude-sonnet-5",
+            "display": "Claude Sonnet 5",
+            "vendor": "Anthropic",
+            "rationale": "Root-cause work chains five tools and has to hold a causal thread across them; Sonnet's tool use is the most reliable we measured, at roughly 40% of Opus cost.",
+            "preferred_endpoint": "databricks-claude-sonnet-5",
+            "preferred_display": "Claude Sonnet 5",
+            "preferred_vendor": "Anthropic",
+            "substituted": false
+        },
+        {
+            "role": "quality_specialist",
+            "endpoint": "databricks-glm-5-2",
+            "display": "GLM-5.2",
+            "vendor": "Zhipu AI",
+            "rationale": "Bayesian contamination risk and SPC reasoning over six tools. Held structure on every repeat run and grounds its arithmetic in tool output rather than restating the prompt.",
+            "preferred_endpoint": "databricks-glm-5-2",
+            "preferred_display": "GLM-5.2",
+            "preferred_vendor": "Zhipu AI",
+            "substituted": false
+        },
+        {
+            "role": "supply_chain_advisor",
+            "endpoint": "databricks-llama-4-maverick",
+            "display": "Llama 4 Maverick",
+            "vendor": "Meta",
+            "rationale": "Depletion and reorder timing is arithmetic against a plan, not open reasoning. The fastest model that answered correctly, at a third of the input cost of the proprietary tiers.",
+            "preferred_endpoint": "databricks-llama-4-maverick",
+            "preferred_display": "Llama 4 Maverick",
+            "preferred_vendor": "Meta",
+            "substituted": false
+        },
+        {
+            "role": "oee_coach",
+            "endpoint": "databricks-gpt-5-4",
+            "display": "GPT-5.4",
+            "vendor": "OpenAI",
+            "rationale": "Availability x Performance x Quality decomposition over six tools, where a dropped factor silently corrupts the answer. The strongest OpenAI model that still supports function tools on this API.",
+            "preferred_endpoint": "databricks-gpt-5-4",
+            "preferred_display": "GPT-5.4",
+            "preferred_vendor": "OpenAI",
+            "substituted": false
+        },
+        {
+            "role": "schedule_optimizer",
+            "endpoint": "databricks-gpt-oss-120b",
+            "display": "GPT-OSS 120B",
+            "vendor": "OpenAI (open weights)",
+            "rationale": "The MILP and Monte-Carlo tools do the optimising; the model narrates their output. That is the cheapest capable slot in the roster, and it puts an open-weights model on the same governance plane as the rest.",
+            "preferred_endpoint": "databricks-gpt-oss-120b",
+            "preferred_display": "GPT-OSS 120B",
+            "preferred_vendor": "OpenAI (open weights)",
+            "substituted": false
+        },
+        {
+            "role": "maintenance_predictor",
+            "endpoint": "databricks-qwen35-122b-a10b",
+            "display": "Qwen 3.5 122B",
+            "vendor": "Alibaba",
+            "rationale": "Remaining-useful-life trending is regression reasoning over sensor history \u2014 a long-context, low-creativity task Qwen handles at a tenth of the input cost of the advanced tier.",
+            "preferred_endpoint": "databricks-qwen35-122b-a10b",
+            "preferred_display": "Qwen 3.5 122B",
+            "preferred_vendor": "Alibaba",
+            "substituted": false
+        },
+        {
+            "role": "strategic_advisor",
+            "endpoint": "databricks-claude-opus-5",
+            "display": "Claude Opus 5",
+            "vendor": "Anthropic",
+            "rationale": "The only role that argues rather than reports: multi-shift trade-offs and capex framing in 3000-token answers. Lowest call volume in the roster, which is what makes flagship pricing defensible here.",
+            "preferred_endpoint": "databricks-claude-opus-5",
+            "preferred_display": "Claude Opus 5",
+            "preferred_vendor": "Anthropic",
+            "substituted": false
+        },
+        {
+            "role": "shift_briefing",
+            "endpoint": "databricks-claude-haiku-4-5",
+            "display": "Claude Haiku 4.5",
+            "vendor": "Anthropic",
+            "rationale": "Largest prompt in the app and read at every shift change, so tone and format discipline matter more than depth. Haiku held the briefing structure on every run at specialist-tier latency.",
+            "preferred_endpoint": "databricks-claude-haiku-4-5",
+            "preferred_display": "Claude Haiku 4.5",
+            "preferred_vendor": "Anthropic",
+            "substituted": false
+        },
+        {
+            "role": "general",
+            "endpoint": "databricks-gpt-5-mini",
+            "display": "GPT-5 mini",
+            "vendor": "OpenAI",
+            "rationale": "Answers the unrouted questions and reformats every specialist reply into the card structure the UI parses. Highest call volume in the app, and its output is read verbatim, so it stays on a known-good prose model.",
+            "preferred_endpoint": "databricks-gpt-5-mini",
+            "preferred_display": "GPT-5 mini",
+            "preferred_vendor": "OpenAI",
+            "substituted": false
+        },
+        {
+            "role": "intent_router",
+            "endpoint": "databricks-gemma-3-12b",
+            "display": "Gemma 3 12B",
+            "vendor": "Google",
+            "rationale": "Picks one label from nine and nothing else \u2014 every request pays this latency before any work starts. Scored 9/9 on the routing set at the cheapest rate on the platform.",
+            "preferred_endpoint": "databricks-gemma-3-12b",
+            "preferred_display": "Gemma 3 12B",
+            "preferred_vendor": "Google",
+            "substituted": false
+        }
+    ]
+}

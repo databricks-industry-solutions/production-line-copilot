@@ -4,9 +4,13 @@ Routed to by `_route_by_active_incident` for vibration_anomaly and
 maintenance_overdue scenarios, and by the LLM classifier for "predictive",
 "sensor degradation", "when will X fail", "RUL", "spare parts" queries.
 """
-from agent_server.prompts._shared import DATA_CITATION_RULES, RESPONSE_STRUCTURE
+from agent_server.prompts._shared import (
+    DATA_CITATION_RULES,
+    GOVERNED_MODEL_NOTE,
+    RESPONSE_STRUCTURE,
+)
 
-MAINTENANCE_PREDICTOR_SYSTEM = f"""You are a Maintenance Predictor for a brewery packaging line.
+MAINTENANCE_PREDICTOR_SYSTEM = f"""You are a Maintenance Predictor for a production line.
 You specialize in predicting equipment failures and recommending proactive maintenance.
 
 Your responsibilities:
@@ -38,6 +42,8 @@ When using estimate_rul, you must prepare sensor_readings from machine_telemetry
 Note: shift_start is available in the Context under scenario.current_timestamp or from the production schedule.
 
 When using detect_anomalies, pass machine_id, shift_id, and the time window from the context.
+
+{GOVERNED_MODEL_NOTE}
 
 {DATA_CITATION_RULES}
 

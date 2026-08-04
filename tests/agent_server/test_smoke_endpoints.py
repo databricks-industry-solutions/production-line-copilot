@@ -75,6 +75,36 @@ def test_openapi_loads_and_lists_core_routes(client: TestClient) -> None:
         assert route in paths, f"missing route in OpenAPI spec: {route}"
 
 
+def test_sim_commands_serialises_timestamped_rows(client: TestClient, monkeypatch) -> None:
+    """``/sim/commands`` returns rows straight from Postgres, and every one of
+    them carries a ``created_at``. Starlette's JSON encoder cannot render a
+    datetime, so before the encoder was added this route returned 500 for the
+    entire time any incident was active — precisely when it is consulted.
+    """
+    from datetime import datetime, timezone
+
+    from agent_server.serving import realtime_store
+
+    monkeypatch.setattr(
+        realtime_store,
+        "read_commands_active",
+        lambda shift_id: [
+            {
+                "command_id": "c1",
+                "scenario_id": "conveyor_jam",
+                "status": "active",
+                "created_at": datetime(2026, 8, 3, 9, 30, tzinfo=timezone.utc),
+            }
+        ],
+    )
+
+    resp = client.get("/sim/commands")
+    assert resp.status_code == 200
+    commands = resp.json()["commands"]
+    assert commands[0]["command_id"] == "c1"
+    assert commands[0]["created_at"].startswith("2026-08-03T09:30")
+
+
 def test_cors_default_is_locked_down() -> None:
     """Default CORS policy (no AGENT_CORS_ALLOW_ORIGINS) blocks cross-origin
     requests. We import start_server fresh under a clean env and check the

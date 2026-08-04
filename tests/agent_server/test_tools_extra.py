@@ -43,11 +43,23 @@ from agent_server.tools.sql_query import sql_query
 
 
 @pytest.fixture(autouse=True)
-def _reset_sql_conn(monkeypatch):
-    """Isolate the module-global cached connection between tests."""
-    monkeypatch.setattr(sqm, "_cached_connection", None, raising=False)
-    monkeypatch.setattr(sqm, "_last_health_check", 0.0, raising=False)
+def _reset_sql_conn():
+    """Clear this thread's cached connection between tests.
+
+    Thread-local rather than a module global, because the connector declares
+    PEP 249 ``threadsafety = 1``: connections must not be shared between
+    threads.
+    """
+    sqm._local.connection = None
+    sqm._local.last_health_check = 0.0
     yield
+    sqm._local.connection = None
+    sqm._local.last_health_check = 0.0
+
+
+def _seed_connection(connection, checked_at: float = 0.0) -> None:
+    sqm._local.connection = connection
+    sqm._local.last_health_check = checked_at
 
 
 def test_create_connection_missing_config_raises(monkeypatch):
@@ -86,8 +98,7 @@ def test_create_connection_oauth_path(monkeypatch):
 
 def test_get_connection_returns_cached_within_interval(monkeypatch):
     cached = object()
-    monkeypatch.setattr(sqm, "_cached_connection", cached)
-    monkeypatch.setattr(sqm, "_last_health_check", time.monotonic())
+    _seed_connection(cached, time.monotonic())
     # would blow up if it tried to reconnect
     monkeypatch.setattr(sqm, "_create_connection", lambda: pytest.fail("reconnected"))
     assert sqm._get_connection() is cached
@@ -102,23 +113,112 @@ def test_get_connection_reconnects_when_stale(monkeypatch):
             pass
 
     fresh = object()
-    monkeypatch.setattr(sqm, "_cached_connection", _BadConn())
-    monkeypatch.setattr(sqm, "_last_health_check", 0.0)  # forces health check
+    _seed_connection(_BadConn(), 0.0)  # zero forces the health check
     monkeypatch.setattr(sqm, "_create_connection", lambda: fresh)
     assert sqm._get_connection() is fresh
 
 
-def test_invalidate_connection_closes_and_clears(monkeypatch):
+def test_invalidate_connection_closes_and_clears():
     closed = {"v": False}
 
     class _Conn:
         def close(self):
             closed["v"] = True
 
-    monkeypatch.setattr(sqm, "_cached_connection", _Conn())
+    _seed_connection(_Conn())
     sqm._invalidate_connection()
     assert closed["v"] is True
-    assert sqm._cached_connection is None
+    assert sqm._local.connection is None
+
+
+def test_invalidate_survives_a_connection_that_will_not_close():
+    """The caller is discarding it either way; a raising close must not escape."""
+
+    class _StubbornConn:
+        def close(self):
+            raise RuntimeError("already gone")
+
+    _seed_connection(_StubbornConn())
+    sqm._invalidate_connection()
+    assert sqm._local.connection is None
+
+
+# --------------------------------------------------------------------------- #
+# Thread isolation.
+#
+# databricks-sql-connector declares PEP 249 threadsafety = 1: threads may share
+# the module but NOT connections. The specialist pool runs six workers, so these
+# pin the property the pool depends on.
+# --------------------------------------------------------------------------- #
+def test_the_driver_still_forbids_sharing_a_connection():
+    """If this ever reaches 2, per-thread connections stop being necessary."""
+    import databricks.sql as dbsql
+
+    assert dbsql.threadsafety == 1, (
+        f"connector now declares threadsafety={dbsql.threadsafety}; "
+        "re-read whether per-thread connections are still required"
+    )
+
+
+def test_each_thread_gets_its_own_connection(monkeypatch):
+    import threading as _threading
+
+    workers = 4
+    monkeypatch.setattr(sqm, "_create_connection", object)
+
+    # A barrier, so all four hold a connection at the same moment. Without it
+    # the threads can run one after another, and thread ids are recycled once a
+    # thread exits — which would let a shared connection pass unnoticed.
+    ready = _threading.Barrier(workers, timeout=5)
+    seen: list[object] = [None] * workers
+
+    def _worker(slot: int):
+        connection = sqm._get_connection()
+        ready.wait()
+        seen[slot] = connection
+
+    threads = [_threading.Thread(target=_worker, args=(i,)) for i in range(workers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert all(c is not None for c in seen), "a worker never got a connection"
+    assert len({id(c) for c in seen}) == workers, "threads shared a connection"
+
+
+def test_one_thread_invalidating_leaves_the_others_alone(monkeypatch):
+    """The cascade this replaces: a failure closed everyone's connection.
+
+    One thread hitting a stale socket used to call `_invalidate_connection()` on
+    the single shared connection, failing every query in flight — each of which
+    then invalidated in turn.
+    """
+    import threading as _threading
+
+    monkeypatch.setattr(sqm, "_create_connection", lambda: object())
+
+    other_thread_state: dict[str, object] = {}
+    reached_invalidate = _threading.Event()
+    may_finish = _threading.Event()
+
+    def _other():
+        other_thread_state["before"] = sqm._get_connection()
+        reached_invalidate.wait(timeout=5)
+        other_thread_state["after"] = sqm._get_connection()
+        may_finish.set()
+
+    thread = _threading.Thread(target=_other)
+    thread.start()
+
+    # This thread throws its own connection away while the other holds one.
+    sqm._get_connection()
+    sqm._invalidate_connection()
+    reached_invalidate.set()
+
+    assert may_finish.wait(timeout=5)
+    thread.join()
+    assert other_thread_state["before"] is other_thread_state["after"]
 
 
 def test_sql_query_500_rows_logged(monkeypatch):

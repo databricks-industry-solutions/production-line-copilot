@@ -36,6 +36,78 @@ def test_check_naming_convention():
         )
 
 
+def test_mvm_catalog_token_substituted_default(monkeypatch):
+    """The ``${MVM_CATALOG}`` token in the referential check must be replaced
+    at load time — a literal ``${MVM_CATALOG}`` would make DQX target a
+    nonsensical table."""
+    pytest.importorskip("yaml")
+    monkeypatch.delenv("MVM_CATALOG", raising=False)
+    from pipelines.dqx_augment import DEFAULT_MVM_CATALOG, load_checks
+
+    fk = [c for c in load_checks() if c.get("name") == "machine_state__machine_id_referential"]
+    assert fk, "referential FK check should be present"
+    ref_table = fk[0]["check"]["arguments"]["ref_table"]
+    assert "${MVM_CATALOG}" not in ref_table
+    assert ref_table == f"{DEFAULT_MVM_CATALOG}.asset.equipment_register"
+
+
+def test_mvm_catalog_token_substituted_from_env(monkeypatch):
+    pytest.importorskip("yaml")
+    monkeypatch.setenv("MVM_CATALOG", "my_mvm_cat")
+    from pipelines.dqx_augment import load_checks
+
+    fk = [c for c in load_checks() if c.get("name") == "machine_state__machine_id_referential"]
+    assert fk[0]["check"]["arguments"]["ref_table"] == "my_mvm_cat.asset.equipment_register"
+
+
+def test_freshness_check_uses_dqx_015_function(monkeypatch):
+    """The freshness check must use ``is_data_fresh`` (DQX >=0.15), not the
+    removed ``is_older_than_n_seconds`` (0.10) — the latter raises
+    ``InvalidCheckError`` at apply time, which the fail-safe swallows so DQX
+    silently stops flagging freshness."""
+    pytest.importorskip("yaml")
+    from pipelines.dqx_augment import load_checks
+
+    fresh = [c for c in load_checks("machine_state")
+             if c.get("name", "").startswith("machine_state__stale")]
+    assert fresh, "freshness check should be present"
+    fn = fresh[0]["check"]["function"]
+    assert fn == "is_data_fresh", f"expected is_data_fresh, got {fn!r}"
+    assert "max_age_minutes" in fresh[0]["check"]["arguments"]
+
+
+def test_line_kpi_checks_reference_real_bronze_columns():
+    """The line_kpi checks must reference columns that actually exist on
+    line_kpi_bronze (total_throughput / oee_to_now). Wrong names make DQX emit
+    'invalid check columns' meta-warnings that flood dqx_warnings instead of
+    evaluating — a regression that was invisible until DQX actually ran."""
+    pytest.importorskip("yaml")
+    from pipelines.dqx_augment import load_checks
+
+    by_name = {c["name"]: c for c in load_checks("line_kpi")}
+    assert by_name["line_kpi__throughput_non_negative"]["check"]["arguments"]["column"] == "total_throughput"
+    oee = by_name["line_kpi__oee_in_unit_range"]["check"]["arguments"]
+    assert oee["column"] == "oee_to_now"
+    # OEE is a percentage (0..100) in the producer schema, not a 0..1 fraction.
+    assert oee["max_limit"] == 100
+
+
+def test_mvm_catalog_arg_overrides_env(monkeypatch):
+    """The explicit ``mvm_catalog`` arg must win over ``MVM_CATALOG`` env.
+
+    Regression guard for the serverless bug: the streaming sink resolves the
+    catalog on the driver and passes it in, because a server-side ``os.environ``
+    read inside the ``foreachBatch`` closure sees neither the CLI-promoted env
+    var nor the correct catalog."""
+    pytest.importorskip("yaml")
+    monkeypatch.setenv("MVM_CATALOG", "env_cat")
+    from pipelines.dqx_augment import load_checks
+
+    fk = [c for c in load_checks(mvm_catalog="arg_cat")
+          if c.get("name") == "machine_state__machine_id_referential"]
+    assert fk[0]["check"]["arguments"]["ref_table"] == "arg_cat.asset.equipment_register"
+
+
 def test_filter_by_table_name():
     pytest.importorskip("yaml")
     from pipelines.dqx_augment import load_checks

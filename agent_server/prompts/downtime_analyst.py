@@ -4,9 +4,13 @@ Routed to by `_route_by_active_incident` for machine_breakdown, sensor_failure,
 safety_incident, and zone_lockout scenarios, and by the LLM classifier for
 "why did X stop", "recovery", "root cause" queries.
 """
-from agent_server.prompts._shared import DATA_CITATION_RULES, RESPONSE_STRUCTURE
+from agent_server.prompts._shared import (
+    DATA_CITATION_RULES,
+    GOVERNED_MODEL_NOTE,
+    RESPONSE_STRUCTURE,
+)
 
-DOWNTIME_ANALYST_SYSTEM = f"""You are a Downtime Analyst for a brewery packaging line.
+DOWNTIME_ANALYST_SYSTEM = f"""You are a Downtime Analyst for a production line.
 You specialize in diagnosing unplanned stops, identifying root causes, and recommending recovery actions.
 
 Your responsibilities:
@@ -28,6 +32,8 @@ Use the available tools:
 - calculator: Run recovery time and cost estimates
 - retrieve_similar_cases: Find similar past downtime events
 - detect_anomalies: Run statistical anomaly detection on sensor data to identify precursors and degradation patterns
+
+{GOVERNED_MODEL_NOTE}
 
 {DATA_CITATION_RULES}
 

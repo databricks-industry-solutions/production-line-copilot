@@ -49,12 +49,12 @@ Quality rules drop rows that fail the per-table predicates and emit a
 can break failures down by reason.
 
 DQX augmentation (opt-in, warning-only): ``pipelines/dqx_augment.py`` provides
-an additive layer that runs DQX freshness + non-negative + (post-step-3)
-referential checks BESIDE the hand-rolled path and appends flagged rows to
-``<schema>.dqx_warnings``. It's not wired in yet — enable by setting
-``DQX_ENABLED=1`` and adding one ``apply_dqx_warnings`` call inside ``_sink``
-(see ``pipelines/dqx_augment.py`` docstring). The valid-row path is not
-affected either way, so this is safe to deploy dark.
+an additive layer that runs DQX freshness + non-negative + referential
+(``asset.equipment_register``) checks BESIDE the hand-rolled path and appends
+flagged rows to the normalized ``<schema>.dqx_warnings`` audit table. It is now
+wired into ``_sink`` but gated by ``DQX_ENABLED`` (default OFF), so it deploys
+dark and is turned on per-target via the env var. The valid-row path is never
+affected — DQX is observability-only and its failures are swallowed.
 
 Idempotency: Delta sinks are checkpointed; ``_latest`` upsert uses
 ``ON CONFLICT … DO UPDATE``. Spark retries the whole batch on failure —
@@ -165,6 +165,18 @@ def _apply_cli_env() -> None:
         default=None,
         choices=("processingTime", "availableNow"),
     )
+    # DQX augmentation toggle + the MVM catalog its referential check resolves.
+    # Serverless task envs don't reliably propagate job env vars to the driver,
+    # so (like the Lakebase params above) we pass them as CLI flags and promote
+    # them to the env vars dqx_augment reads (DQX_ENABLED / MVM_CATALOG).
+    p.add_argument("--dqx-enabled", default=None)
+    p.add_argument("--mvm-catalog", default=None)
+    # Streaming-silver toggle: when on, each QC'd micro-batch is MERGE-upserted
+    # into the governed MVM fact tables (asset.failure_record, inventory.stock_
+    # balance, production.production_line, quality.inspection_result) at streaming
+    # latency — replacing the old 30-min batch refresh job. Off by default so it
+    # deploys dark, like DQX.
+    p.add_argument("--mvm-silver", default=None)
     ns, _ = p.parse_known_args()
     mapping = {
         "UC_CATALOG": ns.catalog,
@@ -178,6 +190,9 @@ def _apply_cli_env() -> None:
         "CHECKPOINT_VOLUME": ns.checkpoint_volume,
         "TRIGGER_PROCESSING_MILLIS": ns.trigger_millis,
         "STREAM_TRIGGER_MODE": ns.trigger_mode,
+        "DQX_ENABLED": ns.dqx_enabled,
+        "MVM_CATALOG": ns.mvm_catalog,
+        "MVM_SILVER_ENABLED": ns.mvm_silver,
     }
     for k, v in mapping.items():
         if v:
@@ -213,6 +228,42 @@ CHECKPOINT_ROOT = os.environ.get(
 JOB_CHECKPOINT_ROOT = f"{CHECKPOINT_ROOT}/streaming_quality_sync_v2"
 
 REJECTS_TABLE = f"`{CATALOG}`.`{SCHEMA}`.`quality_rejects`"
+# DQX audit sink (see pipelines/dqx_augment.py). saveAsTable wants an unquoted
+# catalog.schema.table identifier. Written only when DQX_ENABLED=1.
+DQX_WARNINGS_TABLE = f"{CATALOG}.{SCHEMA}.dqx_warnings"
+
+# DQX config is resolved HERE, at module import on the client/driver, right
+# after ``_apply_cli_env()`` has promoted the ``--dqx-enabled`` / ``--mvm-catalog``
+# CLI flags into the process env. These MUST NOT be read from ``os.environ``
+# inside the ``foreachBatch`` sink: on serverless (Spark Connect) the batch
+# function executes server-side where the CLI-promoted env vars do not exist,
+# so a runtime ``os.environ`` read there silently returns the default (DQX off,
+# wrong MVM catalog). Capturing them as module constants makes cloudpickle
+# serialize the resolved VALUES into the closure — the same reason CATALOG /
+# SCHEMA / DQX_WARNINGS_TABLE above work inside the sink.
+DQX_ENABLED = os.environ.get("DQX_ENABLED", "0") == "1"
+MVM_CATALOG = os.environ.get("MVM_CATALOG") or None
+# Streaming silver: MERGE each micro-batch into the governed MVM fact tables.
+# Resolved on the driver at import (same reason as DQX_ENABLED above) so the
+# value is serialized into the server-side foreachBatch closure. Requires
+# MVM_CATALOG to be set (the model must be installed).
+MVM_SILVER_ENABLED = os.environ.get("MVM_SILVER_ENABLED", "0") == "1"
+DBX_HOST = os.environ.get("DATABRICKS_HOST") or None
+DBX_TOKEN = os.environ.get("DATABRICKS_TOKEN") or None
+# Capture a working credential on the DRIVER (where default auth resolves) so
+# the DQX WorkspaceClient can authenticate inside the server-side foreachBatch
+# closure, where default auth is NOT configured. authenticate() returns the
+# Authorization header for the resolved auth (PAT or minted OAuth bearer).
+try:  # pragma: no cover - only meaningful on a Databricks driver
+    from databricks.sdk import WorkspaceClient as _WC
+    _dw = _WC()
+    DBX_HOST = DBX_HOST or _dw.config.host
+    if not DBX_TOKEN:
+        _auth = _dw.config.authenticate() or {}
+        _bearer = _auth.get("Authorization", "")
+        DBX_TOKEN = _bearer[len("Bearer "):] if _bearer.startswith("Bearer ") else None
+except Exception:  # noqa: BLE001
+    pass
 
 
 def _bronze(name: str) -> str:
@@ -352,82 +403,6 @@ def _connect_with_token(token: str, pg_conf: dict):
     return conn
 
 
-def _make_partition_writer(
-    base_sql: str,
-    template: str,
-    name: str,
-    token: str,
-    pg_conf: dict,
-    row_counter=None,
-):
-    """Build a closure for ``df.foreachPartition`` that opens a connection,
-    runs one ``execute_values`` insert, and closes.
-
-    The OAuth ``token`` and Postgres ``pg_conf`` are captured by closure
-    so Spark serialises them to executors. ``os.environ`` cannot be used
-    for this — env vars don't cross the driver→executor Python-worker
-    boundary on classic OR serverless, which was the bug that bricked
-    the original foreachPartition rollout (executor saw an empty token
-    and threw ``no password supplied``).
-
-    Token freshness: the caller (``_sink``) reads the current value
-    from a mutable token holder once per micro-batch and rebuilds this
-    writer with that snapshot. A background thread on the driver
-    refreshes the holder on a TTL, so streams running for hours never
-    hand a stale token to executors.
-
-    ``row_counter`` (optional Spark accumulator): each partition adds the
-    number of rows it inserted. The caller reads ``.value`` after the
-    foreachPartition action returns to get the total. We add this here
-    so callers can stop running a separate ``valid_p.count()`` action
-    just for the log line — that count was costing ~0.5-1 s per batch
-    per stream on classic single-node, which the SSE cursor saw as
-    extra time before the next row landed in Lakebase.
-
-    Idempotent on Spark retry because the SQL ends with
-    ``ON CONFLICT … DO NOTHING`` (history) or ``DO UPDATE`` (latest,
-    but that path stays driver-side). Accumulator may double-count on
-    retry; we accept that for log-line accuracy since the dashboard
-    never reads it.
-    """
-
-    def _write_partition(rows_iter):
-        rows = [r.asDict(recursive=True) for r in rows_iter]
-        if not rows:
-            return
-        import psycopg2
-        from psycopg2.extras import execute_values
-        conn = psycopg2.connect(
-            host=pg_conf["host"],
-            port=pg_conf["port"],
-            user=pg_conf["user"],
-            password=token,
-            dbname=pg_conf["dbname"],
-            sslmode=pg_conf["sslmode"],
-            connect_timeout=10,
-        )
-        conn.autocommit = False
-        try:
-            with conn.cursor() as cur:
-                execute_values(cur, base_sql, rows, template=template, page_size=1000)
-            conn.commit()
-        finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
-        if row_counter is not None:
-            try:
-                row_counter.add(len(rows))
-            except Exception:
-                # Accumulator unavailable on the executor for some reason —
-                # don't fail the write, the log line will just say
-                # ``history=?``.
-                pass
-
-    return _write_partition
-
-
 def _pg_conf_from_env() -> dict:
     """Snapshot the Lakebase connection params from driver env into a dict
     that can be captured by closure and shipped to executors.
@@ -519,10 +494,6 @@ def _build_values_sql(
 
 
 _MS_COLS = ["shift_id", "machine_id", "ts", "status", "throughput_per_min", "speed_pct", "alarm_count"]
-_MS_HISTORY = _build_values_sql(
-    "ai_serving.machine_state_history", _MS_COLS,
-    "ON CONFLICT (shift_id, machine_id, ts) DO NOTHING",
-)
 _MS_LATEST = _build_values_sql(
     "ai_serving.machine_state_latest", _MS_COLS,
     """ON CONFLICT (shift_id, machine_id) DO UPDATE SET
@@ -538,10 +509,6 @@ _KPI_COLS = [
     "machines_starved", "total_throughput", "cumulative_cases", "avg_speed_pct",
     "availability_to_now", "performance_to_now", "quality_to_now", "oee_to_now",
 ]
-_KPI_HISTORY = _build_values_sql(
-    "ai_serving.line_kpi_history", _KPI_COLS,
-    "ON CONFLICT (shift_id, ts) DO NOTHING",
-)
 _KPI_LATEST = _build_values_sql(
     "ai_serving.line_kpi_latest", _KPI_COLS,
     """ON CONFLICT (shift_id) DO UPDATE SET
@@ -564,10 +531,6 @@ _EVT_COLS = [
     "timestamp_start", "timestamp_end", "duration_minutes", "root_cause",
     "description", "corrective_action",
 ]
-_EVT_HISTORY = _build_values_sql(
-    "ai_serving.event_log_history", _EVT_COLS,
-    "ON CONFLICT (event_id) DO NOTHING",
-)
 _EVT_LATEST = _build_values_sql(
     "ai_serving.event_log_recent", _EVT_COLS,
     """ON CONFLICT (event_id) DO UPDATE SET
@@ -587,10 +550,6 @@ _INV_HIST_COLS = [
     "shift_id", "material_id", "ts", "on_hand_qty", "safety_stock",
     "reorder_point", "status", "consumption_rate_per_hour",
 ]
-_INV_HISTORY = _build_values_sql(
-    "ai_serving.inventory_status_history", _INV_HIST_COLS,
-    "ON CONFLICT (shift_id, material_id, ts) DO NOTHING",
-)
 
 _INV_LATEST_COLS = [
     "shift_id", "material_id", "on_hand_qty", "safety_stock",
@@ -711,9 +670,106 @@ def _ensure_gold_history_tables(spark: SparkSession) -> None:
     return
 
 
+# ─── Streaming-silver MVM merge ──────────────────────────────────────────
+#
+# Design B: instead of a separate 30-min batch job, each QC'd micro-batch is
+# MERGE-upserted into the governed MVM fact tables from inside foreachBatch —
+# so the industry model rides the SAME Zerobus→bronze streaming path (seconds
+# latency, no third data path). Dimensions (equipment_register, location,
+# material_master, schedule) are slow-changing and seeded once at setup; only
+# the fact tables stream here.
+#
+# Gated by MVM_SILVER_ENABLED (deploys dark) and, like DQX, fully non-fatal:
+# a merge failure NEVER takes the streaming/analytics path down.
+
+# stream name → silver_mapper mapping key(s) (stream-enabled fact tables).
+# quality_checks feeds TWO governed facts from one bronze stream: every check
+# becomes an inspection_result, and failing checks additionally become an ncr.
+_STREAM_TO_MVM = {
+    "event_log": ("failure_record",),
+    "inventory_status": ("stock_balance",),
+    "line_kpi": ("production_line",),
+    "quality_checks": ("inspection_result", "ncr"),
+}
+# Introspected target columns per mapping key, cached after first (non-empty)
+# lookup so we don't hit information_schema every micro-batch.
+_MVM_COLS_CACHE: dict[str, set[str]] = {}
+
+
+def _mvm_merge(source_df: DataFrame, mvm_key: str, batch_id: int) -> None:
+    """Upsert one micro-batch into the MVM fact table for ``mvm_key``.
+
+    Non-fatal by contract: any failure (model not installed, column drift,
+    transient SQL error) is logged and swallowed so the governed-model write
+    never affects the QC/gold/Lakebase path. Idempotent — the MERGE matches on
+    a stable surrogate key, so a Spark batch retry re-upserts the same rows.
+    """
+    if not (MVM_SILVER_ENABLED and MVM_CATALOG):
+        return
+    try:
+        from agent_server.serving.silver_mapper import (
+            MAPPINGS, build_merge, introspect_sql,
+        )
+    except Exception:
+        logger.exception("[mvm:%s] silver_mapper import failed (non-fatal)", mvm_key)
+        return
+    m = next((mm for mm in MAPPINGS if mm.key == mvm_key), None)
+    if m is None or not m.is_streaming:
+        return
+
+    sess = source_df.sparkSession
+    cols = _MVM_COLS_CACHE.get(mvm_key)
+    if not cols:
+        try:
+            rows = sess.sql(introspect_sql(MVM_CATALOG, m.schema, m.table)).collect()
+            cols = {str(r[0]) for r in rows}
+        except Exception:
+            logger.exception("[mvm:%s] introspect failed (target installed?)", mvm_key)
+            return
+        if not cols:
+            # Target not installed yet — don't cache; a later batch (after setup)
+            # will re-check and pick it up.
+            return
+        _MVM_COLS_CACHE[mvm_key] = cols
+
+    view = f"_mvm_src_{mvm_key}_{batch_id}"
+    try:
+        source_df.createOrReplaceTempView(view)
+        stmt = build_merge(m, MVM_CATALOG, view, cols)
+        if stmt:
+            sess.sql(stmt)
+            print(f"[mvm:{mvm_key}] batch={batch_id} merged", flush=True)
+    except Exception:
+        logger.exception("[mvm:%s] merge failed (non-fatal)", mvm_key)
+    finally:
+        try:
+            sess.catalog.dropTempView(view)
+        except Exception:
+            pass
+
+
+def _make_mvm_only_sink(name: str, mvm_keys: tuple[str, ...]):
+    """foreachBatch sink that ONLY upserts governed MVM fact table(s).
+
+    Used for bronze streams (e.g. quality_checks) that feed the industry model
+    but have no Lakebase ``_latest`` cache or gold_history sink of their own.
+    A single stream may feed several MVM tables (quality_checks → inspection_
+    result + ncr). Inert unless MVM_SILVER_ENABLED.
+    """
+    def _sink(batch_df: DataFrame, batch_id: int) -> None:
+        for mvm_key in mvm_keys:
+            try:
+                _mvm_merge(batch_df, mvm_key, batch_id)
+            except Exception:
+                # _mvm_merge is already fail-safe; this is belt-and-braces so a
+                # quality_checks batch can never crash the job.
+                logger.exception("[%s] mvm-only sink failed for %s (non-fatal)",
+                                 name, mvm_key)
+    return _sink
+
+
 def _make_dual_sink(
     name: str,
-    history: tuple[str, str],
     latest: tuple[str, str],
     pk_for_latest: list[str],
     select_cols: list[str],
@@ -721,7 +777,7 @@ def _make_dual_sink(
     token_holder: dict,
     optional_cols: tuple[str, ...] = (),
 ):
-    """Return a foreachBatch closure that writes valid rows to THREE sinks.
+    """Return a foreachBatch closure that writes valid rows to up to FOUR sinks.
 
     Sink layout (and where each runs):
 
@@ -730,14 +786,24 @@ def _make_dual_sink(
                                                             to ≤ 36 rows by
                                                             _latest_per_key
       3. ``quality_rejects``             Delta append    — Spark distributed
+      4. governed MVM fact(s)            Delta MERGE     — streaming silver,
+                                                            _STREAM_TO_MVM[name],
+                                                            only when
+                                                            MVM_SILVER_ENABLED;
+                                                            non-fatal (never
+                                                            takes the job down)
+
+    Sink 4 (design B) upserts each micro-batch into the governed industry-model
+    fact table(s) so the MVM rides this same streaming path at seconds latency
+    instead of a 30-min batch. It runs AFTER the live-cache + gold writes and is
+    fully fail-safe, so it can neither delay nor break the analytics/live paths.
+    It is inert on the dark-deploy default (MVM_SILVER_ENABLED off).
 
     Note: ``ai_serving.<name>_history`` (the previous Sink 2) is no longer
     written here. The producer dual-writes those rows directly via
     ``src/streaming_sim/lakebase_sink.py`` so the live UI sees them in
     ~200 ms instead of waiting for Zerobus' 5-30 s bronze materialization
-    SLA followed by this consumer's micro-batch. The ``history`` argument
-    is retained for ABI stability with callers in ``main()`` but is now
-    ignored; safe to drop on a future cleanup pass.
+    SLA followed by this consumer's micro-batch.
 
     ``latest`` is a ``(base_sql, template)`` pair from ``_build_values_sql``.
     ``pg_conf`` (host/port/dbname/user/sslmode) is captured by closure once.
@@ -752,12 +818,36 @@ def _make_dual_sink(
     Spark retries the WHOLE batch on any failure → every sink is
     idempotent, so duplicates are no-ops.
     """
-    del history  # No longer used; producer owns the _history sink now.
     latest_sql, latest_tpl = latest
 
     def _sink(batch_df: DataFrame, batch_id: int) -> None:
         try:
             valid, invalid = split_valid_invalid(batch_df, name)
+
+            # ── DQX augmentation (optional, observability-only) ────────────
+            # Runs BESIDE the QC gate: flags suspect rows into the separate
+            # ``dqx_warnings`` audit table without touching the valid/reject
+            # decision. Inert unless DQX_ENABLED=1. Never raises — DQX must not
+            # take the streaming job down (see apply_dqx_warnings' fail-safe).
+            #
+            # Everything DQX needs is resolved on the DRIVER at import and passed
+            # in by value; NOTHING here reads os.environ or default SDK auth,
+            # because this closure executes server-side on serverless where
+            # neither is available:
+            #   * DQX_ENABLED / MVM_CATALOG — module constants (not is_enabled()).
+            #   * DBX_HOST / DBX_TOKEN — driver-resolved workspace creds; the DQX
+            #     DQEngine needs an authenticated WorkspaceClient and default auth
+            #     is not configured in the closure.
+            if DQX_ENABLED:
+                try:
+                    from pipelines.dqx_augment import apply_dqx_warnings
+                    apply_dqx_warnings(
+                        batch_df.sparkSession, batch_df, name, DQX_WARNINGS_TABLE,
+                        mvm_catalog=MVM_CATALOG,
+                        ws_host=DBX_HOST, ws_token=DBX_TOKEN,
+                    )
+                except Exception:
+                    logger.exception("[%s] DQX augmentation failed (non-fatal)", name)
 
             # Backfill any optional columns the producer omitted (e.g. KPI
             # availability/performance/quality/oee on first emit) so the
@@ -808,6 +898,14 @@ def _make_dual_sink(
                     logger.exception("[%s] gold_history append failed", name)
                     print(f"[{name}] batch={batch_id} GOLD-WRITE-FAILED", flush=True)
                     raise  # let Spark retry the batch
+
+                # ── Sink 4: governed MVM fact upsert (streaming silver) ─
+                # Non-fatal; runs on the full-column ``valid`` frame (the MVM
+                # mapping references raw bronze columns, not the projection).
+                # Driven by _STREAM_TO_MVM (single source of truth) so a stream
+                # can feed 0..N governed facts. Inert unless MVM_SILVER_ENABLED.
+                for _mvm_key in _STREAM_TO_MVM.get(name, ()):
+                    _mvm_merge(valid, _mvm_key, batch_id)
 
             # ── Sink 3: quality_rejects ────────────────────────────────────
             try:
@@ -871,10 +969,30 @@ def _start_stream(
     micro-batch is sub-second once the cluster is warm.
     """
     checkpoint_dir = f"{checkpoint_root}/{name}"
+    # NOTE: intentionally NO ``startingVersion=latest``. Under the serverless
+    # AvailableNow-in-a-loop model, ``main()`` recreates each reader every cycle.
+    # ``startingVersion`` is only honoured when the checkpoint has no committed
+    # offset yet, and ``latest`` there means "process only rows that arrive AFTER
+    # this query starts". Sparse streams (event_log, quality_checks) are empty at
+    # steady state, so a cycle's brief AvailableNow run sees nothing, commits no
+    # offset, and the NEXT cycle again resets to "latest" — perpetually straddling
+    # and skipping any incident rows written during the inter-cycle sleep. They
+    # therefore never commit a first offset and never merge into the governed MVM
+    # facts. Omitting the option makes a fresh (uncommitted) reader ingest the
+    # full current table snapshot on its first batch, so existing + future rows are
+    # caught and the first offset is committed; once a checkpoint offset exists the
+    # option would be ignored anyway, so high-volume streams (line_kpi/inventory)
+    # that already have committed offsets are unaffected (no history replay).
+    # ``ignoreDeletes`` so a delete-only commit on the bronze source (GDPR
+    # erasure, retention pruning, OPTIMIZE/VACUUM rewrites, or an operator
+    # cleaning out synthetic rows) is skipped instead of failing the whole
+    # continuous stream with "Detected deleted data ... not supported". We only
+    # ever append to bronze in normal operation, so this changes nothing at
+    # steady state; it just keeps the stream alive across incidental deletes.
     reader = (
         spark.readStream.format("delta")
-             .option("startingVersion", "latest")
              .option("maxFilesPerTrigger", 50)
+             .option("ignoreDeletes", "true")
              .table(bronze_table)
     )
     if transform is not None:
@@ -1011,13 +1129,13 @@ def main() -> None:
     _start_token_refresher(token_holder, lakebase_endpoint)
 
     machine_sink = _make_dual_sink(
-        "machine_state", _MS_HISTORY, _MS_LATEST, _MACHINE_PK,
+        "machine_state", _MS_LATEST, _MACHINE_PK,
         select_cols=[*_MACHINE_PK, "ts", "status", "throughput_per_min",
                      "speed_pct", "alarm_count"],
         pg_conf=pg_conf, token_holder=token_holder,
     )
     kpi_sink = _make_dual_sink(
-        "line_kpi", _KPI_HISTORY, _KPI_LATEST, _KPI_PK,
+        "line_kpi", _KPI_LATEST, _KPI_PK,
         select_cols=[
             "shift_id", "ts", "machines_running", "machines_stopped",
             "machines_degraded", "machines_starved", "total_throughput",
@@ -1029,7 +1147,7 @@ def main() -> None:
                        "performance_to_now", "quality_to_now", "oee_to_now"),
     )
     event_sink = _make_dual_sink(
-        "event_log", _EVT_HISTORY, _EVT_LATEST, [],
+        "event_log", _EVT_LATEST, [],
         select_cols=[
             "event_id", "shift_id", "machine_id", "event_type", "severity",
             "timestamp_start", "timestamp_end", "duration_minutes",
@@ -1044,7 +1162,7 @@ def main() -> None:
     # first and writes without ts in the column list, matching the
     # legacy schema.
     inv_sink = _make_dual_sink(
-        "inventory_status", _INV_HISTORY, _INV_LATEST, _INV_PK,
+        "inventory_status", _INV_LATEST, _INV_PK,
         select_cols=[*_INV_PK, "ts", "on_hand_qty", "safety_stock",
                      "reorder_point", "status", "consumption_rate_per_hour"],
         pg_conf=pg_conf, token_holder=token_holder,
@@ -1056,6 +1174,18 @@ def main() -> None:
         ("event_log_bronze", event_sink, "event_log", None),
         ("inventory_status_bronze", inv_sink, "inventory_status", _normalize_ts),
     ]
+
+    # quality_checks_bronze feeds ONLY the governed model (quality.inspection_
+    # result); it has no Lakebase _latest cache, so it uses a merge-only sink.
+    # Added to the stream set only when streaming-silver is on so we don't spin
+    # an idle stream when the model isn't wired.
+    if MVM_SILVER_ENABLED:
+        quality_sink = _make_mvm_only_sink(
+            "quality_checks", _STREAM_TO_MVM["quality_checks"]
+        )
+        candidate_tasks.append(
+            ("quality_checks_bronze", quality_sink, "quality_checks", None)
+        )
 
     def _drain_once() -> tuple[list[str], list[str]]:
         """Start every available stream once, await all to terminate.

@@ -199,6 +199,14 @@ SHIFT_WINDOW_MINUTES = 480
 IDEAL_CASES_PER_MIN = 17.5
 SHIFT_PLANNED_CASES = round(IDEAL_CASES_PER_MIN * SHIFT_WINDOW_MINUTES)
 
+# Bottles per physical case (24-pack). The cascade tracks flow in BOTTLES/min
+# end to end (CASE_PACKER's cases/min capacity is scaled to bottle-equivalents
+# so a 17.5 cases/min packer doesn't throttle a 420 BPM bottle line). The
+# end-of-line machine's throughput is therefore in bottles/min, so cases
+# produced = end-of-line bottle throughput / BOTTLES_PER_CASE. Ideal end-of-line
+# rate 420 BPM ÷ 24 = 17.5 cases/min → 8,400 cases/shift (SHIFT_PLANNED_CASES).
+BOTTLES_PER_CASE = 24
+
 
 def _shift_window_start(now: datetime) -> datetime:
     """UTC-aligned start of the fixed 8h shift window containing ``now``.
@@ -270,7 +278,7 @@ def _machine_specs() -> list[MachineSpec]:
         elif m.type == "conveyor":
             cap = 9999.0
         elif m.id == "CASE_PACKER":
-            cap = m.nominal_speed * 24.0
+            cap = m.nominal_speed * BOTTLES_PER_CASE  # cases/min → bottle-equivalents
         elif m.type == "washer":  # tunnel m/min → BPM
             cap = m.nominal_speed * 16.8  # ≈ bottles per linear metre
         else:
@@ -1131,8 +1139,15 @@ def main() -> None:
             cascade_tick(specs, state, tick_seconds=tick_s)
 
             # ── Accumulate cases produced this tick ───────────────────
-            # End-of-line throughput is in cases/min; integrate over tick_s.
-            cases_this_tick = state.machines[end_of_line_id].throughput * (tick_s / 60.0)
+            # End-of-line throughput is in BOTTLES/min (the cascade tracks
+            # bottle-equivalent flow end to end), so divide by BOTTLES_PER_CASE
+            # to get cases/min before integrating over tick_s. Omitting the
+            # divide overcounts ~24x (bottles counted as cases) — the cause of
+            # the "31,106 cases vs 8,400 plan" tile bug. The tally stays a float
+            # for sub-case precision across ticks; it's floored to a whole count
+            # only at emit (see line_kpi_derived.compute_tier1_line_kpi_row).
+            bottles_this_tick = state.machines[end_of_line_id].throughput * (tick_s / 60.0)
+            cases_this_tick = bottles_this_tick / BOTTLES_PER_CASE
             cumulative_cases += max(0.0, cases_this_tick)
 
             # ── Emit machine state (with realistic ~±1.5% sensor jitter) ─

@@ -60,9 +60,39 @@ profiles:
     # existing seed schema instead (e.g. "main" / "line_manager_ai_kit").
     src_catalog: ''
     src_schema: ''
+    # Manufacturing Industry Data Model (MVM) silver catalog. Empty → falls back
+    # to uc_catalog (installing a NEW catalog needs metastore CREATE CATALOG,
+    # which many workspaces deny). Installed once by the setup job; fact tables
+    # are then kept fresh by the streaming job's per-micro-batch MERGE (see
+    # mvm_silver_enabled). Read by the DQX referential check + Genie/SQL analytics.
+    mvm_catalog: ''
+    # "true" enables DQX (freshness/range/referential checks → dqx_warnings +
+    # DQ dashboard) on this target's streaming_quality_sync job. Ships OFF.
+    dqx_enabled: false
+    # "true" enables streaming silver (design B): the streaming_quality_sync job
+    # MERGE-upserts each micro-batch into the MVM fact tables at seconds latency
+    # (no separate 30-min batch refresh). Requires mvm_catalog set. Ships OFF.
+    mvm_silver_enabled: false
     lakebase_catalog: ''
     lakebase_schema: 'public'
     genie_space_id: 'SET_ME'
+    # Separate GOVERNED Genie space over the MVM silver model (asset/production/
+    # quality/inventory). Auto-created by deploy.sh only when mvm_silver_enabled
+    # is true; leave SET_ME to (re)capture. Distinct from genie_space_id (the
+    # live streaming/mobile-briefing space the in-app agent uses).
+    mvm_genie_space_id: 'SET_ME'
+    # Per-domain governed Genie spaces, one per schema of the MVM model. Each
+    # specialist gets only its own domain: asset -> maintenance + downtime,
+    # quality -> quality specialist, inventory -> supply chain, production ->
+    # OEE + scheduling + strategy. Narrow scope is what keeps Genie accurate,
+    # and the boundary is a UC schema so grants can differ per domain.
+    # Auto-created by deploy.sh alongside mvm_genie_space_id when
+    # mvm_silver_enabled is true; leave SET_ME to (re)capture. A domain left
+    # empty just means that specialist falls back to sql_query.
+    genie_space_asset: 'SET_ME'
+    genie_space_quality: 'SET_ME'
+    genie_space_inventory: 'SET_ME'
+    genie_space_production: 'SET_ME'
     zerobus_server_endpoint: 'SET_ME'
     producer_client_id: 'SET_ME'
     producer_client_secret_ref: '{{secrets/line-manager/zerobus-client-secret}}'
@@ -74,15 +104,40 @@ profiles:
     lakebase_endpoint: 'projects/<your-lakebase-project>/branches/production/endpoints/primary'
     lakebase_checkpoint_volume: '/Volumes/<your_catalog>/line_manager_streaming/_checkpoints'
     mlflow_experiment_path: '/Shared/production-line-copilot-experiment'
-    # LLM serving endpoints the agents call. Defaults target the Databricks
-    # Foundation Model APIs (pay-per-token), which exist in most workspaces.
-    # Override ONLY if your workspace exposes these models under different
-    # endpoint names (check Serving → Endpoints). preflight.py validates them.
-    #   specialist  → 6 specialists + the router (fast / cheap)
-    #   advanced    → oee_coach + strategic_advisor (deeper reasoning)
-    #   orchestrator→ optional; empty reuses the specialist endpoint
+    # LLM serving endpoints. Each agent role runs on a model picked for its
+    # workload, spanning Anthropic, OpenAI, Google, Meta, Alibaba and Zhipu on
+    # the Databricks Foundation Model APIs — agent_server/model_roster.py holds
+    # the assignments and the reasoning. Nothing here needs editing to get that.
+    #
+    # These two are the FALLBACK tiers. A role whose preferred model isn't
+    # served in your workspace lands on one of them instead, so a workspace
+    # missing a vendor still works. Point them at whatever your workspace does
+    # serve; preflight.py validates them.
+    #   specialist  → fallback for the tactical roles (fast / cheap)
+    #   advanced    → fallback for oee_coach + strategic_advisor (deep reasoning)
     model_specialist_endpoint: 'databricks-gpt-5-mini'
     model_advanced_endpoint: 'databricks-gpt-5'
+    # Set to false to ignore the roster entirely and run every role on the two
+    # tiers above — the single-vendor behaviour shipped before v0.3.
+    model_multi_vendor: true
+    # Per-role overrides. Uncomment a line to pin one role to a specific
+    # endpoint; everything you leave out keeps the roster default. Run
+    # ``python3 scripts/preflight.py <env> --models`` to see the defaults and
+    # which of them your workspace actually serves. Unknown role names fail the
+    # render rather than silently doing nothing.
+    # model_roles:
+    #   downtime_analyst: 'databricks-claude-sonnet-5'
+    #   quality_specialist: 'databricks-glm-5-2'
+    #   supply_chain_advisor: 'databricks-llama-4-maverick'
+    #   oee_coach: 'databricks-gpt-5-4'
+    #   schedule_optimizer: 'databricks-gpt-oss-120b'
+    #   maintenance_predictor: 'databricks-qwen35-122b-a10b'
+    #   strategic_advisor: 'databricks-claude-opus-5'
+    #   shift_briefing: 'databricks-claude-haiku-4-5'
+    #   general: 'databricks-gpt-5-mini'
+    #   intent_router: 'databricks-gemma-3-12b'
+    # Legacy: pins BOTH routing and synthesis to one endpoint. Empty (default)
+    # lets the roster pick a model for each.
     model_orchestrator_endpoint: ''
 
   line_manager_dev:
@@ -112,9 +167,31 @@ profiles:
     # existing seed schema instead (e.g. "main" / "line_manager_ai_kit").
     src_catalog: ''
     src_schema: ''
+    # Manufacturing Industry Data Model (MVM) silver catalog. Empty → falls back
+    # to uc_catalog (installing a NEW catalog needs metastore CREATE CATALOG,
+    # which many workspaces deny). Installed once by the setup job; fact tables
+    # are then kept fresh by the streaming job's per-micro-batch MERGE (see
+    # mvm_silver_enabled). Read by the DQX referential check + Genie/SQL analytics.
+    mvm_catalog: ''
+    # "true" enables DQX (freshness/range/referential checks → dqx_warnings +
+    # DQ dashboard) on this target's streaming_quality_sync job. Ships OFF.
+    dqx_enabled: false
+    # "true" enables streaming silver (design B): the streaming_quality_sync job
+    # MERGE-upserts each micro-batch into the MVM fact tables at seconds latency
+    # (no separate 30-min batch refresh). Requires mvm_catalog set. Ships OFF.
+    mvm_silver_enabled: false
     lakebase_catalog: ''
     lakebase_schema: 'public'
     genie_space_id: ''
+    # Governed MVM Genie space (see note above). Empty by default in this
+    # profile; deploy.sh only provisions it when mvm_silver_enabled is true.
+    mvm_genie_space_id: ''
+    # Per-domain governed Genie spaces — see line_manager_prod above. Captured
+    # by deploy.sh when mvm_silver_enabled is true.
+    genie_space_asset: ''
+    genie_space_quality: ''
+    genie_space_inventory: ''
+    genie_space_production: ''
     zerobus_server_endpoint: 'SET_ME'
     producer_client_id: 'SET_ME'
     producer_client_secret_ref: '{{secrets/line-manager/zerobus-client-secret}}'
@@ -130,4 +207,6 @@ profiles:
     # workspace serves the models under different endpoint names.
     model_specialist_endpoint: 'databricks-gpt-5-mini'
     model_advanced_endpoint: 'databricks-gpt-5'
+    model_multi_vendor: true
+    # model_roles:  # per-role overrides — see line_manager_prod above
     model_orchestrator_endpoint: ''

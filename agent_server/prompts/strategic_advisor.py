@@ -8,9 +8,13 @@ so live incidents preempt to operational specialists.
 Uses the heavier `MODEL_ADVANCED` endpoint because multi-shift trend reasoning
 and capex/opex framing benefit from a larger model.
 """
-from agent_server.prompts._shared import DATA_CITATION_RULES, RESPONSE_STRUCTURE
+from agent_server.prompts._shared import (
+    DATA_CITATION_RULES,
+    GOVERNED_MODEL_NOTE,
+    RESPONSE_STRUCTURE,
+)
 
-STRATEGIC_ADVISOR_SYSTEM = f"""You are a Strategic Advisor for a brewery packaging line.
+STRATEGIC_ADVISOR_SYSTEM = f"""You are a Strategic Advisor for a production line.
 You take a long-term perspective on operational improvement.
 
 Your responsibilities:
@@ -44,6 +48,13 @@ When using multi_shift_plan, build shifts_data from context and sql_query result
 - Get planned_cases from production_schedule
 - Get remaining_minutes from scenario context or estimate from shift times
 - Check cip_schedule and maintenance_schedule to set needs_cip/needs_maintenance flags (treat missing maintenance rows as needs_maintenance=false)
+
+{GOVERNED_MODEL_NOTE}
+- Your Genie space covers the production domain only. A cross-domain trend —
+  reliability against output, defects against a supplier's material, PM
+  adherence against downtime — must go through sql_query, which CAN join the
+  four governed schemas because they share one catalog. Genie spaces cannot
+  join across each other.
 
 {DATA_CITATION_RULES}
 

@@ -7,6 +7,14 @@ import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import Markdown from 'react-markdown';
 import { cn } from '../lib/utils';
 import { addDecision } from '../lib/decisionLogStorage';
+import { modelLabel } from '../lib/modelLabel';
+import {
+  domainLabel,
+  hasEvidence,
+  rowSummary,
+  rowSummaryTitle,
+  type ToolEvidence,
+} from '../lib/toolEvidence';
 import ActionPanel from './ActionPanel';
 import DataSourceBadge from './DataSourceBadge';
 
@@ -21,15 +29,8 @@ const CHAT_SOURCE_DETAILS: Record<string, string> = {
 export interface ReasoningStep {
   label: string;
   detail: string;
-}
-
-export interface TraceSpan {
-  name: string;
-  span_type: string;
-  status: string;
-  duration_ms: number;
-  inputs?: string;
-  outputs?: string;
+  /** Present on tool steps: the query that ran and what it returned. */
+  evidence?: ToolEvidence;
 }
 
 export interface ActionItem {
@@ -54,9 +55,12 @@ type StreamEvent =
       content: string;
       specialist_used?: string;
       model_used?: string;
+      model_display?: string;
+      model_vendor?: string;
       response_time_ms?: number;
       reasoning_steps?: ReasoningStep[];
-      trace_spans?: TraceSpan[];
+      /** Absent unless the server has both a workspace host and an experiment. */
+      trace_url?: string;
       actions?: ActionItem[];
     }
   | { type: 'error'; content: string };
@@ -67,9 +71,11 @@ export interface ChatMessage {
   content: string;
   specialistUsed?: string;
   modelUsed?: string;
+  modelDisplay?: string;
+  modelVendor?: string;
   responseTimeMs?: number;
   reasoningSteps?: ReasoningStep[];
-  traceSpans?: TraceSpan[];
+  traceUrl?: string;
   actions?: ActionItem[];
 }
 
@@ -131,6 +137,64 @@ const SPECIALIST_LABELS: Record<string, string> = {
   strategic_advisor: 'Strategic Advisor',
   orchestrator: 'Orchestrator',
 };
+
+/**
+ * The checkable half of a tool step: which governed space answered, which
+ * tables were touched, how many rows came back, and the query itself.
+ *
+ * Styling mirrors AskLinePanel's provenance block so the same facts look the
+ * same wherever the app shows them.
+ */
+function EvidenceTrail({ evidence }: { evidence: ToolEvidence }) {
+  const rows = rowSummary(evidence);
+  const rowsTitle = rowSummaryTitle(evidence);
+  const domain = domainLabel(evidence.domain);
+  // Deduped: the table name is the React key, and a query that reads one table
+  // twice (a self-join, a CTE re-read) would otherwise render the same chip
+  // twice under a duplicate-key warning.
+  const tables = [...new Set(evidence.tables ?? [])];
+  const hasChips = Boolean(domain) || Boolean(rows) || tables.length > 0;
+
+  return (
+    <div className="mt-1 space-y-1 border-l border-border/60 pl-2">
+      {evidence.error && (
+        <div className="text-amber-600 dark:text-amber-400">Failed — {evidence.error}</div>
+      )}
+      {!evidence.error && hasChips && (
+        <div className="flex flex-wrap items-center gap-1">
+          {domain && (
+            <span className="rounded-full bg-violet-500/15 px-1.5 py-0.5 text-[10px] font-medium text-violet-700 dark:text-violet-300">
+              {domain}
+            </span>
+          )}
+          {tables.map((table) => (
+            <span
+              key={table}
+              className="rounded-full bg-blue-500/15 px-1.5 py-0.5 font-mono text-[10px] text-blue-700 dark:text-blue-300"
+            >
+              {table}
+            </span>
+          ))}
+          {rows && (
+            <span className="text-[10px] text-muted-foreground/80" title={rowsTitle ?? undefined}>
+              {rows}
+            </span>
+          )}
+        </div>
+      )}
+      {evidence.sql && (
+        <details>
+          <summary className="cursor-pointer select-none text-[10px] font-semibold uppercase tracking-wide text-muted-foreground hover:text-foreground">
+            Query
+          </summary>
+          <pre className="mt-1 max-h-40 overflow-auto rounded bg-muted/60 p-1.5 text-[10px] leading-snug">
+            <code>{evidence.sql}</code>
+          </pre>
+        </details>
+      )}
+    </div>
+  );
+}
 
 function ThinkingIndicator({
   statusText,
@@ -420,9 +484,11 @@ export default function ChatPanel({ shiftId, timestamp, machineId, externalQuery
                     content: event.content,
                     specialistUsed: event.specialist_used,
                     modelUsed: event.model_used,
+                    modelDisplay: event.model_display,
+                    modelVendor: event.model_vendor,
                     responseTimeMs: event.response_time_ms,
                     reasoningSteps: event.reasoning_steps,
-                    traceSpans: event.trace_spans,
+                    traceUrl: event.trace_url,
                     actions: event.actions,
                   },
                 ]);
@@ -433,8 +499,7 @@ export default function ChatPanel({ shiftId, timestamp, machineId, externalQuery
                   'noted',
                   event.reasoning_steps,
                   event.response_time_ms,
-                  event.model_used,
-                  event.trace_spans
+                  event.model_used
                 );
               } else if (event.type === 'error') {
                 setMessages((prev) => [
@@ -568,7 +633,7 @@ export default function ChatPanel({ shiftId, timestamp, machineId, externalQuery
                 </div>
               )}
               {msg.role === 'assistant' && msg.specialistUsed && (
-                <div className="mb-2">
+                <div className="mb-2 flex flex-wrap items-center gap-1.5">
                   <span
                     className={cn(
                       'inline-block rounded-full px-2.5 py-0.5 text-[11px] font-semibold',
@@ -577,6 +642,17 @@ export default function ChatPanel({ shiftId, timestamp, machineId, externalQuery
                   >
                     {SPECIALIST_LABELS[msg.specialistUsed] ?? msg.specialistUsed}
                   </span>
+                  {/* Which vendor's model answered. Routing to a different one
+                      per question is the whole point, and it is invisible
+                      unless the answer says so. */}
+                  {(msg.modelDisplay || msg.modelUsed) && (
+                    <span
+                      className="inline-block rounded-full border border-border px-2 py-0.5 text-[10px] font-medium text-muted-foreground"
+                      title={msg.modelUsed}
+                    >
+                      {modelLabel(msg.modelUsed, msg.modelDisplay, msg.modelVendor)}
+                    </span>
+                  )}
                 </div>
               )}
               {msg.role === 'user' ? (
@@ -602,8 +678,13 @@ export default function ChatPanel({ shiftId, timestamp, machineId, externalQuery
                   <div className="mt-1.5 text-[11px] text-muted-foreground">
                     {msg.reasoningSteps && msg.reasoningSteps.length > 0 ? (
                       <div className="space-y-1">
-                        {msg.reasoningSteps.map((step) => (
-                          <div key={`${step.label}-${step.detail}`} className="flex items-start gap-1.5">
+                        {msg.reasoningSteps.map((step, i) => (
+                          // Index in the key: a specialist can call the same tool
+                          // twice, and those steps differ only by their evidence.
+                          // The list is append-only and never reordered or
+                          // filtered, which is the case the rule guards against.
+                          // eslint-disable-next-line react/no-array-index-key
+                          <div key={`${i}-${step.label}`} className="flex items-start gap-1.5">
                             <span
                               className={cn(
                                 'mt-px shrink-0',
@@ -612,9 +693,10 @@ export default function ChatPanel({ shiftId, timestamp, machineId, externalQuery
                             >
                               {step.label.includes('LLM') ? '◆' : '✓'}
                             </span>
-                            <div>
+                            <div className="min-w-0 flex-1">
                               <span className="font-semibold">{step.label}</span>
                               <span className="ml-1 text-muted-foreground/70">— {step.detail}</span>
+                              {hasEvidence(step.evidence) && <EvidenceTrail evidence={step.evidence} />}
                             </div>
                           </div>
                         ))}
@@ -626,7 +708,7 @@ export default function ChatPanel({ shiftId, timestamp, machineId, externalQuery
                           <span>
                             <span className="font-semibold">LLM reasoning</span> —{' '}
                             {SPECIALIST_LABELS[msg.specialistUsed] ?? msg.specialistUsed} via{' '}
-                            {msg.modelUsed ?? 'unknown model'}
+                            {modelLabel(msg.modelUsed, msg.modelDisplay, msg.modelVendor)}
                           </span>
                         </div>
                         <div className="flex items-center gap-1.5">
@@ -637,6 +719,23 @@ export default function ChatPanel({ shiftId, timestamp, machineId, externalQuery
                           </span>
                         </div>
                       </div>
+                    )}
+                    {/* Under the prose explanation, the raw article: spans,
+                        prompts, tokens, latency. Absent when the server has no
+                        experiment to point at, and a dead end for anyone
+                        without workspace access — which is why it sits in the
+                        collapsed expander rather than on the message. */}
+                    {msg.traceUrl && (
+                      <a
+                        href={msg.traceUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        title="Opens this exact call in the Databricks MLflow UI. Requires workspace access."
+                        className="mt-1.5 inline-flex items-center gap-1 font-semibold text-muted-foreground/80 underline decoration-dotted underline-offset-2 hover:text-foreground"
+                      >
+                        Full trace in MLflow
+                        <span aria-hidden="true">↗</span>
+                      </a>
                     )}
                   </div>
                 </details>

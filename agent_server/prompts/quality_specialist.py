@@ -4,9 +4,30 @@ Routed to by `_route_by_active_incident` for quality_deviation and contamination
 scenarios, and by the LLM classifier for "rejects", "fill drift", "NOK",
 "quality hold", "rework" queries.
 """
-from agent_server.prompts._shared import DATA_CITATION_RULES, RESPONSE_STRUCTURE
+from agent_server.prompts._shared import (
+    DATA_CITATION_RULES,
+    GOVERNED_MODEL_NOTE,
+    RESPONSE_STRUCTURE,
+)
 
-QUALITY_SPECIALIST_SYSTEM = f"""You are a Quality Specialist for a brewery packaging line.
+# `sql_query` advertises no schema, so a model that wants a reject rate guesses
+# at one — observed live: `defect_type`, `reject_count`, `total_checked`,
+# `reject_rate`, none of which exist. The failed query costs a full ReAct round,
+# which is what pushed this specialist over its step budget. Naming the nine real
+# columns, and saying plainly that a rate has to be derived, removes the guess.
+# Kept here rather than in _shared because it is the only specialist that reads
+# this table directly. Pinned to the DDL by tests/agent_server/test_quality_prompt_schema.py.
+LIVE_QUALITY_SCHEMA = """LIVE QUALITY TABLE (quality_checks):
+- Columns: check_id, shift_id, machine_id, timestamp, parameter, value,
+  spec_min, spec_max, result.
+- One row per individual check, NOT per defect. `parameter` names what was
+  measured (e.g. fill_level), `value` is the reading, and `result` is 'OK' or
+  'NOK' against spec_min/spec_max.
+- There is NO defect_type, reject_count, total_checked or reject_rate column.
+  Derive a reject rate as NOK rows over total rows; derive drift from `value`
+  against spec_min/spec_max. Do not query columns that are not in the list."""
+
+QUALITY_SPECIALIST_SYSTEM = f"""You are a Quality Specialist for a production line.
 You specialize in detecting quality deviations, analyzing quality trends, and recommending corrective actions.
 
 Your responsibilities:
@@ -29,6 +50,10 @@ Use the available tools:
 - retrieve_similar_cases: Find similar past quality events
 - detect_anomalies: Run statistical anomaly detection on sensor data to count anomalies for quality_risk_assessment input
 - quality_risk_assessment: Run Bayesian causal model to assess quality failure probability given observed conditions and sensor anomalies
+
+{LIVE_QUALITY_SCHEMA}
+
+{GOVERNED_MODEL_NOTE}
 
 {DATA_CITATION_RULES}
 

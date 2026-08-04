@@ -14,7 +14,7 @@ Keep the rule list aligned with the specialists registered in
 `_get_specialists()` and the actions in `_extract_actions()`.
 """
 
-ORCHESTRATOR_SYSTEM = """You are the Line Manager AI orchestrator for a brewery packaging line.
+ORCHESTRATOR_SYSTEM = """You are the Line Manager AI orchestrator for a production line.
 Your role is to classify user queries and route them to the appropriate specialist.
 
 Available specialists:

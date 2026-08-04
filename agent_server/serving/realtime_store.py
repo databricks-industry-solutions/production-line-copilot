@@ -25,7 +25,7 @@ import logging
 import os
 from typing import Any
 
-from agent_server.memory.pg_pool import get_connection
+from agent_server.memory.pg_pool import query, transaction
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +46,16 @@ def _synced_suffix() -> str:
 
 
 def _normalize_line_kpi_row(row: dict[str, Any] | None) -> dict[str, Any] | None:
-    """Gold ``line_kpi`` lacks optional columns present on ``ai_serving.line_kpi_latest``."""
+    """Gold ``line_kpi`` lacks optional columns present on ``ai_serving.line_kpi_latest``.
+
+    ``setdefault`` alone was not enough. Both readers here select ``*``, so a
+    column that exists but is NULL arrives as a present key holding ``None``,
+    which ``setdefault`` leaves exactly as it found it. Callers then do
+    ``float(kpi["availability_to_now"])`` and the request dies on a
+    ``TypeError`` — one NULL in one column taking down the whole answer. A
+    missing metric and a null metric mean the same thing to every caller, so
+    both become 0 here rather than at each use.
+    """
     if not row:
         return None
     out = dict(row)
@@ -57,15 +66,13 @@ def _normalize_line_kpi_row(row: dict[str, Any] | None) -> dict[str, Any] | None
         "quality_to_now",
         "oee_to_now",
     ):
-        out.setdefault(k, 0)
+        if out.get(k) is None:
+            out[k] = 0
     return out
 
 
 def clear_serving_tables(shift_id: str) -> None:
     """Delete all rows for a given shift — used during sim reset."""
-    conn = get_connection()
-    if not conn:
-        return
     tables = [
         "ai_serving.machine_state_latest",
         "ai_serving.line_kpi_latest",
@@ -74,13 +81,13 @@ def clear_serving_tables(shift_id: str) -> None:
         "ai_serving.scenario_commands",
     ]
     try:
-        with conn.cursor() as cur:
+        with transaction() as cur:
+            if cur is None:
+                return
             for t in tables:
                 cur.execute(f"DELETE FROM {t} WHERE shift_id = %s", (shift_id,))
-        conn.commit()
         logger.info("Cleared ai_serving tables for shift_id=%s", shift_id)
-    except Exception as e:
-        conn.rollback()
+    except Exception as e:  # noqa: BLE001 - reset is best-effort
         logger.warning("clear_serving_tables failed: %s", str(e)[:300])
 
 
@@ -90,77 +97,58 @@ def read_machine_state_latest(shift_id: str) -> list[dict[str, Any]]:
     Synced Table mirrors (``public.machine_state``, etc.) are not queried here — Lakebase
     often injects ``LAKEBASE_SYNCED_DATA_SCHEMA=public`` before mirrors exist, which broke SSE.
     """
-    conn = get_connection()
-    if not conn:
-        return []
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT shift_id, machine_id, ts, status, throughput_per_min, speed_pct, alarm_count
-            FROM ai_serving.machine_state_latest
-            WHERE shift_id = %s
-            ORDER BY machine_id
-            """,
-            (shift_id,),
-        )
-        return [dict(r) for r in cur.fetchall()]
+    return query(
+        """
+        SELECT shift_id, machine_id, ts, status, throughput_per_min, speed_pct, alarm_count
+        FROM ai_serving.machine_state_latest
+        WHERE shift_id = %s
+        ORDER BY machine_id
+        """,
+        (shift_id,),
+    ) or []
 
 
 def read_line_kpi_latest(shift_id: str) -> dict[str, Any] | None:
     """Single KPI row for ``shift_id``, normalised to fill optional gold columns."""
-    conn = get_connection()
-    if not conn:
-        return None
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT *
-            FROM ai_serving.line_kpi_latest
-            WHERE shift_id = %s
-            """,
-            (shift_id,),
-        )
-        row = cur.fetchone()
-        return _normalize_line_kpi_row(dict(row) if row else None)
+    row = query(
+        """
+        SELECT *
+        FROM ai_serving.line_kpi_latest
+        WHERE shift_id = %s
+        """,
+        (shift_id,),
+        fetch="one",
+    )
+    return _normalize_line_kpi_row(row)
 
 
 def read_event_log_recent(shift_id: str, limit: int = 200) -> list[dict[str, Any]]:
     """Recent events for the EventFeed panel. ``limit`` is clamped to [1,1000]."""
-    conn = get_connection()
-    if not conn:
-        return []
     safe_limit = min(max(int(limit), 1), 1000)
-    with conn.cursor() as cur:
-        cur.execute(
-            f"""
-            SELECT *
-            FROM ai_serving.event_log_recent
-            WHERE shift_id = %s
-            ORDER BY timestamp_start DESC NULLS LAST
-            LIMIT {safe_limit}
-            """,
-            (shift_id,),
-        )
-        return [dict(r) for r in cur.fetchall()]
+    return query(
+        f"""
+        SELECT *
+        FROM ai_serving.event_log_recent
+        WHERE shift_id = %s
+        ORDER BY timestamp_start DESC NULLS LAST
+        LIMIT {safe_limit}
+        """,
+        (shift_id,),
+    ) or []
 
 
 def read_inventory_latest(shift_id: str) -> list[dict[str, Any]]:
     """All current inventory materials for ``shift_id`` (one row per material)."""
-    conn = get_connection()
-    if not conn:
-        return []
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT material_id, on_hand_qty, safety_stock, reorder_point,
-                   status, consumption_rate_per_hour
-            FROM ai_serving.inventory_status
-            WHERE shift_id = %s
-            ORDER BY material_id
-            """,
-            (shift_id,),
-        )
-        return [dict(r) for r in cur.fetchall()]
+    return query(
+        """
+        SELECT material_id, on_hand_qty, safety_stock, reorder_point,
+               status, consumption_rate_per_hour
+        FROM ai_serving.inventory_status
+        WHERE shift_id = %s
+        ORDER BY material_id
+        """,
+        (shift_id,),
+    ) or []
 
 
 _active_commands_cache: dict[str, Any] = {"ts": 0.0, "shift_id": "", "rows": []}
@@ -191,33 +179,24 @@ def read_commands_active(shift_id: str) -> list[dict[str, Any]]:
         return list(_active_commands_cache["rows"])
 
     rows: list[dict[str, Any]] = []
-    conn = get_connection()
-    if conn is not None:
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT command_id, scenario_id, target_machine_id, severity,
-                           status, created_at
-                    FROM ai_serving.scenario_commands
-                    WHERE shift_id = %s AND status = 'active'
-                    ORDER BY created_at DESC
-                    LIMIT 50
-                    """,
-                    (shift_id,),
-                )
-                # pg_pool's connection uses RealDictCursor → rows are dicts.
-                rows = [dict(r) for r in cur.fetchall()]
-        except Exception as e:  # noqa: BLE001
-            # Don't crash the SSE generator on a transient Lakebase blip —
-            # resolve UI just stays empty for one tick. Roll back so the
-            # singleton connection is reusable for the next caller.
-            logger.warning("read_commands_active(Lakebase) failed: %s", str(e)[:200])
-            try:
-                conn.rollback()
-            except Exception:
-                logger.debug("Lakebase rollback after read_commands_active failed", exc_info=True)
-            rows = []
+    try:
+        rows = query(
+            """
+            SELECT command_id, scenario_id, target_machine_id, severity,
+                   status, created_at
+            FROM ai_serving.scenario_commands
+            WHERE shift_id = %s AND status = 'active'
+            ORDER BY created_at DESC
+            LIMIT 50
+            """,
+            (shift_id,),
+        ) or []
+    except Exception as e:  # noqa: BLE001
+        # Don't crash the SSE generator on a Lakebase blip — the resolve UI
+        # just stays empty for one tick. pg_pool has already rolled back and
+        # retried; anything reaching here is a real query error.
+        logger.warning("read_commands_active(Lakebase) failed: %s", str(e)[:200])
+        rows = []
 
     _active_commands_cache["ts"] = now
     _active_commands_cache["shift_id"] = shift_id
@@ -256,30 +235,25 @@ def read_machine_state_after(
     ``read_max_history_ts`` doc), and without this guard a cursor that
     crossed a stale tail could keep returning rows from yesterday's run.
     """
-    conn = get_connection()
-    if not conn:
-        return [], None
-    with conn.cursor() as cur:
-        cur.execute(
-            f"""
-            WITH next_ts AS (
-                SELECT MIN(ts) AS ts
-                FROM ai_serving.machine_state_history
-                WHERE shift_id = %s
-                  AND ts > %s
-                  AND ts > NOW() - INTERVAL '{int(recent_seconds)} seconds'
-            )
-            SELECT m.shift_id, m.machine_id, m.ts, m.status,
-                   m.throughput_per_min, m.speed_pct, m.alarm_count
-            FROM ai_serving.machine_state_history m, next_ts n
-            WHERE m.shift_id = %s
-              AND n.ts IS NOT NULL
-              AND m.ts = n.ts
-            ORDER BY m.machine_id
-            """,
-            (shift_id, cursor_ts, shift_id),
+    rows = query(
+        f"""
+        WITH next_ts AS (
+            SELECT MIN(ts) AS ts
+            FROM ai_serving.machine_state_history
+            WHERE shift_id = %s
+              AND ts > %s
+              AND ts > NOW() - INTERVAL '{int(recent_seconds)} seconds'
         )
-        rows = [dict(r) for r in cur.fetchall()]
+        SELECT m.shift_id, m.machine_id, m.ts, m.status,
+               m.throughput_per_min, m.speed_pct, m.alarm_count
+        FROM ai_serving.machine_state_history m, next_ts n
+        WHERE m.shift_id = %s
+          AND n.ts IS NOT NULL
+          AND m.ts = n.ts
+        ORDER BY m.machine_id
+        """,
+        (shift_id, cursor_ts, shift_id),
+    ) or []
     next_ts = rows[0]["ts"] if rows else None
     return rows, next_ts
 
@@ -291,26 +265,22 @@ def read_line_kpi_after(
 
     See ``read_machine_state_after`` for the ``recent_seconds`` guard.
     """
-    conn = get_connection()
-    if not conn:
-        return None, None
-    with conn.cursor() as cur:
-        cur.execute(
-            f"""
-            SELECT *
-            FROM ai_serving.line_kpi_history
-            WHERE shift_id = %s
-              AND ts > %s
-              AND ts > NOW() - INTERVAL '{int(recent_seconds)} seconds'
-            ORDER BY ts ASC
-            LIMIT 1
-            """,
-            (shift_id, cursor_ts),
-        )
-        row = cur.fetchone()
+    row = query(
+        f"""
+        SELECT *
+        FROM ai_serving.line_kpi_history
+        WHERE shift_id = %s
+          AND ts > %s
+          AND ts > NOW() - INTERVAL '{int(recent_seconds)} seconds'
+        ORDER BY ts ASC
+        LIMIT 1
+        """,
+        (shift_id, cursor_ts),
+        fetch="one",
+    )
     if not row:
         return None, None
-    d = _normalize_line_kpi_row(dict(row))
+    d = _normalize_line_kpi_row(row)
     return d, d.get("ts") if d else None
 
 
@@ -322,30 +292,25 @@ def read_inventory_after(
 
     See ``read_machine_state_after`` for the ``recent_seconds`` guard.
     """
-    conn = get_connection()
-    if not conn:
-        return [], None
-    with conn.cursor() as cur:
-        cur.execute(
-            f"""
-            WITH next_ts AS (
-                SELECT MIN(ts) AS ts
-                FROM ai_serving.inventory_status_history
-                WHERE shift_id = %s
-                  AND ts > %s
-                  AND ts > NOW() - INTERVAL '{int(recent_seconds)} seconds'
-            )
-            SELECT i.material_id, i.on_hand_qty, i.safety_stock, i.reorder_point,
-                   i.status, i.consumption_rate_per_hour, i.ts
-            FROM ai_serving.inventory_status_history i, next_ts n
-            WHERE i.shift_id = %s
-              AND n.ts IS NOT NULL
-              AND i.ts = n.ts
-            ORDER BY i.material_id
-            """,
-            (shift_id, cursor_ts, shift_id),
+    rows = query(
+        f"""
+        WITH next_ts AS (
+            SELECT MIN(ts) AS ts
+            FROM ai_serving.inventory_status_history
+            WHERE shift_id = %s
+              AND ts > %s
+              AND ts > NOW() - INTERVAL '{int(recent_seconds)} seconds'
         )
-        rows = [dict(r) for r in cur.fetchall()]
+        SELECT i.material_id, i.on_hand_qty, i.safety_stock, i.reorder_point,
+               i.status, i.consumption_rate_per_hour, i.ts
+        FROM ai_serving.inventory_status_history i, next_ts n
+        WHERE i.shift_id = %s
+          AND n.ts IS NOT NULL
+          AND i.ts = n.ts
+        ORDER BY i.material_id
+        """,
+        (shift_id, cursor_ts, shift_id),
+    ) or []
     next_ts = rows[0]["ts"] if rows else None
     return rows, next_ts
 
@@ -368,28 +333,21 @@ def read_max_history_ts(shift_id: str, recent_seconds: int = 300) -> Any:
     generator falls back to a wall-clock anchor and shows "waiting" until
     the streaming-quality-sync job lands its next batch.
     """
-    conn = get_connection()
-    if not conn:
-        return None
-    with conn.cursor() as cur:
-        cur.execute(
-            f"""
-            SELECT MAX(ts) AS ts
-            FROM ai_serving.machine_state_history
-            WHERE shift_id = %s
-              AND ts > NOW() - INTERVAL '{int(recent_seconds)} seconds'
-            """,
-            (shift_id,),
-        )
-        row = cur.fetchone()
-    return (dict(row).get("ts") if row else None)
+    row = query(
+        f"""
+        SELECT MAX(ts) AS ts
+        FROM ai_serving.machine_state_history
+        WHERE shift_id = %s
+          AND ts > NOW() - INTERVAL '{int(recent_seconds)} seconds'
+        """,
+        (shift_id,),
+        fetch="one",
+    )
+    return row.get("ts") if row else None
 
 
 def clear_history_tables(shift_id: str) -> None:
     """Delete all history rows for a shift. Called by ``/sim/restart``."""
-    conn = get_connection()
-    if not conn:
-        return
     tables = [
         "ai_serving.machine_state_history",
         "ai_serving.line_kpi_history",
@@ -397,13 +355,13 @@ def clear_history_tables(shift_id: str) -> None:
         "ai_serving.event_log_history",
     ]
     try:
-        with conn.cursor() as cur:
+        with transaction() as cur:
+            if cur is None:
+                return
             for t in tables:
                 cur.execute(f"DELETE FROM {t} WHERE shift_id = %s", (shift_id,))
-        conn.commit()
         logger.info("Cleared ai_serving history tables for shift_id=%s", shift_id)
-    except Exception as e:
-        conn.rollback()
+    except Exception as e:  # noqa: BLE001 - reset is best-effort
         logger.warning("clear_history_tables failed: %s", str(e)[:300])
 
 
@@ -422,9 +380,6 @@ def clear_history_tables(shift_id: str) -> None:
 
 def read_machine_state_synced(shift_id: str) -> list[dict[str, Any]]:
     """Latest row per ``machine_id`` from the synced machine_state table."""
-    conn = get_connection()
-    if not conn:
-        return []
     schema = _synced_schema()
     table = f"machine_state{_synced_suffix()}"
     sql = f"""
@@ -441,9 +396,7 @@ def read_machine_state_synced(shift_id: str) -> list[dict[str, Any]]:
         ORDER BY machine_id
     """
     try:
-        with conn.cursor() as cur:
-            cur.execute(sql, (shift_id,))
-            return [dict(r) for r in cur.fetchall()]
+        return query(sql, (shift_id,)) or []
     except Exception as e:
         logger.warning("read_machine_state_synced failed: %s", str(e)[:300])
         return []
@@ -451,9 +404,6 @@ def read_machine_state_synced(shift_id: str) -> list[dict[str, Any]]:
 
 def read_line_kpi_synced(shift_id: str) -> dict[str, Any] | None:
     """Most recent KPI row from the synced line_kpi table."""
-    conn = get_connection()
-    if not conn:
-        return None
     schema = _synced_schema()
     table = f"line_kpi{_synced_suffix()}"
     sql = f"""
@@ -464,10 +414,7 @@ def read_line_kpi_synced(shift_id: str) -> dict[str, Any] | None:
         LIMIT 1
     """
     try:
-        with conn.cursor() as cur:
-            cur.execute(sql, (shift_id,))
-            row = cur.fetchone()
-            return _normalize_line_kpi_row(dict(row) if row else None)
+        return _normalize_line_kpi_row(query(sql, (shift_id,), fetch="one"))
     except Exception as e:
         logger.warning("read_line_kpi_synced failed: %s", str(e)[:300])
         return None
@@ -475,9 +422,6 @@ def read_line_kpi_synced(shift_id: str) -> dict[str, Any] | None:
 
 def read_event_log_synced(shift_id: str, limit: int = 200) -> list[dict[str, Any]]:
     """Recent events from the synced event_log table."""
-    conn = get_connection()
-    if not conn:
-        return []
     schema = _synced_schema()
     table = f"event_log{_synced_suffix()}"
     safe_limit = min(max(int(limit), 1), 1000)
@@ -492,9 +436,7 @@ def read_event_log_synced(shift_id: str, limit: int = 200) -> list[dict[str, Any
         LIMIT {safe_limit}
     """
     try:
-        with conn.cursor() as cur:
-            cur.execute(sql, (shift_id,))
-            return [dict(r) for r in cur.fetchall()]
+        return query(sql, (shift_id,)) or []
     except Exception as e:
         logger.warning("read_event_log_synced failed: %s", str(e)[:300])
         return []

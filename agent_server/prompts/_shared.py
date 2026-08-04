@@ -21,6 +21,27 @@ DATA_CITATION_RULES = """DATA CITATION RULES:
 - Never make claims without supporting data from the context"""
 
 
+# Governed industry data model (MVM) awareness. Injected into the specialists
+# whose domain has a governed counterpart so they know the model EXISTS and when
+# to use it — without regressing the real-time path. The default remains the
+# live streaming tables; the governed model is for standards-aligned /
+# enterprise-schema / audit-style questions and cross-entity governed joins.
+GOVERNED_MODEL_NOTE = """GOVERNED INDUSTRY MODEL (optional, via sql_query):
+- A governed Manufacturing silver model mirrors the canonical enterprise schema
+  in the SAME catalog under asset.*, production.*, quality.*, inventory.*
+  (e.g. asset.equipment_register, asset.pm_schedule, asset.failure_record,
+  production.production_line/run, quality.inspection_result, quality.ncr,
+  inventory.stock_balance). Fully qualify these as catalog.schema.table.
+- Use it ONLY when the user asks in governed/enterprise terms (equipment
+  register, PM schedule, NCR, work order, stock balance, plan-vs-actual run) or
+  needs an audit-grade, standards-aligned answer. For real-time monitoring,
+  KEEP using the live streaming tables — they are fresher and richer.
+- Honesty: only a curated column subset is populated (others are NULL), and the
+  incident facts (asset.failure_record, quality.inspection_result, quality.ncr)
+  are EMPTY at steady state and fill only during incidents. Report zero rows
+  truthfully; never fabricate governed rows."""
+
+
 # The UI parses these ## h2 headings to fold answers into expandable cards
 # with icon + accent color (see client/src/components/ChatPanel.tsx).
 # The synthesis pass in `agent_server/prompts/response_synthesis.py` enforces

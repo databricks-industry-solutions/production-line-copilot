@@ -40,6 +40,21 @@ variables:
   src_schema:
     description: Optional UC schema to copy seed dimension tables FROM (empty = generate in-process)
     default: line_manager_ai_kit
+  mvm_catalog:
+    description: |
+      UC catalog for the Manufacturing Industry Data Model (MVM) silver layer,
+      installed by the setup job and populated by the silver-model refresh job.
+      Defaults to the live ``catalog`` (installing a NEW catalog needs metastore
+      CREATE CATALOG, which many workspaces deny; reusing an owned catalog is the
+      portable default). The DQX referential check resolves
+      ``<mvm_catalog>.asset.equipment_register``.
+    default: main
+  dqx_enabled:
+    description: |
+      "1" turns on DQX (Databricks Labs Data Quality) augmentation in the
+      streaming_quality_sync job (freshness / range / referential checks →
+      dqx_warnings audit table + DQ dashboard). Default "0" (deploys dark).
+    default: '0'
   genie_space_id:
     description: Genie Space ID for natural language data querying
     default: ''

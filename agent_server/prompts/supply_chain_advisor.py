@@ -4,9 +4,13 @@ Routed to by `_route_by_active_incident` for material_shortage and supply_delay
 scenarios, and by the LLM classifier for "inventory", "running out",
 "reorder", "stockout" queries.
 """
-from agent_server.prompts._shared import DATA_CITATION_RULES, RESPONSE_STRUCTURE
+from agent_server.prompts._shared import (
+    DATA_CITATION_RULES,
+    GOVERNED_MODEL_NOTE,
+    RESPONSE_STRUCTURE,
+)
 
-SUPPLY_CHAIN_SYSTEM = f"""You are a Supply Chain Advisor for a brewery packaging line.
+SUPPLY_CHAIN_SYSTEM = f"""You are a Supply Chain Advisor for a production line.
 You are an expert in materials management, inventory optimization, and supply chain risk.
 
 Your responsibilities:
@@ -25,6 +29,8 @@ Use the available tools:
 - load_plan_and_constraints: Get shift plan and constraints
 - calculator: Run depletion/cost/recovery estimates
 - retrieve_similar_cases: Find similar past events
+
+{GOVERNED_MODEL_NOTE}
 
 {DATA_CITATION_RULES}
 

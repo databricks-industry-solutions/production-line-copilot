@@ -30,17 +30,20 @@ Flow (both paths share the same first 4 steps):
     8. _extract_actions() produces the deterministic HITL action chips
        shown next to the chat answer, keyed off specialist + active incidents.
 
-Why three LLM endpoints? The orchestrator-tier calls (classification,
-synthesis, general fallback) are short and structured — the mini endpoint
-handles them at lower cost and latency. The specialist ReAct loops do real
-multi-tool reasoning and use the larger MODEL_MAP-driven endpoints picked
-per specialist inside their `create_*()` factories.
+Why so many LLM endpoints? Each role runs on a model chosen for the shape of
+its work, across six vendors — routing on the cheapest fast model because every
+request waits on it, root-cause analysis on the most reliable tool-caller,
+strategy on a flagship reasoner because that is the one place its price is
+worth paying. `agent_server/model_roster.py` holds the assignments, the
+evidence behind them, and the fallback that keeps a workspace missing one of
+these vendors working anyway.
 """
 import json
 import logging
 import os
 import queue
 import time
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeout
 
@@ -49,7 +52,9 @@ from databricks_langchain import ChatDatabricks
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from agent_server.context_builder import build_context
+from agent_server.llm_output import message_text
 from agent_server.memory.conversation_store import ConversationStore
+from agent_server.model_roster import ROSTER, describe, resolve
 from agent_server.prompts.orchestrator import INTENT_CLASSIFY_TEMPLATE, ORCHESTRATOR_SYSTEM
 from agent_server.prompts.response_synthesis import SYNTHESIS_TEMPLATE
 from agent_server.specialists.downtime_analyst import create_downtime_analyst
@@ -60,6 +65,8 @@ from agent_server.specialists.schedule_optimizer import create_schedule_optimize
 from agent_server.specialists.shift_briefing import create_shift_briefing
 from agent_server.specialists.strategic_advisor import create_strategic_advisor
 from agent_server.specialists.supply_chain_advisor import create_supply_chain_advisor
+from agent_server.tool_evidence import evidence_from_call, evidence_from_result
+from agent_server.trace_link import current_trace_url
 
 logger = logging.getLogger(__name__)
 
@@ -67,10 +74,13 @@ logger = logging.getLogger(__name__)
 # we can query latency + tool-call breakdowns from the experiment view.
 mlflow.langchain.autolog()
 
-# Used for intent classification, the "general" fallback path, and response
-# synthesis. Kept as a single small endpoint because all three are short,
-# structured tasks where the larger models add cost without measurable quality.
-_ORCHESTRATOR_MODEL = os.environ.get("MODEL_ORCHESTRATOR", "databricks-gpt-5-mini")
+# Intent classification, the "general" fallback path and response synthesis are
+# three different jobs, so they no longer share one endpoint. Routing picks one
+# label from nine and every request waits on it, which wants the cheapest fast
+# model; the other two are read verbatim by the user, which wants prose quality.
+# See agent_server/model_roster.py.
+_ROUTER_ROLE = "intent_router"
+_GENERAL_ROLE = "general"
 
 
 def _overlay_live_state(context: dict) -> dict:
@@ -134,9 +144,20 @@ def _overlay_live_state(context: dict) -> dict:
         # this to deterministically pick a specialist.
         context["active_incidents"] = read_commands_active(shift_id)
 
-        context.setdefault("scenario", {})
-        context["scenario"]["current_timestamp"] = now_iso
-        context["scenario"]["scenario_name"] = "Live Real-Time (Lakebase)"
+        # Replaced rather than mutated in place. `build_context` hands out
+        # `copy.copy` of its cached bundle, so this nested dict is the *same
+        # object* the cache holds: writing into it stamped the cached entry as
+        # live for the rest of its TTL. The next request to hit that entry with
+        # Lakebase down then returned early above — on the documented promise of
+        # keeping "the historical UC bundle untouched" — and handed the
+        # specialist historical UC readings under a live scenario name and a
+        # current timestamp. That is the half-overlaid state this function's own
+        # docstring calls worse than a clean fallback.
+        context["scenario"] = {
+            **context.get("scenario", {}),
+            "current_timestamp": now_iso,
+            "scenario_name": "Live Real-Time (Lakebase)",
+        }
 
         logger.info(
             "Overlaid live Lakebase state: shift=%s machines=%d events=%d incidents=%d",
@@ -149,50 +170,29 @@ def _overlay_live_state(context: dict) -> dict:
     return context
 
 SPECIALIST_TIMEOUT_SECONDS = int(os.environ.get("SPECIALIST_TIMEOUT_SECONDS", "90"))
-_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="specialist")
+
+# LangGraph counts super-steps, and one ReAct round costs two of them — the
+# model node, then the tool node — with a final model node to write the answer.
+# So this is 2 * tool_rounds + 1, and the old value of 10 allowed four rounds.
+# That is not enough for a specialist that recovers from a bad query: the
+# Quality Specialist spends one round on its governed domain, one on live SQL,
+# one more when the first live query names a column that doesn't exist, and it
+# was failing roughly two runs in three. Seven rounds leaves room to recover
+# without becoming the thing that bounds a runaway loop — SPECIALIST_TIMEOUT_SECONDS
+# is the real ceiling, and it applies to wall clock rather than to step count.
+SPECIALIST_RECURSION_LIMIT = int(os.environ.get("SPECIALIST_RECURSION_LIMIT", "16"))
+# One specialist run holds a worker for as long as it takes, up to
+# SPECIALIST_TIMEOUT_SECONDS. At two workers a third simultaneous question waited
+# behind two runs that can each last 90s and the gateway returned 502 before the
+# app ever answered — which is what a room full of people asking at once looks
+# like. These threads are almost entirely blocked on the serving endpoint and the
+# warehouse, so the cost of more of them is concurrent load on those, not CPU here.
+_SPECIALIST_WORKERS = int(os.environ.get("SPECIALIST_WORKERS", "6"))
+_executor = ThreadPoolExecutor(
+    max_workers=_SPECIALIST_WORKERS, thread_name_prefix="specialist"
+)
 _conversation_store = ConversationStore()
 
-
-def _capture_mlflow_trace_spans() -> list[dict]:
-    """Capture MLflow trace spans from the current thread's last active trace.
-
-    Returns a list of serialized span dicts for inline display. Returns [] if
-    the trace can't be retrieved (e.g. thread-local limitations).
-    """
-    try:
-        last_trace = mlflow.get_last_active_trace()
-        if not last_trace or not last_trace.data or not last_trace.data.spans:
-            return []
-
-        spans = []
-        for span in last_trace.data.spans:
-            duration_ms = 0
-            if span.start_time_ns and span.end_time_ns:
-                duration_ms = round((span.end_time_ns - span.start_time_ns) / 1_000_000)
-
-            span_dict: dict = {
-                "name": span.name or "unknown",
-                "span_type": getattr(span, "span_type", None) or getattr(span, "_span_type", "UNKNOWN"),
-                "status": span.status.status_code.value if span.status else "UNSET",
-                "duration_ms": duration_ms,
-            }
-
-            inputs = getattr(span, "inputs", None)
-            if inputs:
-                input_str = json.dumps(inputs, default=str) if not isinstance(inputs, str) else inputs
-                span_dict["inputs"] = input_str[:200] + ("…" if len(input_str) > 200 else "")
-
-            outputs = getattr(span, "outputs", None)
-            if outputs:
-                output_str = json.dumps(outputs, default=str) if not isinstance(outputs, str) else outputs
-                span_dict["outputs"] = output_str[:200] + ("…" if len(output_str) > 200 else "")
-
-            spans.append(span_dict)
-
-        return spans
-    except Exception:
-        logger.debug("Could not retrieve MLflow trace spans", exc_info=True)
-        return []
 
 # Lazy-initialized specialists
 _specialists: dict | None = None
@@ -266,7 +266,7 @@ def _classify_intent(query: str, context: dict) -> str:
     """
     # max_tokens=50 is enough for any specialist name + slack. Anything longer
     # is almost certainly the model echoing the question — we'd discard it.
-    llm = ChatDatabricks(endpoint=_ORCHESTRATOR_MODEL, max_tokens=50)
+    llm = ChatDatabricks(endpoint=resolve(_ROUTER_ROLE), max_tokens=50)
 
     # Build summary strings for the classification prompt
     events_summary = ", ".join(
@@ -295,7 +295,7 @@ def _classify_intent(query: str, context: dict) -> str:
 
     try:
         response = llm.invoke(messages)
-        intent = response.content.strip().lower().replace(" ", "_")
+        intent = message_text(response).strip().lower().replace(" ", "_")
         valid = {
             "downtime_analyst", "quality_specialist", "supply_chain_advisor",
             "oee_coach", "schedule_optimizer", "maintenance_predictor",
@@ -327,10 +327,12 @@ def _quick_snapshot(context: dict) -> str:
 
     oee = kpi.get("oee_to_now")
     if oee is not None:
+        # `or 0` rather than a .get default: these arrive from `SELECT *`, so a
+        # NULL column is a present key holding None and the default never fires.
         parts.append(f"  OEE: **{float(oee):.1f}%** | "
-                     f"A: {float(kpi.get('availability_to_now', 0)):.1f}% · "
-                     f"P: {float(kpi.get('performance_to_now', 0)):.1f}% · "
-                     f"Q: {float(kpi.get('quality_to_now', 0)):.1f}%")
+                     f"A: {float(kpi.get('availability_to_now') or 0):.1f}% · "
+                     f"P: {float(kpi.get('performance_to_now') or 0):.1f}% · "
+                     f"Q: {float(kpi.get('quality_to_now') or 0):.1f}%")
 
     actual = kpi.get("cumulative_cases")
     planned = plan.get("planned_cases")
@@ -356,7 +358,7 @@ def _quick_snapshot(context: dict) -> str:
     active = [e for e in events if not e.get("timestamp_end")]
     if active:
         for e in active[:3]:
-            parts.append(f"  Alert: **{e.get('machine_id', '?')}** — {e.get('event_type', '?')} ({e.get('severity', '?')}): {e.get('description', '')[:80]}")
+            parts.append(f"  Alert: **{e.get('machine_id', '?')}** — {e.get('event_type', '?')} ({e.get('severity', '?')}): {(e.get('description') or '')[:80]}")
 
     remaining = scenario.get("remaining_minutes")
     if remaining is not None:
@@ -455,7 +457,85 @@ TOOL_DISPLAY_NAMES = {
     "stochastic_schedule_recovery": "Running stochastic schedule optimizer",
     "multi_shift_plan": "Running multi-shift planner",
     "estimate_rul": "Estimating remaining useful life",
+    # One per governed domain. Without these the live trace fell back to
+    # "Using governed_quality_query", which is the tool's name, not a step a
+    # line manager can read.
+    "governed_asset_query": "Asking the governed asset domain",
+    "governed_quality_query": "Asking the governed quality domain",
+    "governed_inventory_query": "Asking the governed inventory domain",
+    "governed_production_query": "Asking the governed production domain",
 }
+
+# Past tense for the verb each label opens with. Spelled out because English
+# will not be derived: the rule this replaced was
+# ``label.replace("ing ", "ed ").replace("Running ", "Ran ")``, which put
+# "Runned anomaly detection" and "Queryed production database" in front of the
+# user on ten of the seventeen labels — the first substitution had already
+# consumed the "Running " the second was looking for. "Estimating remaining
+# useful life" came out as "Estimated remained useful life", because a blanket
+# replace cannot tell a verb from the middle of a noun phrase.
+_PAST_TENSE = {
+    "Asking": "Asked",
+    "Estimating": "Estimated",
+    "Loading": "Loaded",
+    "Querying": "Queried",
+    "Running": "Ran",
+    "Searching": "Searched",
+    # The fallback label for a tool with no display name of its own.
+    "Using": "Used",
+}
+
+
+def completed_label(label: str) -> str:
+    """The past-tense form of a running-tool label, for the ✓ line.
+
+    Only the leading verb is touched, and only if we know it. An unrecognised
+    verb keeps the present tense, which reads as slightly off rather than
+    wrong — ``test_tool_labels.py`` fails on any label this cannot conjugate,
+    so a new one gets a real past tense rather than this fallback.
+    """
+    verb, _, rest = label.partition(" ")
+    past = _PAST_TENSE.get(verb)
+    if past is None:
+        return label
+    return f"{past} {rest}".rstrip()
+
+
+def _attach_evidence(tool_trace: list[dict], label: str, evidence: dict) -> None:
+    """Record a tool's provenance against the step that produced it.
+
+    Attaches to the oldest step with that label that has no evidence yet, which
+    is the only ordering that survives a specialist calling one tool twice in a
+    single turn. Matching the newest instead put both results on the second
+    step — the first kept its label and lost its query, and the second showed
+    one call's SQL beside another call's row count. Since the trail exists to
+    be checkable, evidence on the wrong step is worse than none.
+
+    Once every step with that label is accounted for, later evidence merges
+    into the newest, and a label with no step at all — possible if a result
+    outran its own call event — is dropped rather than inventing a step the
+    user never saw run.
+    """
+    matching = [step for step in tool_trace if step["action"] == label]
+    if not matching:
+        return
+    target = next((step for step in matching if not step.get("evidence")), matching[-1])
+    target.setdefault("evidence", {}).update(evidence)
+
+
+def _tool_steps(tool_trace: list[dict]) -> list[dict]:
+    """Turn the tool trace into reasoning steps, carrying evidence through.
+
+    The evidence is what makes the chat's trail checkable rather than merely
+    descriptive: the query that ran, the tables it touched, the row count.
+    """
+    steps = []
+    for entry in tool_trace:
+        step = {"label": entry["action"], "detail": "Tool call by specialist agent"}
+        if entry.get("evidence"):
+            step["evidence"] = entry["evidence"]
+        steps.append(step)
+    return steps
 
 
 def _run_specialist_streaming(specialist_name: str, query: str, context: dict, event_queue: queue.Queue) -> str:
@@ -475,9 +555,11 @@ def _run_specialist_streaming(specialist_name: str, query: str, context: dict, e
     if specialist_name == "general" or specialist_name not in specialists:
         result = _run_specialist(specialist_name, query, context)
         event_queue.put(("done", result))
-        trace_spans = _capture_mlflow_trace_spans()
-        if trace_spans:
-            event_queue.put(("trace_spans", trace_spans))
+        # The general path runs its one LLM call on this thread, so the trace it
+        # opened is the one this lookup finds.
+        url = current_trace_url()
+        if url:
+            event_queue.put(("trace_url", url))
         return result
 
     agent = specialists[specialist_name]
@@ -493,7 +575,10 @@ def _run_specialist_streaming(specialist_name: str, query: str, context: dict, e
             # nest under one "specialist.<name>" parent (see _invoke above).
             with mlflow.start_span(name=f"specialist.{specialist_name}", span_type="AGENT") as span:
                 span.set_inputs({"query": query, "specialist": specialist_name})
-                for event in agent.stream({"messages": input_messages}, {"recursion_limit": 10}):
+                for event in agent.stream(
+                    {"messages": input_messages},
+                    {"recursion_limit": SPECIALIST_RECURSION_LIMIT},
+                ):
                     for node_name, node_output in event.items():
                         msgs = node_output.get("messages", [])
                         for msg in msgs:
@@ -502,13 +587,29 @@ def _run_specialist_streaming(specialist_name: str, query: str, context: dict, e
                                     tool_name = tc.get("name", "unknown")
                                     display = TOOL_DISPLAY_NAMES.get(tool_name, f"Using {tool_name}")
                                     event_queue.put(("tool", display))
+                                    call_evidence = evidence_from_call(tool_name, tc.get("args"))
+                                    if call_evidence:
+                                        event_queue.put(("tool_evidence", (display, call_evidence)))
                             if isinstance(msg, ToolMessage):
                                 tool_name = getattr(msg, 'name', '') or ''
+                                result_evidence = evidence_from_result(tool_name, msg.content)
+                                if result_evidence:
+                                    # Label it the same way the "tool" event did,
+                                    # so the trace entry it belongs to is findable.
+                                    event_queue.put((
+                                        "tool_evidence",
+                                        (TOOL_DISPLAY_NAMES.get(tool_name, f"Using {tool_name}"), result_evidence),
+                                    ))
                                 display = TOOL_DISPLAY_NAMES.get(tool_name, '')
                                 if display:
                                     event_queue.put(("tool_done", display))
                             if isinstance(msg, AIMessage) and msg.content and not getattr(msg, 'tool_calls', None):
-                                final_content = msg.content
+                                text = message_text(msg)
+                                # Empty means the model emitted only private
+                                # reasoning; keep the previous answer rather
+                                # than blanking the reply.
+                                if text:
+                                    final_content = text
         except Exception as exc:
             logger.exception("Streaming specialist %s failed: %s", specialist_name, exc)
             final_content = (
@@ -516,13 +617,14 @@ def _run_specialist_streaming(specialist_name: str, query: str, context: dict, e
                 "Please try rephrasing your question."
             )
 
-        trace_spans = _capture_mlflow_trace_spans()
-        return final_content, trace_spans
+        # Resolved here, inside the worker, because the trace belongs to this
+        # thread: the submitting thread cannot see it.
+        return final_content, current_trace_url()
 
-    trace_spans: list[dict] = []
+    trace_url: str | None = None
     try:
         future = _executor.submit(_stream_invoke)
-        result, trace_spans = future.result(timeout=SPECIALIST_TIMEOUT_SECONDS)
+        result, trace_url = future.result(timeout=SPECIALIST_TIMEOUT_SECONDS)
     except FuturesTimeout:
         logger.error("Specialist %s timed out after %ds (stream)", specialist_name, SPECIALIST_TIMEOUT_SECONDS)
         result = (
@@ -531,8 +633,8 @@ def _run_specialist_streaming(specialist_name: str, query: str, context: dict, e
         )
 
     event_queue.put(("done", result))
-    if trace_spans:
-        event_queue.put(("trace_spans", trace_spans))
+    if trace_url:
+        event_queue.put(("trace_url", trace_url))
     return result
 
 
@@ -546,7 +648,7 @@ def _run_specialist(specialist_name: str, query: str, context: dict) -> str:
         # "General" is the no-tool path: a single chat call with the trimmed
         # context as a system message. Used when the LLM router couldn't find
         # a specialist match — usually "give me a status" or "what's going on".
-        llm = ChatDatabricks(endpoint=_ORCHESTRATOR_MODEL, max_tokens=1500)
+        llm = ChatDatabricks(endpoint=resolve(_GENERAL_ROLE), max_tokens=1500)
         context_str = json.dumps(trimmed, indent=2, default=str)
         messages = [
             SystemMessage(content=f"You are a helpful Line Manager AI assistant. Here is the current context:\n{context_str}"),
@@ -554,7 +656,7 @@ def _run_specialist(specialist_name: str, query: str, context: dict) -> str:
         ]
         try:
             response = llm.invoke(messages)
-            return response.content
+            return message_text(response)
         except Exception:
             logger.exception("General query failed")
             return "I'm sorry, I couldn't process your query. Please try again."
@@ -571,14 +673,21 @@ def _run_specialist(specialist_name: str, query: str, context: dict) -> str:
         # "specialist.<name>" parent instead of appearing as loose siblings.
         with mlflow.start_span(name=f"specialist.{specialist_name}", span_type="AGENT") as span:
             span.set_inputs({"query": query, "specialist": specialist_name})
-            return agent.invoke({"messages": input_messages}, {"recursion_limit": 10})
+            return agent.invoke(
+                {"messages": input_messages},
+                {"recursion_limit": SPECIALIST_RECURSION_LIMIT},
+            )
 
     try:
         future = _executor.submit(_invoke)
         result = future.result(timeout=SPECIALIST_TIMEOUT_SECONDS)
         for msg in reversed(result.get("messages", [])):
             if isinstance(msg, AIMessage) and msg.content:
-                return msg.content
+                text = message_text(msg)
+                # A message carrying nothing but reasoning blocks is not an
+                # answer — keep walking back for one that is.
+                if text:
+                    return text
         return "Analysis complete but no response generated."
     except FuturesTimeout:
         logger.error("Specialist %s timed out after %ds", specialist_name, SPECIALIST_TIMEOUT_SECONDS)
@@ -609,7 +718,7 @@ def _synthesize_response(specialist_name: str, specialist_response: str, context
     scenario = context.get("scenario", {})
     plan = context.get("production_plan", {})
 
-    llm = ChatDatabricks(endpoint=_ORCHESTRATOR_MODEL, max_tokens=2000)
+    llm = ChatDatabricks(endpoint=resolve(_GENERAL_ROLE), max_tokens=2000)
 
     kpi = context.get("current_kpi", {})
     synthesis_prompt = SYNTHESIS_TEMPLATE.format(
@@ -625,7 +734,7 @@ def _synthesize_response(specialist_name: str, specialist_response: str, context
 
     try:
         response = llm.invoke([HumanMessage(content=synthesis_prompt)])
-        return response.content
+        return message_text(response) or specialist_response
     except Exception:
         logger.exception("Synthesis failed, returning raw specialist response")
         return specialist_response
@@ -778,26 +887,35 @@ def _extract_actions(specialist_name: str, context: dict) -> list[dict]:
 
 MAX_QUERY_LENGTH = int(os.environ.get("MAX_QUERY_LENGTH", "2000"))
 
-# Display-only mapping of specialist → endpoint name. The actual ChatDatabricks
-# clients live inside each `create_*` factory in agent_server/specialists/;
-# this dict is exposed so the UI / reasoning trace can show which endpoint
-# answered, and so `test_model_map_completeness` enforces a registered entry
-# for every specialist. Override at deploy time via env vars:
-#   MODEL_SPECIALIST   — light specialists (mini model)
-#   MODEL_ADVANCED     — heavier reasoning specialists (oee_coach, strategic_advisor)
-# `general` is here so the "general" routing path also surfaces an endpoint
-# in the reasoning trace; functionally it uses _ORCHESTRATOR_MODEL.
-MODEL_MAP: dict[str, str] = {
-    "downtime_analyst": os.environ.get("MODEL_SPECIALIST", "databricks-gpt-5-mini"),
-    "quality_specialist": os.environ.get("MODEL_SPECIALIST", "databricks-gpt-5-mini"),
-    "supply_chain_advisor": os.environ.get("MODEL_SPECIALIST", "databricks-gpt-5-mini"),
-    "oee_coach": os.environ.get("MODEL_ADVANCED", "databricks-gpt-5"),
-    "schedule_optimizer": os.environ.get("MODEL_SPECIALIST", "databricks-gpt-5-mini"),
-    "maintenance_predictor": os.environ.get("MODEL_SPECIALIST", "databricks-gpt-5-mini"),
-    "strategic_advisor": os.environ.get("MODEL_ADVANCED", "databricks-gpt-5"),
-    "shift_briefing": os.environ.get("MODEL_SPECIALIST", "databricks-gpt-5-mini"),
-    "general": _ORCHESTRATOR_MODEL,
-}
+# Specialist → the endpoint that actually answered, for the reasoning trace and
+# the "via <model>" line in the chat UI. The live ChatDatabricks clients are
+# built inside each `create_*` factory; both they and this mapping call
+# `model_roster.resolve`, so the badge cannot drift from the model that ran —
+# the previous hand-maintained copy of the tier rules could, and would have,
+# now that the two differ per specialist.
+#
+# Resolution is deferred to first access rather than computed at import: it may
+# ask the workspace which models are served, and neither the test suite nor app
+# start-up should pay a credentialed round-trip just to import this module.
+_MODEL_MAP_ROLES: tuple[str, ...] = tuple(a.role for a in ROSTER if a.role != _ROUTER_ROLE)
+
+
+class _ResolvedModelMap(Mapping):
+    """Read-through view of specialist → serving endpoint."""
+
+    def __getitem__(self, key: str) -> str:
+        if key not in _MODEL_MAP_ROLES:
+            raise KeyError(key)
+        return resolve(key)
+
+    def __iter__(self):
+        return iter(_MODEL_MAP_ROLES)
+
+    def __len__(self) -> int:
+        return len(_MODEL_MAP_ROLES)
+
+
+MODEL_MAP: Mapping[str, str] = _ResolvedModelMap()
 
 
 def invoke(
@@ -873,11 +991,15 @@ def invoke(
 
     elapsed_ms = int((time.time() - start) * 1000)
 
+    endpoint_used = resolve(specialist_name)
+    model_display, model_vendor = describe(endpoint_used)
     return {
         "content": final_response,
         "quick_snapshot": snapshot,
         "specialist_used": specialist_name,
-        "model_used": MODEL_MAP.get(specialist_name, "databricks-gpt-5-mini"),
+        "model_used": endpoint_used,
+        "model_display": model_display,
+        "model_vendor": model_vendor,
         "response_time_ms": elapsed_ms,
         "conversation_id": conversation_id,
     }
@@ -926,7 +1048,7 @@ def invoke_stream(
         tool_update  — every tool the ReAct loop calls + a "Formatting..."
                        message before synthesis
         answer       — the final dict with content, tool_trace, reasoning_steps,
-                       trace_spans, and actions
+                       trace_url, and actions
         [DONE]       — stream terminator
 
     The specialist runs in a background thread; tool events are pulled off
@@ -977,22 +1099,23 @@ def invoke_stream(
     thread.start()
 
     specialist_response = "Analysis could not be completed."
-    trace_spans: list[dict] = []
+    trace_url: str | None = None
     while True:
         try:
             evt_type, evt_data = tool_queue.get(timeout=1.0)
             if evt_type == "tool":
                 tool_trace.append({"step": len(tool_trace) + 1, "action": evt_data, "status": "running"})
                 yield f"data: {_json.dumps({'type': 'tool_update', 'content': evt_data})}\n\n"
+            elif evt_type == "tool_evidence":
+                _attach_evidence(tool_trace, *evt_data)
             elif evt_type == "tool_done":
                 for t in reversed(tool_trace):
                     if t["action"] == evt_data and t["status"] == "running":
                         t["status"] = "done"
                         break
-                done_label = evt_data.replace("ing ", "ed ").replace("Running ", "Ran ")
-                yield f"data: {_json.dumps({'type': 'tool_update', 'content': f'{done_label} ✓'})}\n\n"
-            elif evt_type == "trace_spans":
-                trace_spans = evt_data
+                yield f"data: {_json.dumps({'type': 'tool_update', 'content': f'{completed_label(evt_data)} ✓'})}\n\n"
+            elif evt_type == "trace_url":
+                trace_url = evt_data
             elif evt_type == "done":
                 specialist_response = evt_data if evt_data else specialist_response
                 break
@@ -1002,11 +1125,18 @@ def invoke_stream(
 
     thread.join(timeout=SPECIALIST_TIMEOUT_SECONDS + 10)
 
+    # The loop above exits on `queue.Empty` if the worker has since finished, and
+    # the worker puts `done` then `trace_url` immediately before it exits — so a
+    # thread that completes inside that one-second window leaves both behind.
+    # Dropping `done` here meant the user got "Analysis could not be completed"
+    # next to a working link to the run that had, in fact, completed.
     while not tool_queue.empty():
         try:
             evt_type, evt_data = tool_queue.get_nowait()
-            if evt_type == "trace_spans":
-                trace_spans = evt_data
+            if evt_type == "trace_url":
+                trace_url = evt_data
+            elif evt_type == "done" and evt_data:
+                specialist_response = evt_data
         except queue.Empty:
             break
 
@@ -1030,25 +1160,32 @@ def invoke_stream(
     reasoning_steps = [
         {"label": "Context builder", "detail": "Loaded shift data, KPIs, events, machine states via parallel SQL queries"},
         {"label": "Intent classifier", "detail": f"LLM classified query intent → routed to {specialist_label}"},
-        {"label": f"{specialist_label} (LLM)", "detail": f"ReAct agent with model {MODEL_MAP.get(specialist_name, 'databricks-gpt-5-mini')}"},
+        {"label": f"{specialist_label} (LLM)", "detail": f"ReAct agent with model {resolve(specialist_name)}"},
     ]
-    for t in tool_trace:
-        reasoning_steps.append({"label": t["action"], "detail": "Tool call by specialist agent"})
+    reasoning_steps.extend(_tool_steps(tool_trace))
     if not skip_synthesis:
         reasoning_steps.append({"label": "Response synthesis (LLM)", "detail": "Structured and grounded the specialist output"})
 
     actions = _extract_actions(specialist_name, context)
 
+    endpoint_used = resolve(specialist_name)
+    model_display, model_vendor = describe(endpoint_used)
     answer_payload = {
         'type': 'answer',
         'content': final_response,
         'specialist_used': specialist_name,
-        'model_used': MODEL_MAP.get(specialist_name, 'databricks-gpt-5-mini'),
+        'model_used': endpoint_used,
+        # Friendly name + vendor so the chat can attribute the answer without
+        # the UI having to keep its own copy of the endpoint-name mapping.
+        'model_display': model_display,
+        'model_vendor': model_vendor,
         'response_time_ms': elapsed_ms,
         'conversation_id': conversation_id,
         'tool_trace': tool_trace,
         'reasoning_steps': reasoning_steps,
-        'trace_spans': trace_spans,
+        # Absent rather than null when tracing isn't configured, so the UI's
+        # "is there a link?" check is a plain truthiness test.
+        **({'trace_url': trace_url} if trace_url else {}),
         'actions': actions,
     }
     yield f"data: {_json.dumps(answer_payload)}\n\n"

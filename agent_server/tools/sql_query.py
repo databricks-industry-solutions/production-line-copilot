@@ -28,9 +28,34 @@ _WAREHOUSE_ID = os.environ.get("DATABRICKS_WAREHOUSE_ID", "")
 _CATALOG = os.environ.get("UC_CATALOG", "main")
 _SCHEMA = os.environ.get("UC_SCHEMA", "line_manager_ai_kit")
 
-_connection_lock = threading.Lock()
-_cached_connection = None
-_last_health_check = 0.0
+# One connection per thread, because the driver says so: databricks-sql-connector
+# declares PEP 249 ``threadsafety = 1`` — "threads may share the module, but not
+# connections". This used to be a single module-level connection guarded by a
+# lock that was held only while HANDING IT OUT, so every worker then ran
+# `cursor.execute` on the same connection at the same time. Two things follow
+# from that, and both get worse the more workers there are:
+#
+#   * concurrent statements interleave on one Thrift transport, which the driver
+#     does not promise to survive;
+#   * a failure in one thread called ``_invalidate_connection()``, which closed
+#     the connection every other thread was mid-query on, failing them too —
+#     each of which then invalidated in turn.
+#
+# The specialist pool went from two workers to six for concurrency this release,
+# which is what turned a narrow race into a likely one.
+#
+# Thread-local removes the sharing rather than locking around it. Serialising
+# instead would have been correct and useless: the query IS the latency, so a
+# global lock would have handed back the concurrency the pool was widened for.
+# It also drops two round trips out of the critical section — the old lock was
+# held across both the `SELECT 1` health check and a full connection handshake,
+# so every thread queued behind whichever one was reconnecting.
+#
+# Connections are created lazily by threads that actually run SQL, so the count
+# tracks real concurrency rather than pool size, and a warehouse multiplexes
+# sessions cheaply. Pool threads are long-lived, so a connection is reused for
+# the life of the thread rather than reopened per query.
+_local = threading.local()
 _HEALTH_CHECK_INTERVAL = 60.0
 
 
@@ -113,43 +138,49 @@ def _create_connection():
 
 
 def _get_connection():
-    """Return a cached connection. Only health-checks periodically to avoid lock contention."""
-    global _cached_connection, _last_health_check
+    """Return this thread's connection, opening or replacing it as needed.
 
-    with _connection_lock:
-        now = time.monotonic()
+    Health-checked at most once a minute: a warehouse connection usually
+    outlives that, and paying a round trip per query to find out would cost more
+    than the occasional retry in ``sql_query``.
+    """
+    now = time.monotonic()
+    connection = getattr(_local, "connection", None)
 
-        if _cached_connection is not None:
-            if now - _last_health_check < _HEALTH_CHECK_INTERVAL:
-                return _cached_connection
-            try:
-                cur = _cached_connection.cursor()
-                cur.execute("SELECT 1")
-                cur.close()
-                _last_health_check = now
-                return _cached_connection
-            except Exception:
-                logger.info("Cached SQL connection stale, reconnecting")
-                try:
-                    _cached_connection.close()
-                except Exception:
-                    logger.debug("Failed to close stale SQL connection", exc_info=True)
-                _cached_connection = None
+    if connection is not None:
+        if now - getattr(_local, "last_health_check", 0.0) < _HEALTH_CHECK_INTERVAL:
+            return connection
+        try:
+            cursor = connection.cursor()
+            cursor.execute("SELECT 1")
+            cursor.close()
+            _local.last_health_check = now
+            return connection
+        except Exception:
+            logger.info("Cached SQL connection stale, reconnecting")
+            _close_quietly(connection, "stale")
+            _local.connection = None
 
-        _cached_connection = _create_connection()
-        _last_health_check = now
-        return _cached_connection
+    _local.connection = _create_connection()
+    _local.last_health_check = now
+    return _local.connection
 
 
 def _invalidate_connection():
-    global _cached_connection
-    with _connection_lock:
-        if _cached_connection:
-            try:
-                _cached_connection.close()
-            except Exception:
-                logger.debug("Failed to close cached SQL connection during invalidate", exc_info=True)
-        _cached_connection = None
+    """Drop this thread's connection. Never touches another thread's."""
+    connection = getattr(_local, "connection", None)
+    if connection is not None:
+        _close_quietly(connection, "invalidate")
+    _local.connection = None
+    _local.last_health_check = 0.0
+
+
+def _close_quietly(connection, reason: str) -> None:
+    """Close on a best-effort basis: the caller is already discarding it."""
+    try:
+        connection.close()
+    except Exception:
+        logger.debug("Failed to close SQL connection during %s", reason, exc_info=True)
 
 
 _DANGEROUS_KEYWORDS = {"INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE", "TRUNCATE", "MERGE", "GRANT", "REVOKE"}

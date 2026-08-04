@@ -92,13 +92,18 @@ def _poll_message(headers: dict, host: str, space_id: str, conv_id: str, msg_id:
     return {"status": "TIMEOUT"}
 
 
-def run_genie_query(question: str) -> dict:
+def run_genie_query(question: str, space_id: str | None = None) -> dict:
     """Core Genie call. Returns a dict with 'answer', 'sql', 'tables', 'data'
     (or 'error'). Shared by the ``genie_query`` LangChain tool (used inside
     specialists) and the first-class ``ask_line`` path (direct data Q&A with
     provenance surfaced in the UI).
+
+    ``space_id`` overrides the default streaming space, which is how the
+    governed per-domain tools in ``governed_domain_query`` point the same
+    machinery at their own space.
     """
-    if not _SPACE_ID:
+    space = (space_id or _SPACE_ID or "").strip()
+    if not space:
         return {"error": "Genie Space not configured (GENIE_SPACE_ID not set)"}
 
     if not question or len(question.strip()) < 5:
@@ -112,7 +117,7 @@ def run_genie_query(question: str) -> dict:
 
     try:
         headers, host = _make_headers()
-        base = f"{host}/api/2.0/genie/spaces/{_SPACE_ID}"
+        base = f"{host}/api/2.0/genie/spaces/{space}"
 
         # Genie Conversation API: ``start-conversation`` creates the conversation
         # AND submits the first message in a single call. (The older two-step
@@ -129,7 +134,7 @@ def run_genie_query(question: str) -> dict:
         conv_id = start["conversation_id"]
         msg_id = start["message"]["message_id"]
 
-        data = _poll_message(headers, host, _SPACE_ID, conv_id, msg_id)
+        data = _poll_message(headers, host, space, conv_id, msg_id)
 
         result: dict = {"answer": "", "sql": None, "data": []}
 
@@ -191,7 +196,7 @@ def run_genie_query(question: str) -> dict:
 
 @tool
 def genie_query(question: str) -> dict:
-    """Ask the Databricks Genie data analyst a natural language question about brewery production data.
+    """Ask the Databricks Genie data analyst a natural language question about production line data.
 
     Genie translates the question into SQL against curated, governed datasets and returns
     structured results. Best for analytical / trend / comparison questions such as:

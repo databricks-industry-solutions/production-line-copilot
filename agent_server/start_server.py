@@ -49,6 +49,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from agent_server.serving import reconciliation
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -1594,6 +1596,240 @@ async def ops_dashboard_info():
         return JSONResponse({"error": str(e)[:400]}, status_code=404)
 
 
+@app.get("/ops/models")
+async def ops_models():
+    """The model roster as resolved in THIS workspace.
+
+    Served rather than hardcoded in the client because the answer is
+    deployment-specific: a workspace that doesn't serve one of the six vendors
+    silently runs that role on its fallback tier, and the About tab has to show
+    what actually answers rather than what we wish answered.
+
+    The first call may list serving endpoints, so it runs off the event loop;
+    the result is cached in the roster module for the life of the process.
+    """
+    from agent_server.model_roster import multi_vendor_enabled, resolved_roster, vendor_summary
+
+    def _read() -> dict:
+        roster = resolved_roster()
+        return {
+            "multi_vendor": multi_vendor_enabled(),
+            "vendors": vendor_summary(),
+            "substituted": sum(1 for e in roster if e["substituted"]),
+            "roles": roster,
+        }
+
+    try:
+        return await asyncio.to_thread(_read)
+    except Exception as e:  # noqa: BLE001 - an About tab must never 500 the app
+        logger.exception("ops/models failed")
+        return JSONResponse({"error": str(e)[:300]}, status_code=503)
+
+
+# Which specialists own which governed domain. The System Map reads this rather
+# than duplicating the mapping in the client, so the diagram cannot drift from
+# the agents actually built in agent_server/specialists/.
+_DOMAIN_OWNERS: dict[str, list[str]] = {
+    "asset": ["maintenance_predictor", "downtime_analyst"],
+    "quality": ["quality_specialist"],
+    "inventory": ["supply_chain_advisor"],
+    "production": ["oee_coach", "schedule_optimizer", "strategic_advisor"],
+}
+
+_DOMAIN_LABELS: dict[str, str] = {
+    "asset": "Asset",
+    "quality": "Quality",
+    "inventory": "Inventory",
+    "production": "Production",
+}
+
+
+@app.get("/ops/topology")
+async def ops_topology():
+    """How agents reach data: the governed domains and which are provisioned.
+
+    Served rather than hardcoded because provisioning is deployment-specific. A
+    workspace where a domain's Genie space failed to create still runs — those
+    specialists fall back to sql_query — and the System Map has to show that
+    honestly instead of drawing a connection that does not exist.
+    """
+    from agent_server.tools.governed_domain_query import (
+        DOMAIN_ENV,
+        domain_space_id,
+        domain_tables,
+    )
+
+    def _read() -> dict:
+        domains = []
+        for domain in DOMAIN_ENV:
+            configured = bool(domain_space_id(domain))
+            domains.append(
+                {
+                    "domain": domain,
+                    "label": _DOMAIN_LABELS.get(domain, domain.title()),
+                    "configured": configured,
+                    "tool": f"governed_{domain}_query" if configured else None,
+                    "entities": domain_tables(domain),
+                    "specialists": _DOMAIN_OWNERS.get(domain, []),
+                }
+            )
+        configured_count = sum(1 for d in domains if d["configured"])
+        return {
+            "domains": domains,
+            "configured": configured_count,
+            "total": len(domains),
+            # The streaming space is the live, per-second surface — a different
+            # audience from the governed domains, so it is reported separately.
+            "streaming_space": bool(os.environ.get("GENIE_SPACE_ID", "").strip()),
+            "mvm_silver_enabled": os.environ.get("MVM_SILVER_ENABLED", "") == "1",
+        }
+
+    try:
+        return await asyncio.to_thread(_read)
+    except Exception as e:  # noqa: BLE001 - the System Map must never 500 the app
+        logger.exception("ops/topology failed")
+        return JSONResponse({"error": str(e)[:300]}, status_code=503)
+
+
+def _reconciliation_uc_query(sql: str) -> list[dict]:
+    """Run a read-only UC query, converting the tool's error shape into a raise.
+
+    ``sql_query`` reports failures as ``[{"error": ...}]`` rather than raising;
+    the reconciler relies on exceptions to degrade one source at a time.
+    """
+    from agent_server.tools.sql_query import sql_query as _sql
+
+    rows = _sql.invoke(sql)
+    if rows and isinstance(rows[0], dict) and "error" in rows[0] and len(rows[0]) == 1:
+        raise RuntimeError(str(rows[0]["error"])[:200])
+    return rows or []
+
+
+def _make_reconciliation_pg_query():
+    """Build a pg_query bound to a dedicated, short-lived read-only connection.
+
+    Deliberately NOT the shared serving connection: these are slow scans, and
+    psycopg2 serializes per connection, so reusing it would stall live SSE reads
+    and any failure would have to roll back another handler's transaction.
+    """
+    from agent_server.memory.pg_pool import new_readonly_connection
+
+    conn = new_readonly_connection()
+    if conn is None:
+        raise RuntimeError("Lakebase not configured")
+
+    def _query(sql: str) -> list[dict]:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            return [dict(r) for r in cur.fetchall()]
+
+    return conn, _query
+
+
+# Reconciliation fans out to several warehouse queries, so it is cached well
+# below the settled-window length: repeated Reloads and tab switches are free,
+# while the data can never be more stale than the window it describes.
+_RECONCILIATION_CACHE: dict[str, Any] = {}
+_RECONCILIATION_TTL_S = 60.0
+_RECONCILIATION_LOCK = threading.Lock()
+
+
+def _run_reconciliation(catalog: str, schema: str, mvm_catalog: str,
+                        governed_owned: bool,
+                        window_minutes: int, lag_guard_seconds: int) -> dict:
+    """Blocking reconciliation with a TTL cache. Runs on a worker thread."""
+    key = (
+        f"{catalog}.{schema}|{mvm_catalog}|{governed_owned}"
+        f"|{window_minutes}|{lag_guard_seconds}"
+    )
+    now = time.time()
+    with _RECONCILIATION_LOCK:
+        hit = _RECONCILIATION_CACHE.get(key)
+        if hit and (now - hit["at"]) < _RECONCILIATION_TTL_S:
+            return {**hit["payload"], "cached": True}
+
+    conn = None
+    try:
+        conn, pg_query = _make_reconciliation_pg_query()
+    except Exception:
+        # Lakebase unreachable: still return the analytics side, marked unknown.
+        def pg_query(_sql: str) -> list[dict]:
+            raise RuntimeError("Lakebase not configured")
+
+    try:
+        payload = reconciliation.reconcile(
+            uc_query=_reconciliation_uc_query,
+            pg_query=pg_query,
+            catalog=catalog,
+            schema=schema,
+            mvm_catalog=mvm_catalog,
+            governed_owned=governed_owned,
+            # Dev and prod share one Lakebase instance and are separated only by
+            # shift, so an unscoped comparison counts both environments.
+            shift_id=os.environ.get("SIM_SHIFT_ID") or None,
+            window_minutes=window_minutes,
+            lag_guard_seconds=lag_guard_seconds,
+        )
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    with _RECONCILIATION_LOCK:
+        _RECONCILIATION_CACHE[key] = {"at": now, "payload": payload}
+    return {**payload, "cached": False}
+
+
+@app.get("/ops/reconciliation")
+async def ops_reconciliation(
+    window_minutes: int = reconciliation.DEFAULT_WINDOW_MINUTES,
+    lag_guard_seconds: int = reconciliation.DEFAULT_LAG_GUARD_SECONDS,
+):
+    """Compare the live (Lakebase) plane against the analytics/governed plane.
+
+    Runs the comparison over a *settled* window so the Zerobus SLA plus one
+    streaming cycle can't masquerade as data loss. Each source degrades
+    independently, so a Lakebase outage still returns the analytics counts.
+    """
+    catalog = os.environ.get("UC_CATALOG", "")
+    schema = os.environ.get("UC_SCHEMA", "")
+    if not catalog or not schema:
+        return JSONResponse(
+            {"error": "UC_CATALOG / UC_SCHEMA not configured"}, status_code=503
+        )
+    # An unset MVM catalog means the model was installed into the live catalog
+    # (the common case when the metastore denies CREATE CATALOG).
+    mvm_catalog = os.environ.get("MVM_CATALOG") or catalog
+    # The governed tables carry no environment suffix, so a catalog shared with
+    # another environment exposes ITS rows to us. Only claim them when this
+    # environment's streaming-silver writer is the one filling them.
+    governed_owned = os.environ.get("MVM_SILVER_ENABLED", "0") == "1"
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(
+                _run_reconciliation,
+                catalog,
+                schema,
+                mvm_catalog,
+                governed_owned,
+                max(1, min(int(window_minutes), 24 * 60)),
+                max(0, min(int(lag_guard_seconds), 3600)),
+            ),
+            # Bounded so a cold or wedged warehouse returns a clear error to the
+            # UI instead of hanging until the proxy gives up.
+            timeout=90,
+        )
+    except asyncio.TimeoutError:
+        return JSONResponse(
+            {"error": "reconciliation timed out — the SQL warehouse may be starting"},
+            status_code=504,
+        )
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse({"error": str(e)[:400]}, status_code=500)
+
+
 @app.get("/ops/control/state")
 async def ops_control_state(req: Request):
     user = _ops_user(req)
@@ -1842,23 +2078,28 @@ async def sim_status():
     App currently sees for its shift, so an operator can confirm the producer +
     streaming sync are healthy without opening the dashboard.
     """
-    try:
+    def _read() -> dict:
         from agent_server.serving.realtime_store import (
             read_commands_active,
             read_line_kpi_latest,
             read_machine_state_latest,
         )
         shift_id = os.environ.get("SIM_SHIFT_ID", "shift_1")
-        machines = read_machine_state_latest(shift_id)
-        # jsonable_encoder handles datetime/Decimal values that Lakebase rows
-        # carry (raw dict/JSONResponse would raise "not JSON serializable").
-        return JSONResponse(jsonable_encoder({
+        return {
             "mode": "producer",
             "shift_id": shift_id,
-            "machines_count": len(machines),
+            "machines_count": len(read_machine_state_latest(shift_id)),
             "active_incidents": len(read_commands_active(shift_id)),
             "kpi_raw": read_line_kpi_latest(shift_id) or {},
-        }))
+        }
+
+    try:
+        # Off the event loop: these are blocking psycopg2 calls, and when
+        # Lakebase is unreachable they wait out a connect timeout — on the
+        # loop that would freeze every other request, SSE streams included.
+        # jsonable_encoder handles datetime/Decimal values that Lakebase rows
+        # carry (raw dict/JSONResponse would raise "not JSON serializable").
+        return JSONResponse(jsonable_encoder(await asyncio.to_thread(_read)))
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -1885,12 +2126,11 @@ def _truncate_ai_serving_demo_state(shift_id: str) -> dict:
     """
     out: dict[str, Any] = {"shift_id": shift_id}
     try:
-        from agent_server.memory.pg_pool import get_connection
-        conn = get_connection()
-        if conn is None:
-            return {"warning": "lakebase not available; demo state not cleared"}
-        cur = conn.cursor()
-        try:
+        from agent_server.memory.pg_pool import transaction
+
+        with transaction() as cur:
+            if cur is None:
+                return {"warning": "lakebase not available; demo state not cleared"}
             # Tables ordered the same as the SQL schema for predictability;
             # all DELETEs are scoped to ``shift_id`` so a multi-shift demo
             # only nukes the row(s) for the shift being restarted.
@@ -1907,19 +2147,24 @@ def _truncate_ai_serving_demo_state(shift_id: str) -> dict:
             total_deleted = 0
             tables_ok = 0
             for tbl in tables:
+                # Savepoint per table so this stays genuinely best-effort. A
+                # failed DELETE aborts the whole transaction in Postgres, so
+                # without one the remaining tables would all fail and the
+                # commit would silently discard the deletes we just reported
+                # as successful.
+                cur.execute("SAVEPOINT clear_table")
                 try:
                     cur.execute(f"DELETE FROM {tbl} WHERE shift_id = %s", (shift_id,))
                     out[tbl] = f"deleted={cur.rowcount}"
                     total_deleted += max(0, int(cur.rowcount or 0))
                     tables_ok += 1
+                    cur.execute("RELEASE SAVEPOINT clear_table")
                 except Exception as e:  # noqa: BLE001
                     out[tbl] = f"error:{str(e)[:80]}"
+                    cur.execute("ROLLBACK TO SAVEPOINT clear_table")
             out["tables_ok"] = tables_ok
             out["tables_total"] = len(tables)
             out["rows_deleted"] = total_deleted
-            conn.commit()
-        finally:
-            cur.close()
     except Exception as e:  # noqa: BLE001
         out["error"] = str(e)[:200]
     return out
@@ -1953,47 +2198,39 @@ def _abort_pending_uc_commands() -> dict:
     Best-effort: any error is logged in the dict instead of raised.
     """
     try:
-        from agent_server.memory.pg_pool import get_connection
+        from agent_server.memory.pg_pool import transaction
 
-        conn = get_connection()
-        if conn is None:
-            return {"error": "Lakebase unavailable"}
         out: dict[str, Any] = {}
-        try:
-            with conn.cursor() as cur:
-                # Step 1: ask the still-running producer to resolve its
-                # active incidents. The producer's ``fetch_resolve_requested``
-                # poll runs every tick (1 s) so this completes within a
-                # second or two of the first commit.
-                cur.execute(
-                    "UPDATE ai_serving.scenario_commands "
-                    "SET status = 'resolve_requested' "
-                    "WHERE status IN ('active', 'resolving')"
-                )
-                resolve_requested_n = int(cur.rowcount or 0)
-                out["resolve_requested"] = resolve_requested_n
+        with transaction() as cur:
+            if cur is None:
+                return {"error": "Lakebase unavailable"}
 
-                # Step 2: terminal-out anything still queued and never
-                # delivered, plus stale resolve_requested rows older than
-                # 60 s (the producer must have died before processing them).
-                cur.execute(
-                    "UPDATE ai_serving.scenario_commands "
-                    "SET status = 'aborted' "
-                    "WHERE status = 'pending' "
-                    "   OR (status = 'resolve_requested' "
-                    "       AND created_at < now() - INTERVAL '60 seconds')"
-                )
-                aborted_n = int(cur.rowcount or 0)
-                out["aborted"] = aborted_n
-                out["total"] = resolve_requested_n + aborted_n
-            conn.commit()
-            return out
-        except Exception:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
-            raise
+            # Step 1: ask the still-running producer to resolve its active
+            # incidents. The producer's ``fetch_resolve_requested`` poll runs
+            # every tick (1 s) so this completes within a second or two of
+            # the commit.
+            cur.execute(
+                "UPDATE ai_serving.scenario_commands "
+                "SET status = 'resolve_requested' "
+                "WHERE status IN ('active', 'resolving')"
+            )
+            resolve_requested_n = int(cur.rowcount or 0)
+            out["resolve_requested"] = resolve_requested_n
+
+            # Step 2: terminal-out anything still queued and never
+            # delivered, plus stale resolve_requested rows older than
+            # 60 s (the producer must have died before processing them).
+            cur.execute(
+                "UPDATE ai_serving.scenario_commands "
+                "SET status = 'aborted' "
+                "WHERE status = 'pending' "
+                "   OR (status = 'resolve_requested' "
+                "       AND created_at < now() - INTERVAL '60 seconds')"
+            )
+            aborted_n = int(cur.rowcount or 0)
+            out["aborted"] = aborted_n
+            out["total"] = resolve_requested_n + aborted_n
+        return out
     except Exception as e:  # noqa: BLE001
         return {"error": str(e)[:200]}
 
@@ -2297,9 +2534,14 @@ async def sim_warmup(req: Request):
         from agent_server.serving.realtime_store import read_machine_state_latest
         read_machine_state_latest(os.environ.get("SIM_SHIFT_ID", "shift_1"))
 
-    _step("sql_warehouse", _sql_probe)
-    _step("scenario_commands", _scenario_commands_probe)
-    _step("lakebase_serving", _lakebase_probe)
+    def _run_probes() -> None:
+        _step("sql_warehouse", _sql_probe)
+        _step("scenario_commands", _scenario_commands_probe)
+        _step("lakebase_serving", _lakebase_probe)
+
+    # Warmup is deliberately slow — it exists to pay the cold-start cost — so
+    # it is the last thing that should pay it on the event loop.
+    await asyncio.to_thread(_run_probes)
 
     total_ms = sum(int(s.get("ms") or 0) for s in steps)
     all_ok = all(bool(s.get("ok")) for s in steps)
@@ -2353,9 +2595,12 @@ async def resolve_incident_endpoint(body: IncidentResolveBody):
     in Lakebase so the external producer picks it up, clears its sticky fault,
     and emits a resolved event.
     """
-    try:
+    def _resolve() -> None:
         from agent_server.sim.commands import resolve_command
         resolve_command(command_id=body.command_id)
+
+    try:
+        await asyncio.to_thread(_resolve)
         return JSONResponse({"command_id": body.command_id, "status": "resolving"})
     except Exception as e:
         logger.exception("Failed to resolve incident")
@@ -2378,58 +2623,53 @@ async def recover_machine_endpoint(body: RecoverMachineBody):
     if not target_mid:
         return JSONResponse({"error": "machine_id required"}, status_code=400)
 
-    from agent_server.sim.recovery import commands_targeting_machine
+    def _lookup_and_resolve() -> list[str]:
+        """Find this machine's open commands and mark them resolve_requested.
+
+        Runs off the event loop: it is one read plus a serial UPDATE per
+        matching command, so on a busy line it is easily hundreds of
+        milliseconds of blocking psycopg2 — and a connect timeout when
+        Lakebase is down.
+        """
+        from agent_server.memory.pg_pool import query
+        from agent_server.sim.commands import resolve_command
+        from agent_server.sim.recovery import commands_targeting_machine
+
+        resolved: list[str] = []
+        try:
+            uc_cmds: list[dict[str, Any]] = []
+            try:
+                rows = query(
+                    """
+                    SELECT command_id, target_machine_id
+                    FROM ai_serving.scenario_commands
+                    WHERE status IN ('pending', 'active', 'resolving')
+                    ORDER BY created_at DESC
+                    LIMIT 200
+                    """
+                )
+                uc_cmds = [
+                    {"command_id": r["command_id"], "target_machine_id": r.get("target_machine_id")}
+                    for r in (rows or [])
+                ]
+            except Exception as e:  # noqa: BLE001
+                logger.warning("recover_machine Lakebase lookup failed: %s", str(e)[:200])
+            for c in commands_targeting_machine(uc_cmds, target_mid):
+                cid = c["command_id"]
+                if cid in resolved:
+                    continue
+                try:
+                    resolve_command(command_id=cid, resolved_by=body.resolved_by)
+                    resolved.append(cid)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("recover_machine Lakebase resolve failed for %s: %s", cid, str(e)[:200])
+        except Exception as e:  # noqa: BLE001
+            logger.warning("recover_machine command-targeting lookup failed: %s", str(e)[:200])
+        return resolved
 
     # Look up non-terminal commands targeting this machine from Lakebase (the
     # sole source of truth) and mark them resolve_requested for the producer.
-    resolved_uc: list[str] = []
-    try:
-        from agent_server.memory.pg_pool import get_connection
-        from agent_server.sim.commands import resolve_command
-
-        conn = get_connection()
-        rows: list[tuple[str, str | None]] = []
-        if conn is not None:
-            try:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        SELECT command_id, target_machine_id
-                        FROM ai_serving.scenario_commands
-                        WHERE status IN ('pending', 'active', 'resolving')
-                        ORDER BY created_at DESC
-                        LIMIT 200
-                        """
-                    )
-                    # RealDictCursor → rows are dicts; normalize to the
-                    # tuple shape the rest of this block expects.
-                    rows = [
-                        (r["command_id"], r.get("target_machine_id"))
-                        for r in cur.fetchall()
-                    ]
-            except Exception as e:  # noqa: BLE001
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-                logger.warning("recover_machine Lakebase lookup failed: %s", str(e)[:200])
-
-        uc_cmds = [
-            {"command_id": cid, "target_machine_id": tmid} for cid, tmid in rows
-        ]
-        for c in commands_targeting_machine(uc_cmds, target_mid):
-            cid = c["command_id"]
-            if cid in resolved_uc:
-                continue
-            try:
-                resolve_command(command_id=cid, resolved_by=body.resolved_by)
-                resolved_uc.append(cid)
-            except Exception as e:  # noqa: BLE001
-                logger.warning("recover_machine Lakebase resolve failed for %s: %s", cid, str(e)[:200])
-    except Exception as e:  # noqa: BLE001
-        logger.warning("recover_machine command-targeting lookup failed: %s", str(e)[:200])
-
-    all_resolved = list(dict.fromkeys(resolved_uc))
+    all_resolved = list(dict.fromkeys(await asyncio.to_thread(_lookup_and_resolve)))
     return JSONResponse({
         "machine_id": target_mid,
         "resolved_command_ids": all_resolved,
@@ -2441,10 +2681,12 @@ async def recover_machine_endpoint(body: RecoverMachineBody):
 @app.get("/sim/commands")
 async def list_commands():
     """List active incidents from Lakebase ``ai_serving.scenario_commands``."""
-    try:
+    def _read() -> list[dict]:
         from agent_server.serving.realtime_store import read_commands_active
-        shift_id = os.environ.get("SIM_SHIFT_ID", "shift_1")
-        return JSONResponse({"commands": read_commands_active(shift_id)})
+        return read_commands_active(os.environ.get("SIM_SHIFT_ID", "shift_1"))
+
+    try:
+        return JSONResponse(jsonable_encoder({"commands": await asyncio.to_thread(_read)}))
     except Exception as e:
         logger.exception("Failed to list commands")
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -2582,7 +2824,38 @@ async def serving_stream():
                 max_ts = max_ts.replace(tzinfo=timezone.utc)
             return max_ts - _td(seconds=buffer_s)
 
-        start_cursor = _resolve_anchor()
+        def _read_tick(cur_machine, cur_kpi, cur_inventory, want_anchor):
+            """Every Lakebase read for one SSE tick, in one worker-thread hop.
+
+            These are blocking psycopg2 calls. Run inline on the event loop
+            they would freeze EVERY request the app is serving — including
+            other dashboards' SSE streams — for as long as Postgres takes to
+            answer, which during an outage is a connect timeout rather than
+            the usual few milliseconds. One hop per tick rather than six keeps
+            the thread-pool churn negligible.
+            """
+            out: dict[str, Any] = {
+                "machines": [], "next_machine_ts": None,
+                "kpi": None, "next_kpi_ts": None,
+                "inventory": [], "next_inv_ts": None,
+                "anchor": None,
+            }
+            if cur_machine is not None:
+                out["machines"], out["next_machine_ts"] = read_machine_state_after(shift_id, cur_machine)
+            if cur_kpi is not None:
+                out["kpi"], out["next_kpi_ts"] = read_line_kpi_after(shift_id, cur_kpi)
+            if cur_inventory is not None:
+                out["inventory"], out["next_inv_ts"] = read_inventory_after(shift_id, cur_inventory)
+            if want_anchor:
+                try:
+                    out["anchor"] = _resolve_anchor()
+                except Exception:
+                    logger.exception("SSE cursor catch-up anchor failed")
+            out["events"] = read_event_log_recent(shift_id, limit=50)
+            out["commands"] = read_commands_active(shift_id)
+            return out
+
+        start_cursor = await asyncio.to_thread(_resolve_anchor)
         cursor["machine"] = start_cursor
         cursor["kpi"] = start_cursor
         cursor["inventory"] = start_cursor
@@ -2597,19 +2870,17 @@ async def serving_stream():
 
                 # If still None (history empty), fall through with empty
                 # arrays — the "waiting" branch below handles it.
-                machine_rows: list = []
-                kpi_row: dict | None = None
-                inventory_rows: list = []
-                next_machine_ts = None
-                next_kpi_ts = None
-                next_inv_ts = None
-
-                if cursor["machine"] is not None:
-                    machine_rows, next_machine_ts = read_machine_state_after(shift_id, cursor["machine"])
-                if cursor["kpi"] is not None:
-                    kpi_row, next_kpi_ts = read_line_kpi_after(shift_id, cursor["kpi"])
-                if cursor["inventory"] is not None:
-                    inventory_rows, next_inv_ts = read_inventory_after(shift_id, cursor["inventory"])
+                tick = await asyncio.to_thread(
+                    _read_tick,
+                    cursor["machine"], cursor["kpi"], cursor["inventory"],
+                    (lake_tick % 5) == 0,
+                )
+                machine_rows: list = tick["machines"]
+                kpi_row: dict | None = tick["kpi"]
+                inventory_rows: list = tick["inventory"]
+                next_machine_ts = tick["next_machine_ts"]
+                next_kpi_ts = tick["next_kpi_ts"]
+                next_inv_ts = tick["next_inv_ts"]
 
                 # NOTE: deliberately NO data-source fallback here. If
                 # ``*_history`` is empty (fresh deploy / right after restart)
@@ -2636,9 +2907,9 @@ async def serving_stream():
                 # ``_resolve_anchor`` ensures the cursor never strands
                 # on an old producer run — even when the streaming sync
                 # job is briefly silent.
-                if cursor["machine"] is not None and (lake_tick % 5) == 0:
+                if cursor["machine"] is not None and tick["anchor"] is not None:
                     try:
-                        target = _resolve_anchor()
+                        target = tick["anchor"]
                         cur_machine = cursor["machine"]
                         if getattr(cur_machine, "tzinfo", None) is None:
                             cur_machine = cur_machine.replace(tzinfo=timezone.utc)
@@ -2679,8 +2950,8 @@ async def serving_stream():
 
                 # Events + commands always read fresh — they're sparse and
                 # users want to see incidents the moment they're inserted.
-                events = read_event_log_recent(shift_id, limit=50)
-                commands = read_commands_active(shift_id)
+                events = tick["events"]
+                commands = tick["commands"]
 
                 # Build payload. ``waiting=True`` when the cursor produced no
                 # new rows AND no usable cached frame is available.
