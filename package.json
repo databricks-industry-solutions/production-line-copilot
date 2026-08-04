@@ -95,7 +95,7 @@
   "overrides": {
     "vite": "^7.3.5",
     "fast-uri": "^3.1.4",
-    "brace-expansion": "^5.0.8",
+    "brace-expansion": "^5.0.9",
     "uuid": "^11.1.1",
     "drizzle-orm": "^0.45.2",
     "js-yaml": "^4.3.0",
