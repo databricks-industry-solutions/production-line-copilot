@@ -42,6 +42,7 @@ import json
 import logging
 import os
 import queue
+import re
 import time
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
@@ -538,6 +539,81 @@ def _tool_steps(tool_trace: list[dict]) -> list[dict]:
     return steps
 
 
+# Every answer template ends with `## Confidence` followed by one line reading
+# `**HIGH** — <justification>` (see prompts/response_synthesis.py). Lenient about
+# the bold markers and the case because this parses model output, not our own:
+# a heading the model formatted slightly differently should cost us the tag, not
+# raise. `re.MULTILINE` so `^##` only matches a real heading.
+_CONFIDENCE_RE = re.compile(
+    r"^##\s*Confidence\s*$\s*\**\s*(HIGH|MEDIUM|LOW)\b",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+# What a specialist returns when its ReAct loop finished without producing an
+# answer message. Defined once because it is both returned and recognised.
+NO_ANSWER = "Analysis complete but no response generated."
+
+
+def _confidence_level(answer: str) -> str | None:
+    """The self-reported HIGH/MEDIUM/LOW from an answer, or None if absent.
+
+    Recorded on the span so low-confidence answers are findable without
+    re-reading every trace body — `mlflow traces search` can filter on it.
+    Absent is a distinct outcome from LOW and must stay distinguishable: it
+    means the model skipped a required section, which is a formatting failure
+    worth seeing rather than a hedge worth acting on.
+    """
+    if not answer:
+        return None
+    m = _CONFIDENCE_RE.search(answer)
+    return m.group(1).upper() if m else None
+
+
+def _final_answer_text(result: Mapping) -> str:
+    """The answer out of a finished ReAct run's message list.
+
+    Walks back to the last AIMessage carrying real content. A message holding
+    nothing but reasoning blocks is not an answer, so it keeps walking rather
+    than returning an empty string.
+    """
+    for msg in reversed(result.get("messages", [])):
+        if isinstance(msg, AIMessage) and msg.content:
+            text = message_text(msg)
+            if text:
+                return text
+    return NO_ANSWER
+
+
+def _tag_confidence(answer: str) -> None:
+    """Promote the answer's confidence to a trace tag.
+
+    A span output is only readable by opening the trace; a tag is queryable, so
+    `mlflow traces search --filter-string "tag.confidence = 'LOW'"` can pull
+    every hedged answer at once. Tagging is an observability nicety and must
+    never take a reply down with it, so a tracing failure is logged and
+    swallowed.
+    """
+    level = _confidence_level(answer)
+    if not level:
+        return
+    try:
+        mlflow.update_current_trace(tags={"confidence": level})
+    except Exception as exc:  # noqa: BLE001 - tracing must not break answering
+        logger.debug("Could not tag trace confidence: %s", exc)
+
+
+def _record_answer(span, answer: str) -> None:
+    """Attach an answer to its span.
+
+    Without this the span carries inputs and no outputs, which is how every
+    specialist trace in both experiments came to render an empty "Model output"
+    in the MLflow UI — the question was recorded and the answer was not, making
+    the traces useless for judging answer quality.
+    """
+    span.set_outputs({"response": answer, "confidence": _confidence_level(answer)})
+    _tag_confidence(answer)
+
+
 def _run_specialist_streaming(specialist_name: str, query: str, context: dict, event_queue: queue.Queue) -> str:
     """Run a specialist, streaming tool-call events to `event_queue`.
 
@@ -569,7 +645,7 @@ def _run_specialist_streaming(specialist_name: str, query: str, context: dict, e
     ]
 
     def _stream_invoke() -> tuple[str, str | None]:
-        final_content = "Analysis complete but no response generated."
+        final_content = NO_ANSWER
         try:
             # Named span in the WORKER thread so autolog's ReAct tool/LLM spans
             # nest under one "specialist.<name>" parent (see _invoke above).
@@ -610,6 +686,10 @@ def _run_specialist_streaming(specialist_name: str, query: str, context: dict, e
                                 # than blanking the reply.
                                 if text:
                                     final_content = text
+                # Inside the `with`, so it lands on the span rather than after
+                # it has closed. On an exception the span is already marked
+                # failed and carries the traceback, which is the better record.
+                _record_answer(span, final_content)
         except Exception as exc:
             logger.exception("Streaming specialist %s failed: %s", specialist_name, exc)
             final_content = (
@@ -667,28 +747,27 @@ def _run_specialist(specialist_name: str, query: str, context: dict) -> str:
         HumanMessage(content=f"Context:\n{context_str}\n\nUser query: {query}"),
     ]
 
-    def _invoke():
+    def _invoke() -> str:
         # Open a named span in the WORKER thread (where mlflow.langchain.autolog
         # creates the ReAct spans) so every tool/LLM span nests under a single
         # "specialist.<name>" parent instead of appearing as loose siblings.
         with mlflow.start_span(name=f"specialist.{specialist_name}", span_type="AGENT") as span:
             span.set_inputs({"query": query, "specialist": specialist_name})
-            return agent.invoke(
+            result = agent.invoke(
                 {"messages": input_messages},
                 {"recursion_limit": SPECIALIST_RECURSION_LIMIT},
             )
+            # Extracted here rather than in the caller so the answer is known
+            # while the span is still open. Returning the raw message list and
+            # picking the answer out afterwards is what left these spans with
+            # no outputs at all.
+            answer = _final_answer_text(result)
+            _record_answer(span, answer)
+            return answer
 
     try:
         future = _executor.submit(_invoke)
-        result = future.result(timeout=SPECIALIST_TIMEOUT_SECONDS)
-        for msg in reversed(result.get("messages", [])):
-            if isinstance(msg, AIMessage) and msg.content:
-                text = message_text(msg)
-                # A message carrying nothing but reasoning blocks is not an
-                # answer — keep walking back for one that is.
-                if text:
-                    return text
-        return "Analysis complete but no response generated."
+        return future.result(timeout=SPECIALIST_TIMEOUT_SECONDS)
     except FuturesTimeout:
         logger.error("Specialist %s timed out after %ds", specialist_name, SPECIALIST_TIMEOUT_SECONDS)
         return (
@@ -703,8 +782,15 @@ def _run_specialist(specialist_name: str, query: str, context: dict) -> str:
             "Falling back to a general analysis. Please try rephrasing your question."
         )
 
+@mlflow.trace(name="synthesize_response", span_type="LLM")
 def _synthesize_response(specialist_name: str, specialist_response: str, context: dict) -> str:
     """Reformat the specialist output to the SYNTHESIS_TEMPLATE structure.
+
+    Traced because this pass, when it runs, produces the text the manager
+    actually reads — including the `## Confidence` line. Untraced, the only
+    answer stored anywhere was the specialist's draft, so a trace could not
+    show what was shown on screen. The decorator records the return value, so
+    unlike the spans above this needs no explicit output call.
 
     The UI parses `## Root Cause`, `## Impact`, etc. headings to fold answers
     into expandable cards. Specialists don't always produce the right
@@ -734,10 +820,12 @@ def _synthesize_response(specialist_name: str, specialist_response: str, context
 
     try:
         response = llm.invoke([HumanMessage(content=synthesis_prompt)])
-        return message_text(response) or specialist_response
+        answer = message_text(response) or specialist_response
     except Exception:
         logger.exception("Synthesis failed, returning raw specialist response")
-        return specialist_response
+        answer = specialist_response
+    _tag_confidence(answer)
+    return answer
 
 def _should_skip_synthesis(specialist_name: str, specialist_response: str) -> bool:
     """Return True when the synthesis LLM call would waste tokens.
@@ -1002,33 +1090,6 @@ def invoke(
         "model_vendor": model_vendor,
         "response_time_ms": elapsed_ms,
         "conversation_id": conversation_id,
-    }
-
-
-@mlflow.trace(name="ask_line", span_type="CHAIN")
-def ask_line(question: str) -> dict:
-    """First-class "ask the line" data path.
-
-    Routes a free-form analytical question straight to Databricks Genie and
-    returns the grounded answer WITH provenance: the generated SQL and the
-    tables it touched. Unlike ``invoke`` (which runs a specialist LLM over the
-    live snapshot), this is for ad-hoc data questions — "what's the OEE trend
-    over the last 5 shifts?", "which machine had the most downtime this week?"
-    — where the operator wants Genie's SQL-backed numbers, not a narrative.
-
-    Returns a dict: ``{answer, sql, tables, data}`` on success, or
-    ``{answer: "", sql: None, tables: [], data: [], error: <msg>}`` on failure.
-    """
-    from agent_server.tools.genie_query import run_genie_query
-
-    result = run_genie_query(question)
-    if "error" in result:
-        return {"answer": "", "sql": None, "tables": [], "data": [], "error": result["error"]}
-    return {
-        "answer": result.get("answer", ""),
-        "sql": result.get("sql"),
-        "tables": result.get("tables", []),
-        "data": result.get("data", []),
     }
 
 

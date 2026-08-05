@@ -4,6 +4,98 @@ All notable changes to ProdLine CoPilot are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.5] - 2026-08-04
+
+### Added
+- **Prompts are versioned in Unity Catalog.** All eleven prompts the app sends
+  — eight specialist system prompts, the router's system and classification
+  prompts, and the synthesis template — are published to the MLflow Prompt
+  Registry as `<catalog>.<schema>.prompt_<slug>`, with an author, a commit
+  message and a `@production` alias. A wording change is now a version you can
+  diff and point a trace at, rather than a line in a Python file. `deploy.sh`
+  publishes on every deploy and `scripts/register_prompts.py` runs standalone.
+  Registration is idempotent: each prompt is compared against its latest
+  registered version and only rewritten when the text differs, because a
+  per-deploy run that always writes would bury the versions that mattered under
+  eleven identical ones. The app does **not** read prompts back — the constants
+  in `agent_server/prompts/` are still the runtime source of truth, so a
+  registration failure is non-fatal and leaves behaviour unchanged, and editing
+  a version in the UI changes nothing that runs. Specialists that own a
+  governed domain have `governed_domain_prompt(<domain>)` appended at
+  construction, which is deployment-specific and cannot be pinned; those
+  versions are tagged with the domain and the suffix so the difference reads as
+  intended rather than as a stale registry.
+
+### Fixed
+- **Traces recorded the question and not the answer.** Every specialist span
+  set its inputs and never its outputs, so the MLflow UI rendered an empty
+  "Model output" for each one and the traces could not be used for the thing
+  they exist for — judging answer quality. Spans now carry the answer text and
+  the self-reported confidence, and `synthesize_response` is traced too, so
+  what a trace stores is what the manager actually read rather than the
+  specialist's draft. Confidence is also promoted to a trace tag, which makes
+  hedged answers findable in bulk
+  (`mlflow traces search --filter-string "tag.confidence = 'LOW'"`) instead of
+  needing every trace opened by hand. A test walks the module's AST and fails
+  any manual `start_span` block that sets inputs without outputs, because the
+  original omission was invisible from outside the UI.
+- **The trace link in chat 404'd against a Unity Catalog-backed experiment.** A
+  UC trace is identified by its storage location — `trace:/<catalog>.<schema>.<prefix>/<hex>`
+  — and interpolating that whole string into the UI's trace route splits one
+  path segment into three, so the router matched nothing. The page rendered its
+  own 404 while the server still answered 200, which is why nothing server-side
+  reported it. Only the trailing hex now reaches the URL, and an id with
+  nothing usable in it falls back to the experiment's Traces tab rather than
+  building a link that ends in a bare slash. Classic `tr-<hex>` ids are
+  untouched.
+- **The unit suite no longer tries to export traces.** Tracing is disabled for
+  the session in `tests/conftest.py`, so tests stop emitting `Failed to send
+  trace` warnings and stop depending on network reachability.
+
+### Removed
+- **The "Ask the line" panel is gone, along with `/api/ask-line` and
+  `agent.ask_line`.** It sent free-form questions straight to a Genie space
+  configured over the "current" tables — `line_kpi`, `machine_state`,
+  `quality_checks` and friends — which are DDL that nothing writes: the
+  streaming pipeline fills the `*_bronze` and `gold_history_*` tables instead,
+  and the dashboard reads Lakebase. So the panel returned empty result sets to
+  questions the tab beside it was answering with live numbers, which is worse
+  than not offering the feature. The specialists reach Genie through the
+  governed per-domain tools and are unaffected; SQL provenance still appears
+  under chat answers. Bringing it back means pointing it at a Genie space over
+  tables that hold data.
+
+- **Spans stopped being dropped, because trace storage moved to Unity
+  Catalog.** A classic experiment uploads span payloads to
+  `<region>.storage.cloud.databricks.com`, and the Databricks Apps runtime gets
+  `Connection refused` from that host: trace metadata landed and every span was
+  discarded. Because export is async and non-fatal, nothing surfaced it — the
+  MLflow UI simply showed traces with no spans, which is how this survived
+  since 0.2.0. `scripts/deploy.sh` now provisions a purpose-made experiment
+  linked to a UC schema, where spans are written to Delta through the workspace
+  host the app already reaches for SQL and model serving.
+
+  It needs its own experiment rather than the bundle's because a UC trace
+  destination can only be linked to an experiment that holds **no traces**, and
+  the bundle's has been collecting them since the app first ran. That also
+  fixes the ordering: provisioning runs after the app service principal is
+  known, so it can be granted, and before the app deploy, because one written
+  trace makes an experiment unconvertible forever. Both orderings are pinned by
+  tests, since getting either wrong yields a successful deploy with silently
+  broken tracing.
+
+  Two things are worth knowing before changing any of this. A link is
+  permanent — `unset_experiment_trace_location` exists in MLflow but Databricks
+  rejects it, so an experiment linked wrongly is scrap and the only repair is a
+  new one. And `set_experiment_trace_location` is the wrong way to make the
+  link: it returns success and writes the storage-table tags while registering
+  no telemetry destination, which is what export actually routes through, so
+  the experiment reads as correctly configured and discards every span.
+  `mlflow.set_experiment(trace_location=UnityCatalog(...))` is used instead, and
+  the destination tag is verified afterwards rather than trusted — a link
+  without one fails the step and leaves the app config alone, and an experiment
+  already in that state is skipped rather than reused.
+
 ## [0.3.4] - 2026-08-04
 
 ### Added

@@ -18,7 +18,6 @@ import InventoryPanel from './components/InventoryPanel';
 import EventFeed from './components/EventFeed';
 import { isEventActive, buildResolvedTsByMachine } from './lib/eventFeedUtils';
 import ChatPanel from './components/ChatPanel';
-import AskLinePanel from './components/AskLinePanel';
 import AboutTab from './components/AboutTab';
 import MultiAITab from './components/MultiAITab';
 import MachineDetailCard from './components/MachineDetailCard';
@@ -805,9 +804,6 @@ function App() {
 
           <div className={path !== '/admin' && activeTab === 'alerts' ? '' : 'hidden'}>
             <div className="flex flex-col gap-3" style={{ height: 'calc(100vh - 140px)' }}>
-              <ErrorBoundary>
-                <AskLinePanel />
-              </ErrorBoundary>
               <div className="flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-3 gap-3">
                 <div className="min-h-0 overflow-hidden lg:col-span-1">
                   <ErrorBoundary>

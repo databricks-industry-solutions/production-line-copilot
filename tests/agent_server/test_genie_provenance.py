@@ -1,9 +1,12 @@
-"""Tests for the first-class "ask the line" Genie data path (Theme 3b).
+"""Tests for Genie SQL provenance — the tables behind an answer.
 
 Covers:
   * extract_tables() SQL provenance parsing (pure function).
   * genie_query returning a `tables` field alongside answer/sql/data.
-  * agent.ask_line() shaping the run_genie_query result (+ error passthrough).
+
+Provenance is what lets the chat answer say which tables a number came from
+(see tool_evidence.build_evidence), so it is worth pinning even though the
+parsing looks trivial.
 
 All external REST is mocked; no workspace connection required.
 """
@@ -56,21 +59,3 @@ class TestGenieTablesProvenance:
         monkeypatch.setattr(gq, "requests", _FakeRequests())
         r = _invoke(genie_query, question="What is the OEE trend?")
         assert r["tables"] == ["main.streaming.line_kpi"]
-
-
-class TestAskLine:
-    def test_shapes_success(self, monkeypatch):
-        monkeypatch.setattr(
-            gq, "run_genie_query",
-            lambda q: {"answer": "up", "sql": "SELECT 1 FROM t", "tables": ["t"], "data": [{"a": 1}]},
-        )
-        from agent_server.agent import ask_line
-        out = ask_line("What is the OEE trend over the last 5 shifts?")
-        assert out == {"answer": "up", "sql": "SELECT 1 FROM t", "tables": ["t"], "data": [{"a": 1}]}
-
-    def test_error_passthrough(self, monkeypatch):
-        monkeypatch.setattr(gq, "run_genie_query", lambda q: {"error": "Genie not configured"})
-        from agent_server.agent import ask_line
-        out = ask_line("some analytical question")
-        assert out["error"] == "Genie not configured"
-        assert out["answer"] == "" and out["sql"] is None and out["tables"] == [] and out["data"] == []

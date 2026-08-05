@@ -25,6 +25,18 @@ logger = logging.getLogger(__name__)
 # Databricks routes a single trace at /ml/experiments/<exp>/traces/<trace>.
 _TRACE_PATH = "{host}/ml/experiments/{experiment_id}/traces/{trace_id}"
 
+# Where to land when there is an experiment but no usable trace id. A valid page
+# one click from the trace beats a deep link that 404s.
+_TRACES_TAB = "{host}/ml/experiments/{experiment_id}/traces"
+
+# A Unity Catalog-backed trace is identified by its storage location rather than
+# a bare id: `trace:/<catalog>.<schema>.<prefix>/<hex>`. The UI route takes one
+# path segment, so interpolating that whole string splits it across three and
+# the router matches nothing — the page renders its own 404 while the server
+# still answers 200, which is why this could not be caught by checking status
+# codes. The UI wants the trailing hex on its own.
+_UC_TRACE_PREFIX = "trace:/"
+
 # Values the deploy templates ship before a real id is substituted in. Treated
 # as unset, because a link built from "SET_ME" is worse than no link: it looks
 # clickable and lands on a 404.
@@ -48,6 +60,19 @@ def workspace_host() -> str:
     return host.rstrip("/")
 
 
+def _ui_trace_id(trace_id: str) -> str:
+    """The id form the MLflow UI's trace route accepts.
+
+    Classic experiment ids (``tr-<hex>``) pass through untouched. Unity
+    Catalog ids carry their table location, which has to come off — see
+    ``_UC_TRACE_PREFIX``. Returns "" when nothing usable is left, so the caller
+    can fall back rather than build a link to a trailing slash.
+    """
+    if not trace_id.startswith(_UC_TRACE_PREFIX):
+        return trace_id
+    return trace_id.rsplit("/", 1)[-1].strip()
+
+
 def trace_url(trace_id: str | None) -> str | None:
     """Build the workspace URL for ``trace_id``, or None if we can't.
 
@@ -65,7 +90,10 @@ def trace_url(trace_id: str | None) -> str | None:
     experiment_id = _clean("MLFLOW_EXPERIMENT_ID")
     if not host or not experiment_id:
         return None
-    return _TRACE_PATH.format(host=host, experiment_id=experiment_id, trace_id=trace_id)
+    ui_id = _ui_trace_id(trace_id)
+    if not ui_id:
+        return _TRACES_TAB.format(host=host, experiment_id=experiment_id)
+    return _TRACE_PATH.format(host=host, experiment_id=experiment_id, trace_id=ui_id)
 
 
 def current_trace_url() -> str | None:

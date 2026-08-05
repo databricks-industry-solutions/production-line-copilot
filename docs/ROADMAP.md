@@ -11,7 +11,7 @@ Progress:
 - [x] Theme 2b: committed example bundle target; `bundle validate` passes on fresh clone
 - [x] Theme 2c: architecture diagram embedded in README
 - [x] Theme 3a: eval dataset grown (12 -> 33), forbidden-phrase scorer, orchestrator/specialist spans, docs/EVALUATION.md
-- [x] Theme 3b: first-class `ask_line` Genie path + `/api/ask-line` + AskLinePanel UI with SQL provenance + eval case
+- [x] Theme 3b: first-class `ask_line` Genie path + `/api/ask-line` + AskLinePanel UI with SQL provenance + eval case (since reverted — see Theme 3b below)
 - [x] Dev deploy + live smoke test: root/UI, `/healthz`, live SSE stream, `/api/sim/status`,
       `/api/ask-line` (Genie answer+SQL+tables), `/api/agent` (live OEE) all 200. Two runtime
       bugs found + fixed (Genie Conversation API endpoint; sim/status datetime) + idempotent
@@ -152,6 +152,15 @@ Acceptance: a user can ask an ad-hoc question (for example, "which machine had
 the most downtime this shift?") and get a correct, grounded answer with visible
 SQL, validated by eval cases.
 
+Outcome: shipped, then removed. The standalone panel asked its own Genie space
+directly, which pointed at the "current" UC tables (`line_kpi`, `machine_state`,
+and so on) — DDL that the streaming pipeline never writes, since it fills the
+`*_bronze` and `gold_history_*` tables instead. So the panel answered ad-hoc
+questions with empty result sets while the dashboard beside it showed live
+numbers from Lakebase. The specialists reach Genie through the governed
+per-domain tools and still do; only the standalone path is gone. Reinstating it
+means giving it a Genie space pointed at tables that actually hold data.
+
 ---
 
 ## Suggested sequencing
@@ -173,12 +182,34 @@ SQL, validated by eval cases.
   time). See `evaluations/alignment/README.md`.
 - **Production monitoring.** Register the eval scorers to run on sampled live app
   traces (not just the pre-deploy gate). Impact: Med. Effort: M.
-- **MLflow trace export from Apps compute (non-fatal).** The dev app logs repeated
-  `Connection refused` to `us-east-1.storage.cloud.databricks.com` when uploading
-  MLflow trace artifacts — traces don't persist and the retries add log noise.
-  App endpoints are unaffected (export is async). Investigate Apps egress / trace
-  destination config, or disable artifact upload for the app runtime. Impact: Low
-  (observability). Effort: S.
+- **~~MLflow trace export from Apps compute~~ — done.** The app could not reach
+  `us-east-1.storage.cloud.databricks.com`, so trace metadata landed and every
+  span was dropped. `scripts/deploy.sh` now provisions a Unity Catalog-backed
+  experiment (`scripts/provision_trace_storage.py`), which writes spans to Delta
+  through the workspace host the app already reaches. Applies to prod on its
+  next deploy; the pre-existing bundle experiment keeps its old traces and is
+  left in place, since an experiment that already holds traces cannot be
+  converted.
+- **Load prompts from the registry at runtime.** `scripts/register_prompts.py`
+  publishes them today, but the app still reads the constants in
+  `agent_server/prompts/`, so the registry is a record rather than a control
+  surface and traces carry no prompt version. The work is a loader that resolves
+  `<catalog>.<schema>.prompt_<slug>@production` with the code constant as
+  fallback, called from the specialist factories and from `_classify_intent` /
+  `_synthesize_response`. Two things to know before starting: specialists are
+  built once and cached for the process (`_get_specialists`), so this buys
+  version pinning and prompt/trace linkage but *not* hot-swap — a prompt change
+  still needs a restart; and the registered text for a governed-domain
+  specialist is missing the `governed_domain_prompt(<domain>)` suffix the
+  runtime appends, so the loader must keep appending it. Impact: Med.
+  Effort: S–M.
+- **Register the agent as an MLflow LoggedModel.** `mlflow.create_external_model(model_type="agent")`
+  plus `set_active_model` at startup is the intended path for an agent served by
+  its own app rather than Model Serving: traces attach to the model, so quality
+  can be compared across versions, and the model roster, prompt versions and git
+  SHA can be logged as params. Full pyfunc/`ChatAgent` packaging was considered
+  and rejected — a served copy would need its own Genie spaces, Lakebase and
+  warehouse wiring, duplicating the app. Impact: Med. Effort: S.
 - **Split `start_server.py` (2770 lines) into FastAPI routers.** Pure refactor;
   defer until live deploy/smoke-test is available to validate route behavior.
   Impact: Med (maintainability). Effort: M.

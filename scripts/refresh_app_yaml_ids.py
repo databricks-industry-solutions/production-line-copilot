@@ -96,6 +96,14 @@ def _patch_yaml(path: Path, env_to_id: dict[str, str]) -> int:
 
         - name: OPS_PRODUCER_JOB_ID
           value: '1234567890'
+
+    A block written as ``valueFrom: <resource>`` is converted to a literal
+    ``value:``. That form is how the committed templates bind an env var to a
+    bundle resource, and an env var we are given an explicit id for is one the
+    caller has decided not to take from the bundle — MLFLOW_EXPERIMENT_ID being
+    the case in point, since trace storage has to point at a purpose-made
+    experiment rather than the bundle's. Only env vars named in ``env_to_id``
+    are touched, so a template's other ``valueFrom`` bindings are left alone.
     """
     text = path.read_text(encoding="utf-8")
     lines = text.splitlines()
@@ -113,9 +121,10 @@ def _patch_yaml(path: Path, env_to_id: dict[str, str]) -> int:
             # Look for the next ``value:`` line (must be the matching one — same
             # block depth + 2 spaces). Don't peek further than 3 lines ahead.
             for j in range(i + 1, min(i + 4, len(lines))):
-                vmatch = re.match(r"^(\s+)value:\s+(.*)$", lines[j])
+                vmatch = re.match(r"^(\s+)value(?:From)?:\s+(.*)$", lines[j])
                 if vmatch:
-                    cur = vmatch.group(2).strip().strip("'\"")
+                    is_value_from = lines[j].lstrip().startswith("valueFrom:")
+                    cur = None if is_value_from else vmatch.group(2).strip().strip("'\"")
                     if cur != new_val:
                         out[-1:] = [line]
                         # write all intermediate lines, replace the value line

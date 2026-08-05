@@ -774,6 +774,30 @@ if echo "$REFRESH_OUT" | grep -qE '^Patched [1-9]'; then
   NEEDS_REDEPLOY=1
 fi
 
+# ── 4b-ii. Unity Catalog-backed trace storage ───────────────────────────
+# A classic experiment uploads span payloads to <region>.storage.cloud.databricks.com,
+# which the Apps runtime gets "Connection refused" from: trace metadata lands,
+# every span is dropped, and since export is async and non-fatal nothing says
+# so — the MLflow UI just shows traces with no spans. UC-backed traces write to
+# Delta through the workspace host the app already reaches.
+#
+# Ordering is load-bearing twice over. It runs AFTER 4/4b so the app SP exists
+# to be granted, and BEFORE the app deploy in step 5 because a UC destination
+# can only be linked to an experiment that holds no traces — once the app has
+# written one, that experiment can never be converted. It also writes
+# MLFLOW_EXPERIMENT_ID into app.<env>.local.yaml, so it has to land before the
+# yaml swap and the redeploy below pick the file up.
+#
+# Non-fatal: a failure costs observability, not a working app.
+echo "=== provision_trace_storage.py $ENV ==="
+TRACE_OUT=$("${PROJECT_PY[@]}" scripts/provision_trace_storage.py "$ENV" \
+  --settings "$ROOT_DIR/$PROJECT_SETTINGS_YAML" \
+  ${APP_SP_ID:+--app-sp "$APP_SP_ID"} 2>&1) || true
+echo "$TRACE_OUT"
+if echo "$TRACE_OUT" | grep -q 'MLFLOW_EXPERIMENT_ID updated'; then
+  NEEDS_REDEPLOY=1
+fi
+
 # ── 4c. Second bundle deploy (only if SP captured or IDs changed) ───────
 if [[ "$NEEDS_REDEPLOY" -eq 1 ]]; then
   echo "=== Re-deploy: app env / SP grants changed on first pass ==="
@@ -1119,8 +1143,8 @@ fi
 # ── 8b. Idempotent app-SP Genie grant (self-heal on every deploy) ───────
 # The Genie CAN_RUN grant in step 7a only runs when a NEW space is created
 # (fresh env). For an EXISTING space — the common case on code-only redeploys —
-# the app SP would otherwise never be added to the space ACL, so ``ask_line`` /
-# the Genie tool 404 (Genie returns 404, not 403, when the principal lacks
+# the app SP would otherwise never be added to the space ACL, so the Genie
+# tool 404s (Genie returns 404, not 403, when the principal lacks
 # access). PATCH is additive + idempotent, so re-applying it every deploy is
 # cheap and closes that gap.
 if [[ -n "${APP_SP_ID:-}" ]]; then
@@ -1133,6 +1157,30 @@ if [[ -n "${APP_SP_ID:-}" ]]; then
       && echo "  ok: CAN_RUN on Genie space $GENIE_ID_GRANT" \
       || echo "  WARN: could not grant app SP CAN_RUN on Genie space — grant manually." >&2
   fi
+fi
+
+# ── 8c. Publish prompts to the MLflow Prompt Registry (idempotent) ──────
+# Gives every prompt change a version, an author and a commit message, so a
+# shift in answer quality can be read against the wording that was live at the
+# time. The app does NOT load these back — the constants in
+# agent_server/prompts/ stay the runtime source of truth — so a failure here
+# leaves a deployed app that behaves identically, just with a stale registry.
+# Non-fatal for that reason: this must never be the thing that fails a deploy.
+# The script compares each prompt against its latest registered version and
+# only writes when the text differs, which is what keeps a per-deploy run from
+# burying real edits under identical versions.
+UC_CATALOG_PROMPTS=$(_profile_field uc_catalog)
+UC_SCHEMA_PROMPTS=$(_profile_field uc_schema)
+if [[ -n "$UC_CATALOG_PROMPTS" && "$UC_CATALOG_PROMPTS" != "SET_ME" && -n "$UC_SCHEMA_PROMPTS" ]]; then
+  echo "=== Publishing prompts to the MLflow Prompt Registry ($UC_CATALOG_PROMPTS.$UC_SCHEMA_PROMPTS) ==="
+  PROMPT_SHA=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)
+  DATABRICKS_CONFIG_PROFILE="$PROFILE" MLFLOW_TRACKING_URI=databricks \
+    "${PROJECT_PY[@]}" scripts/register_prompts.py \
+      --catalog "$UC_CATALOG_PROMPTS" --schema "$UC_SCHEMA_PROMPTS" \
+      --commit-message "deploy $ENV @ $PROMPT_SHA" \
+    || echo "  WARN: prompt registration failed — app is unaffected, registry may be stale." >&2
+else
+  echo "WARN: skipping prompt registration (catalog='$UC_CATALOG_PROMPTS', schema='$UC_SCHEMA_PROMPTS')." >&2
 fi
 
 echo

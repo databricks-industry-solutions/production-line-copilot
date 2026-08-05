@@ -141,9 +141,6 @@ const SPECIALIST_LABELS: Record<string, string> = {
 /**
  * The checkable half of a tool step: which governed space answered, which
  * tables were touched, how many rows came back, and the query itself.
- *
- * Styling mirrors AskLinePanel's provenance block so the same facts look the
- * same wherever the app shows them.
  */
 function EvidenceTrail({ evidence }: { evidence: ToolEvidence }) {
   const rows = rowSummary(evidence);

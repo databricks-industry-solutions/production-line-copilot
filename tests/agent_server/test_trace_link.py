@@ -56,6 +56,41 @@ class TestTheUrl:
         assert trace_url("tr-abc").startswith("http://localhost:8080/")
 
 
+class TestUnityCatalogTraceIds:
+    """UC-backed traces are identified by location, and the route is not.
+
+    Switching the app to a UC trace location changed the id from ``tr-<hex>``
+    to ``trace:/<catalog>.<schema>.<prefix>/<hex>``. Interpolated whole, its
+    slashes split one route segment into three and the UI renders a 404 —
+    while the server still answers 200, so nothing server-side reports it.
+    """
+
+    UC_ID = "trace:/main.mlflow_traces.prodline_traces/927f9737d4fcfdc18bdaed09cce01dae"
+
+    def test_only_the_trailing_hex_reaches_the_url(self, configured):
+        assert trace_url(self.UC_ID) == (
+            "https://example.cloud.databricks.com/ml/experiments/1234567890"
+            "/traces/927f9737d4fcfdc18bdaed09cce01dae"
+        )
+
+    def test_the_location_does_not_leak_into_the_path(self, configured):
+        """The bug precisely: extra segments below the trace route."""
+        url = trace_url(self.UC_ID)
+        assert "trace:/" not in url
+        assert url.count("/traces/") == 1
+        assert url.rsplit("/traces/", 1)[1].count("/") == 0
+
+    def test_classic_ids_are_untouched(self, configured):
+        """Prod still uses a classic experiment, so both forms must work."""
+        assert trace_url("tr-abc123").endswith("/traces/tr-abc123")
+
+    def test_an_id_with_nothing_after_the_location_falls_back_to_the_tab(self, configured):
+        """Better a valid list page than a link ending in a bare slash."""
+        assert trace_url("trace:/main.schema.prefix/") == (
+            "https://example.cloud.databricks.com/ml/experiments/1234567890/traces"
+        )
+
+
 class TestWhenThereIsNoLinkToGive:
     """None is the normal answer off-platform, not an error path."""
 

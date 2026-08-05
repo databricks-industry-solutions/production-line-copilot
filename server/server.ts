@@ -202,18 +202,6 @@ createApp({
         });
       });
 
-      // First-class "ask the line" data path: free-form analytical question →
-      // Genie, returning { answer, sql, tables, data } with SQL provenance for
-      // the UI. Genie polls up to 60s, so allow a generous timeout.
-      app.post('/api/ask-line', async (req, res) => {
-        await proxyToAgent(res, '/ask-line', {
-          method: 'POST',
-          body: req.body ?? {},
-          timeoutMs: 70000,
-          errorMessage: 'ask-line endpoint unavailable',
-        });
-      });
-
       app.post('/api/agent', async (req, res) => {
         try {
           const agentUrl = `http://localhost:${AGENT_PORT}/invocations`;

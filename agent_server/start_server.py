@@ -169,10 +169,6 @@ class InvocationBody(BaseModel):
     input: Optional[Union[List, str]] = None
 
 
-class AskLineBody(BaseModel):
-    question: str = Field(default="", max_length=2000)
-
-
 class IncidentTriggerBody(BaseModel):
     shift_id: str = Field(default="shift_1", max_length=50)
     scenario_id: str = Field(max_length=50)
@@ -2283,31 +2279,6 @@ async def invocations(body: InvocationBody):
     except Exception as e:
         logger.exception("Agent invocation failed")
         return JSONResponse({"error": str(e), "content": f"Sorry, I encountered an error: {e}"}, status_code=500)
-
-
-@app.post("/ask-line")
-async def ask_line_endpoint(body: AskLineBody):
-    """First-class "ask the line" data path — routes a free-form analytical
-    question straight to Genie and returns the answer plus provenance (the
-    generated SQL and the tables it touched). See agent.ask_line.
-    """
-    question = (body.question or "").strip()
-    if len(question) < 5:
-        return JSONResponse(
-            {"error": "Please provide a meaningful question (at least 5 characters)."},
-            status_code=400,
-        )
-    try:
-        from agent_server.agent import ask_line
-        result = ask_line(question)
-        _live_record("agent_invocations")
-        return JSONResponse(result)
-    except Exception as e:  # noqa: BLE001
-        logger.exception("ask-line failed")
-        return JSONResponse(
-            {"error": str(e), "answer": "", "sql": None, "tables": [], "data": []},
-            status_code=500,
-        )
 
 
 @app.post("/invocations/stream")

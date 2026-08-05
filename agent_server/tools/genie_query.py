@@ -95,8 +95,7 @@ def _poll_message(headers: dict, host: str, space_id: str, conv_id: str, msg_id:
 def run_genie_query(question: str, space_id: str | None = None) -> dict:
     """Core Genie call. Returns a dict with 'answer', 'sql', 'tables', 'data'
     (or 'error'). Shared by the ``genie_query`` LangChain tool (used inside
-    specialists) and the first-class ``ask_line`` path (direct data Q&A with
-    provenance surfaced in the UI).
+    specialists) and the governed per-domain tools below.
 
     ``space_id`` overrides the default streaming space, which is how the
     governed per-domain tools in ``governed_domain_query`` point the same

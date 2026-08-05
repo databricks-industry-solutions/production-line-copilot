@@ -83,3 +83,61 @@ def test_newly_created_domain_spaces_trigger_a_redeploy(lines):
     block = text.split('if [[ "$DOMAIN_SPACES_CREATED" == "1" ]]; then', 1)
     assert len(block) == 2, "no redeploy guarded on DOMAIN_SPACES_CREATED"
     assert "databricks apps deploy" in block[1]
+
+
+def test_trace_storage_is_provisioned_before_the_app_ever_runs(lines):
+    """A UC trace destination only attaches to an experiment with no traces.
+
+    Once the app has written a single trace to an experiment, that experiment
+    can never be converted — the API rejects it outright. So provisioning has
+    to happen before the app deploy, not merely somewhere in the script. Get
+    this backwards and the deploy still succeeds while tracing is quietly
+    broken for the life of the environment.
+    """
+    code = _code_lines(lines)
+    provision = [n for n, t in code if "provision_trace_storage.py" in t]
+    assert provision, "no provision_trace_storage.py call found in deploy.sh"
+
+    app_deploys = [n for n, t in code if "databricks apps deploy" in t]
+    assert app_deploys, "no app deploy found — has deploy.sh moved?"
+    assert min(provision) < min(app_deploys), (
+        f"provision_trace_storage.py runs at line {min(provision)}, after the "
+        f"app deploy at {min(app_deploys)}; the experiment will already hold "
+        "traces and can never be linked to Unity Catalog"
+    )
+
+
+def test_trace_storage_runs_after_the_app_sp_is_known(lines):
+    """Without the SP there is nobody to grant, and the app cannot write."""
+    code = _code_lines(lines)
+    provision = min(n for n, t in code if "provision_trace_storage.py" in t)
+    captures = [n for n, t in code if "APP_SP_ID=" in t]
+    assert captures and min(captures) < provision, (
+        "provision_trace_storage.py runs before APP_SP_ID is captured, so the "
+        "trace tables are created with no grant to the app"
+    )
+
+
+def test_a_new_experiment_id_triggers_a_redeploy(lines):
+    """The id lands in app.<env>.local.yaml, which only ships on a deploy."""
+    text = "\n".join(lines)
+    block = text.split("provision_trace_storage.py", 1)[1][:600]
+    assert "MLFLOW_EXPERIMENT_ID updated" in block and "NEEDS_REDEPLOY=1" in block
+
+
+def test_steps_needing_project_deps_use_the_project_interpreter(lines):
+    """System python3 has neither mlflow nor the SDK.
+
+    Both of these steps are deliberately non-fatal, so calling them with the
+    wrong interpreter does not fail the deploy — it prints a warning in a few
+    hundred lines of output and moves on, leaving prompts unpublished and trace
+    storage unprovisioned. That is how the first run of this step failed.
+    """
+    for script in ("register_prompts.py", "provision_trace_storage.py"):
+        calls = [t for _, t in _code_lines(lines) if script in t and "echo" not in t]
+        assert calls, f"{script} is not called by deploy.sh"
+        for call in calls:
+            assert "PROJECT_PY" in call, (
+                f"{script} is invoked with the system interpreter ({call!r}); "
+                "it needs the project venv, which deploy.sh exposes as PROJECT_PY"
+            )
