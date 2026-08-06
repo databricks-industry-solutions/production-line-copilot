@@ -21,7 +21,7 @@ from agent_server.prompts.catalog import BY_SLUG, CATALOG, NAME_PREFIX, uc_name
 PROMPTS_DIR = Path(__file__).resolve().parents[2] / "agent_server" / "prompts"
 
 # Modules that hold no prompt of their own.
-_NOT_PROMPTS = {"__init__", "catalog"}
+_NOT_PROMPTS = {"__init__", "catalog", "loader"}
 
 # Fragments composed into other prompts at import time rather than sent on their
 # own. They reach the registry inside the specialist prompts that embed them.
@@ -30,6 +30,7 @@ _FRAGMENTS = {
     "GOVERNED_MODEL_NOTE",
     "RESPONSE_STRUCTURE",
     "LIVE_QUALITY_SCHEMA",
+    "LIVE_DATA_TABLES",
 }
 
 
@@ -80,6 +81,64 @@ class TestCompleteness:
     def test_slugs_are_unique(self):
         slugs = [spec.slug for spec in CATALOG]
         assert len(slugs) == len(set(slugs))
+
+
+# A system prompt written inline is invisible to the completeness test above,
+# which can only see the prompts package. That is not hypothetical: the
+# "general" route's prompt sat in agent.py for the whole life of the registry
+# work, so the one route with no tools — and therefore the one most dependent
+# on its prompt — was also the one route whose prompt had no version behind it.
+AGENT_SERVER = Path(__file__).resolve().parents[2] / "agent_server"
+
+# Prompt text is long. A short literal is a role name or a separator, not a
+# prompt, and failing those would only teach people to route around the test.
+_LITERAL_BUDGET = 40
+
+
+def _literal_chars(node: ast.AST) -> int:
+    """Characters of string literal inside ``node``, f-string segments included."""
+    return sum(
+        len(sub.value)
+        for sub in ast.walk(node)
+        if isinstance(sub, ast.Constant) and isinstance(sub.value, str)
+    )
+
+
+class TestNoPromptIsBuiltOutsideThePackage:
+    def test_system_messages_are_composed_from_catalogued_constants(self):
+        """``SystemMessage(content=...)`` must reference a prompt, not inline one.
+
+        Passing a name, an attribute, or a ``.format()`` call is fine — that
+        text lives in the prompts package and the completeness test can see it.
+        A literal or an f-string is a prompt that only exists at the call site.
+        """
+        offenders = []
+        for path in sorted(AGENT_SERVER.rglob("*.py")):
+            if PROMPTS_DIR in path.parents:
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+                if name != "SystemMessage":
+                    continue
+                content = next(
+                    (kw.value for kw in node.keywords if kw.arg == "content"),
+                    node.args[0] if node.args else None,
+                )
+                if content is None:
+                    continue
+                if _literal_chars(content) >= _LITERAL_BUDGET:
+                    rel = path.relative_to(AGENT_SERVER.parent)
+                    offenders.append(f"{rel}:{node.lineno}")
+
+        assert not offenders, (
+            "system prompts built from literals outside agent_server/prompts — "
+            "they cannot be registered, versioned, or diffed against a trace: "
+            f"{offenders}"
+        )
 
 
 class TestBraceConversion:

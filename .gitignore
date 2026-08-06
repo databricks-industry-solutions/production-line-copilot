@@ -68,3 +68,14 @@ docs/ai/
 # Local one-off dev/media helper scripts (not part of the shipped tooling).
 scripts/patch_prodline_film.py
 scripts/_dedash.py
+
+# Internal code-audit reports. Working notes against a specific commit; the
+# fixes they prompted live in the code and CHANGELOG, which is what publishes.
+.polly/
+
+# Internal sales/demo collateral: the one-slide summary and the app screenshots
+# it embeds. Nothing in the product references them — they exist to be dropped
+# into a deck — and a solution accelerator should not ship someone's slide.
+# The film under docs/media/ is different: the README links it.
+docs/media/demo_slide.html
+docs/media/slide_*.png

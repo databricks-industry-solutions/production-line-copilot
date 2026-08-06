@@ -39,7 +39,7 @@
       "name": "qc_failures_24h",
       "displayName": "QC failures (last 24h)",
       "queryLines": [
-        "SELECT timestamp AS ts, machine_id, parameter, value, spec_min, spec_max, result FROM {{UC_CATALOG}}.{{UC_SCHEMA}}.quality_checks WHERE result = 'FAIL' AND timestamp >= dateadd(hour, -24, current_timestamp()) ORDER BY timestamp DESC LIMIT 50"
+        "SELECT timestamp AS ts, machine_id, parameter, value, spec_min, spec_max, result FROM {{UC_CATALOG}}.{{UC_SCHEMA}}.quality_checks_bronze WHERE lower(result) = 'fail' AND timestamp >= dateadd(hour, -24, current_timestamp()) ORDER BY timestamp DESC LIMIT 50"
       ]
     }
   ],
@@ -348,7 +348,7 @@
             "name": "notes",
             "multilineTextboxSpec": {
               "lines": [
-                "**Pass rate** = (bronze rows − rejected rows) / bronze rows in the last 24h.\n\n**Rejected rows** are written to `quality_rejects` by the `streaming_quality_sync` RTM job when a row fails one of the QC predicates (e.g. `valid_status`, `valid_speed`, `non_negative_qty`).\n\n**Lag (min)** = `current_time − MAX(latest bronze ts)`. A growing lag indicates the producer or Zerobus is behind.\n\nSwitch to **QC failures** for the producer-emitted process QC results (`quality_checks` table)."
+                "**Pass rate** = (bronze rows − rejected rows) / bronze rows in the last 24h.\n\n**Rejected rows** are written to `quality_rejects` by the `streaming_quality_sync` RTM job when a row fails one of the QC predicates (e.g. `valid_status`, `valid_speed`, `non_negative_qty`).\n\n**Lag (min)** = `current_time − MAX(latest bronze ts)`. A growing lag indicates the producer or Zerobus is behind.\n\nSwitch to **QC failures** for the producer-emitted process QC results (`quality_checks_bronze` table)."
               ]
             }
           },
@@ -374,7 +374,7 @@
           "widget": {
             "name": "qc-subtitle",
             "multilineTextboxSpec": {
-              "lines": ["Inline quality-check failures from `quality_checks` (top 50)."]
+              "lines": ["Inline quality-check failures from `quality_checks_bronze` (top 50)."]
             }
           },
           "position": { "x": 0, "y": 1, "width": 6, "height": 1 }

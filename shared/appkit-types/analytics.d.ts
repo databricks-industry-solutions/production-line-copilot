@@ -13,14 +13,6 @@ declare module "@databricks/appkit-ui/react" {
         };
         result: unknown;
       };
-    consumption_rate: {
-        name: "consumption_rate";
-        parameters: {
-          /** any - use sql.*() */
-          shift_id: SQLTypeMarker;
-        };
-        result: unknown;
-      };
     events: {
         name: "events";
         parameters: {
@@ -55,16 +47,6 @@ declare module "@databricks/appkit-ui/react" {
         parameters: {
           /** any - use sql.*() */
           shift_id: SQLTypeMarker;
-        };
-        result: unknown;
-      };
-    machine_detail: {
-        name: "machine_detail";
-        parameters: {
-          /** any - use sql.*() */
-          shift_id: SQLTypeMarker;
-          /** any - use sql.*() */
-          machine_id: SQLTypeMarker;
         };
         result: unknown;
       };

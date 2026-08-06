@@ -27,7 +27,7 @@ const TOOLS: { id: string; name: string; icon: string; desc: string; platform?: 
     id: 'genie_query',
     name: 'Line Ops Genie',
     icon: '✨',
-    desc: 'Natural language questions against the curated space over the live streaming tables — the shift as it is happening. Broader than a governed domain by design: 14 tables behind a free-form surface, where the governed model splits along the schemas its grants follow. Carried by the three specialists that reason across a whole shift, and by Ask the line.',
+    desc: 'Natural language questions against the curated space over the live streaming tables — the shift as it is happening. Broader than a governed domain by design: 14 tables behind a free-form surface, where the governed model splits along the schemas its grants follow. Carried by the three specialists that reason across a whole shift.',
     platform: 'AI/BI Genie',
   },
   {

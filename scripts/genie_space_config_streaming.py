@@ -4,11 +4,11 @@ The streaming workspace runs the LIVE streaming demo, whose UC schema
 (``<your_catalog>.line_manager_streaming``) is structurally different from
 the static seed schema used in the seed-schema (demo workspace) path:
 
-  * OEE lives in the streaming ``line_kpi`` table (one row per second), not in
+  * OEE lives in the streaming ``gold_history_line_kpi`` table (one row per second), not in
     a pre-aggregated ``oee_gold`` table. Each metric (``oee_to_now``,
     ``availability_to_now``, ``performance_to_now``, ``quality_to_now``) is
     already a percentage 0-100, so DO NOT multiply by 100.
-  * Per-machine state lives in the streaming ``machine_state`` table — many
+  * Per-machine state lives in the streaming ``gold_history_machine_state`` table — many
     rows per machine over time. To get the *current* state you need
     ``ROW_NUMBER() OVER (PARTITION BY machine_id ORDER BY ts DESC)``.
   * There is **no** ``shift_crew``, ``cip_schedule``, ``consumption_log``, or
@@ -73,7 +73,7 @@ TEMPLATE_FQ_PREFIX = "__CAT__.__SCH__"
 
 tables = [
     {
-        "identifier": f"{TEMPLATE_FQ_PREFIX}.line_kpi",
+        "identifier": f"{TEMPLATE_FQ_PREFIX}.gold_history_line_kpi",
         "description": [
             "Streaming roll-up KPI table — one row per second per shift_id. "
             "Latest row IS the current state; older rows are the historical "
@@ -81,13 +81,13 @@ tables = [
             "ROW_NUMBER() OVER (PARTITION BY shift_id ORDER BY ts DESC)."
         ],
         "column_configs": [
-            {"column_name": "shift_id", "description": ["Shift identifier. Use 'live' or whatever the in-app simulator emits (e.g. 'shift_1', 'shift_1_dev', 'shift_1_west')."]},
+            {"column_name": "shift_id", "description": ["Shift identifier as written by the running line, e.g. 'shift_1_dev' in dev and 'shift_1' in prod. There is no 'live' shift. When in doubt do not filter on it; bound on ts instead."]},
             {"column_name": "ts", "description": ["UTC timestamp the KPI row was emitted (~1 row per second)."]},
             {"column_name": "machines_running", "description": ["Count of machines currently in 'running' status."]},
             {"column_name": "machines_stopped", "description": ["Count of machines currently in 'stopped' status (unplanned downtime)."]},
             {"column_name": "machines_degraded", "description": ["Count of machines in 'degraded' status (running below ideal speed)."]},
             {"column_name": "machines_starved", "description": ["Count of machines starved by upstream stoppage."]},
-            {"column_name": "total_throughput", "description": ["Aggregate cases per minute being produced right now."]},
+            {"column_name": "total_throughput", "description": ["Line output rate right now, in bottle-equivalents per minute, measured at the last station. This is a series line, so it is NOT the sum of the per-machine rates in machine_state - every bottle passes through all 19 machines. Divide by 24 for cases per minute."]},
             {"column_name": "avg_speed_pct", "description": ["Average speed percentage across all machines, 0-100."]},
             {"column_name": "availability_to_now", "description": ["Availability % from start of shift, 0-100. Already a percentage; DO NOT multiply by 100."]},
             {"column_name": "performance_to_now", "description": ["Performance % from start of shift, 0-100. Already a percentage."]},
@@ -97,7 +97,7 @@ tables = [
         ],
     },
     {
-        "identifier": f"{TEMPLATE_FQ_PREFIX}.machine_state",
+        "identifier": f"{TEMPLATE_FQ_PREFIX}.gold_history_machine_state",
         "description": [
             "Streaming per-machine state, ~1 row per machine per second. To get "
             "the CURRENT status of each machine, take the latest row per "
@@ -108,18 +108,22 @@ tables = [
             {"column_name": "shift_id", "description": ["Shift identifier."]},
             {"column_name": "machine_id", "description": ["Machine identifier (FILLER, CAPPER, etc.)."]},
             {"column_name": "ts", "description": ["UTC snapshot timestamp."]},
-            {"column_name": "status", "description": ["One of: running, stopped, degraded, starved, idle."], "synonyms": ["state"]},
-            {"column_name": "throughput_per_min", "description": ["Cases produced by this machine in the most recent minute."]},
+            {"column_name": "status", "description": ["One of: running, blocked, starved, degraded, stopped (lowercase)."], "synonyms": ["state"]},
+            {"column_name": "throughput_per_min", "description": ["Bottle-equivalents this machine passed in the most recent minute (~300 when healthy). Divide by 24 for cases/min. Not cases."]},
             {"column_name": "speed_pct", "description": ["Current speed as percentage of nominal capacity, 0-100."]},
             {"column_name": "alarm_count", "description": ["Active alarms on this machine."]},
         ],
     },
     {
-        "identifier": f"{TEMPLATE_FQ_PREFIX}.event_log",
+        "identifier": f"{TEMPLATE_FQ_PREFIX}.gold_history_event_log",
         "description": [
-            "Incidents and notable events on the line. Rows with "
-            "timestamp_end IS NULL are STILL OPEN at the time of the query — "
-            "those are carryover candidates at shift handover."
+            "Incidents and notable events on the line. This log is APPEND-ONLY: "
+            "resolving an incident appends a separate row with "
+            "event_type = 'resolved' rather than updating the original, so the "
+            "original keeps timestamp_end IS NULL forever. Do NOT treat "
+            "timestamp_end IS NULL as still open — that counts every incident of "
+            "the whole shift. An event is still open only if no 'resolved' row "
+            "exists for the same machine at or after its timestamp_start."
         ],
         "column_configs": [
             {"column_name": "event_id", "description": ["Unique event identifier."]},
@@ -133,8 +137,6 @@ tables = [
             {"column_name": "root_cause", "description": ["Short root-cause tag (e.g. bearing_failure, low_co2)."]},
             {"column_name": "description", "description": ["Long-form description of the event."]},
             {"column_name": "corrective_action", "description": ["What the operator did to resolve it."]},
-            {"column_name": "resolution_minutes", "description": ["Minutes from start to resolution."]},
-            {"column_name": "outcome_oee_impact", "description": ["OEE percentage points the event cost (e.g. -3.2 means a 3.2pp drop)."]},
         ],
     },
     {
@@ -146,14 +148,14 @@ tables = [
             {"column_name": "on_hand_qty", "description": ["Current on-hand quantity."]},
             {"column_name": "safety_stock", "description": ["Minimum quantity before LOW alert fires."]},
             {"column_name": "reorder_point", "description": ["Quantity at which a reorder must be triggered."]},
-            {"column_name": "status", "description": ["OK or LOW. LOW = below safety_stock and operator action required."]},
+            {"column_name": "status", "description": ["OK | LOW | CRITICAL, uppercase. CRITICAL = at or below safety_stock; LOW = between safety_stock and reorder_point; OK = above reorder_point."]},
             {"column_name": "consumption_rate_per_hour", "description": ["Estimated consumption rate based on current line speed."]},
             {"column_name": "feeds_machine_id", "description": ["Machine that consumes this material."]},
             {"column_name": "ts", "description": ["UTC snapshot timestamp."]},
         ],
     },
     {
-        "identifier": f"{TEMPLATE_FQ_PREFIX}.quality_checks",
+        "identifier": f"{TEMPLATE_FQ_PREFIX}.quality_checks_bronze",
         "description": ["Quality samples taken throughout the shift."],
         "column_configs": [
             {"column_name": "check_id", "description": ["Sample identifier."]},
@@ -164,7 +166,7 @@ tables = [
             {"column_name": "value", "description": ["Measured value."]},
             {"column_name": "spec_min", "description": ["Lower spec limit."]},
             {"column_name": "spec_max", "description": ["Upper spec limit."]},
-            {"column_name": "result", "description": ["OK or NOK (not OK = quality reject)."]},
+            {"column_name": "result", "description": ["'pass' or 'fail' (lowercase). A 'fail' row is a quality reject."]},
         ],
     },
     {
@@ -193,7 +195,7 @@ tables = [
             "not this table."
         ],
         "column_configs": [
-            {"column_name": "shift_id", "description": ["Shift identifier (e.g. 'live', 'shift_1', 'shift_1_dev')."]},
+            {"column_name": "shift_id", "description": ["Shift identifier as written by the running line (e.g. 'shift_1_dev'). There is no 'live' shift."]},
             {"column_name": "scenario_name", "description": ["Human-readable scenario name."]},
             {"column_name": "scenario_type", "description": ["E.g. realtime, replay, what-if."]},
             {"column_name": "shift_start", "description": ["Shift start as ISO-8601 string."]},
@@ -209,7 +211,7 @@ tables = [
             {"column_name": "machine_name", "description": ["Human-readable name."]},
             {"column_name": "machine_type", "description": ["Functional type (filler, capper, depalletizer, ...)."]},
             {"column_name": "line_position", "description": ["Position in the line, 1 = upstream."]},
-            {"column_name": "nominal_capacity", "description": ["Rated cases per minute."]},
+            {"column_name": "nominal_capacity", "description": ["Rated bottle-equivalents per minute (420 for most machines). The case packer's 17.5 cases/min is scaled to the same bottle basis so it does not appear to throttle the line."]},
             {"column_name": "zone", "description": ["Physical zone of the line."]},
             {"column_name": "manufacturer", "description": ["OEM."]},
         ],
@@ -217,21 +219,21 @@ tables = [
     {
         "identifier": f"{TEMPLATE_FQ_PREFIX}.kpi_recommendations",
         "description": [
-            "Rule-based recommendations the agent surfaces when KPIs cross "
-            "thresholds. No shift_id column — these are static rules."
+            "Twelve static coaching recommendations. Not alerts and not tickets: "
+            "they are always present, have no shift_id, and none of them opens "
+            "or closes. Nothing here is triggered by a threshold."
         ],
         "column_configs": [
-            {"column_name": "kpi_metric", "description": ["Metric the rule watches (oee_to_now, machines_stopped, ...)."]},
-            {"column_name": "condition_type", "description": ["below | above | equals."]},
-            {"column_name": "threshold_value", "description": ["Threshold the metric is compared against."]},
-            {"column_name": "severity", "description": ["info | minor | major | critical."]},
-            {"column_name": "recommendation", "description": ["Action text to show the line manager."]},
-            {"column_name": "expected_impact", "description": ["Expected OEE / throughput / cost impact text."]},
-            {"column_name": "category", "description": ["Recommendation category (downtime, quality, supply_chain, etc.)."]},
+            {"column_name": "recommendation_id", "description": ["Stable identifier (R001 ... R012)."]},
+            {"column_name": "category", "description": ["cost | quality | throughput | maintenance and similar."]},
+            {"column_name": "title", "description": ["Short name of the recommendation."]},
+            {"column_name": "description", "description": ["The recommended action, in full."]},
+            {"column_name": "priority", "description": ["high | medium | low. There is no severity column."]},
+            {"column_name": "estimated_impact", "description": ["Expected effect as text, e.g. '+3% OEE'."]},
         ],
     },
     {
-        "identifier": f"{TEMPLATE_FQ_PREFIX}.telemetry",
+        "identifier": f"{TEMPLATE_FQ_PREFIX}.telemetry_bronze",
         "description": [
             "Long-form per-sensor telemetry (one row per sensor per timestamp). "
             "Heavy table — always filter by shift_id and time window when joining."
@@ -256,8 +258,8 @@ tables = [
             {"column_name": "assigned_machine", "description": ["Primary machine_id this operator covers this shift."]},
             {"column_name": "operator_id", "description": ["Stable operator identifier (e.g. OP001)."]},
             {"column_name": "operator_name", "description": ["Full name of the operator."]},
-            {"column_name": "role", "description": ["operator | lead | maintenance | quality | supervisor."]},
-            {"column_name": "shift_id", "description": ["Shift identifier. Matches event_log / line_kpi / machine_state shift_id."]},
+            {"column_name": "role", "description": ["operator | mechanic | qa | supervisor. There is no 'lead', 'maintenance' or 'quality' role — filtering for those returns nothing."]},
+            {"column_name": "shift_id", "description": ["Shift identifier. Matches gold_history_event_log / gold_history_line_kpi / gold_history_machine_state shift_id."]},
             {"column_name": "skill_level", "description": ["1-5 skill rating (5 = expert)."]},
             {"column_name": "skills", "description": ["Comma-separated machine_ids the operator is qualified on."]},
             {"column_name": "status", "description": ["present | absent | late. Drives 'crew coverage' callouts in pre-shift briefings."]},
@@ -266,9 +268,14 @@ tables = [
     {
         "identifier": f"{TEMPLATE_FQ_PREFIX}.production_schedule",
         "description": [
-            "Planned production per shift — one row per shift_id with SKU, "
-            "planned_cases, actual_cases, ideal_rate_bpm, time window and "
-            "status. The 'plan' the briefing compares cumulative output against."
+            "Planned production per shift with SKU, planned_cases, actual_cases, "
+            "ideal_rate_bpm, time window and status. The 'plan' the briefing "
+            "compares cumulative output against. A shift can have MORE THAN ONE "
+            "ROW: a changeover segment carries planned_cases = 0 and status = "
+            "'changeover', and the production segment follows it. For the "
+            "shift's target, SUM(planned_cases) or take the row with the "
+            "largest planned_cases — never an arbitrary single row, or you get "
+            "the changeover's zero."
         ],
         "column_configs": [
             {"column_name": "actual_cases", "description": ["Cases actually produced (post-shift). 0 / NULL pre-shift."]},
@@ -340,13 +347,13 @@ sample_questions = [
     {"id": "a2000000000000000000000000000003", "question": ["Wrap up this shift"]},
     {"id": "a2000000000000000000000000000004", "question": ["What's carrying over?"]},
     # ── Operational drill-downs ──
-    {"id": "a2000000000000000000000000000010", "question": ["Who is on shift_1 today?"]},
+    {"id": "a2000000000000000000000000000010", "question": ["Who is on __SHIFT__ today?"]},
     {"id": "a2000000000000000000000000000011", "question": ["What CIP windows are scheduled this shift?"]},
-    {"id": "a2000000000000000000000000000012", "question": ["What is the latest OEE for shift_1 right now?"]},
+    {"id": "a2000000000000000000000000000012", "question": ["What is the latest OEE for __SHIFT__ right now?"]},
     {"id": "a2000000000000000000000000000013", "question": ["Which machines are stopped or degraded right now?"]},
-    {"id": "a2000000000000000000000000000014", "question": ["Show the top 5 longest events on shift_1 so far"]},
+    {"id": "a2000000000000000000000000000014", "question": ["Show the top 5 longest events on __SHIFT__ so far"]},
     {"id": "a2000000000000000000000000000015", "question": ["Which materials are below safety stock right now?"]},
-    {"id": "a2000000000000000000000000000016", "question": ["What is the quality reject rate per machine on shift_1?"]},
+    {"id": "a2000000000000000000000000000016", "question": ["What is the quality reject rate per machine on __SHIFT__?"]},
     {"id": "a2000000000000000000000000000017", "question": ["Which PMs are overdue or due in the next 8 hours?"]},
     # ── Ad-hoc analytics (the "ask the line" data path: trends & comparisons) ──
     {"id": "a2000000000000000000000000000020", "question": ["What is the OEE trend over the last 5 shifts?"]},
@@ -360,11 +367,11 @@ sample_questions = [
 example_question_sqls = [
     {
         "id": "c2000000000000000000000000000001",
-        "question": ["What is the latest OEE for shift_1 right now?"],
+        "question": ["What is the latest OEE for __SHIFT__ right now?"],
         "sql": [
             "WITH latest AS (\n",
             "  SELECT *, ROW_NUMBER() OVER (PARTITION BY shift_id ORDER BY ts DESC) AS rn\n",
-            "  FROM __CAT__.__SCH__.line_kpi\n",
+            "  FROM __CAT__.__SCH__.gold_history_line_kpi\n",
             "  WHERE shift_id = :shift_id\n",
             ")\n",
             "SELECT shift_id,\n",
@@ -377,9 +384,9 @@ example_question_sqls = [
             "  cumulative_cases, ts\n",
             "FROM latest WHERE rn = 1"
         ],
-        "parameters": [{"name": "shift_id", "type_hint": "STRING", "description": ["The shift to query (e.g. live, shift_1, shift_1_dev). Default: live."], "default_value": {"values": ["shift_1"]}}],
+        "parameters": [{"name": "shift_id", "type_hint": "STRING", "description": ["The shift to query. Default: __SHIFT__, the shift this environment's producer writes. There is no 'live' shift."], "default_value": {"values": ["__SHIFT__"]}}],
         "usage_guidance": [
-            "Use for any 'right now' / 'latest' OEE question. The line_kpi table emits one row per second; ",
+            "Use for any 'right now' / 'latest' OEE question. The gold_history_line_kpi table emits one row per second; ",
             "ROW_NUMBER() picks the most recent. Columns are already 0-100 percentages — DO NOT multiply by 100."
         ],
     },
@@ -389,7 +396,7 @@ example_question_sqls = [
         "sql": [
             "WITH latest AS (\n",
             "  SELECT *, ROW_NUMBER() OVER (PARTITION BY machine_id ORDER BY ts DESC) AS rn\n",
-            "  FROM __CAT__.__SCH__.machine_state\n",
+            "  FROM __CAT__.__SCH__.gold_history_machine_state\n",
             "  WHERE shift_id = :shift_id\n",
             ")\n",
             "SELECT machine_id, status, ROUND(speed_pct, 1) AS speed_pct,\n",
@@ -398,7 +405,7 @@ example_question_sqls = [
             "WHERE rn = 1 AND status IN ('stopped', 'degraded', 'starved')\n",
             "ORDER BY CASE status WHEN 'stopped' THEN 1 WHEN 'degraded' THEN 2 ELSE 3 END, machine_id"
         ],
-        "parameters": [{"name": "shift_id", "type_hint": "STRING", "description": ["The shift to query (e.g. live, shift_1, shift_1_dev). Default: live."], "default_value": {"values": ["shift_1"]}}],
+        "parameters": [{"name": "shift_id", "type_hint": "STRING", "description": ["The shift to query. Default: __SHIFT__, the shift this environment's producer writes. There is no 'live' shift."], "default_value": {"values": ["__SHIFT__"]}}],
     },
     {
         "id": "c2000000000000000000000000000003",
@@ -407,13 +414,13 @@ example_question_sqls = [
             "SELECT event_id, machine_id, event_type, severity,\n",
             "  ROUND(duration_minutes, 1) AS duration_min,\n",
             "  root_cause, description,\n",
-            "  CASE WHEN timestamp_end IS NULL THEN 'OPEN' ELSE 'closed' END AS state\n",
-            "FROM __CAT__.__SCH__.event_log\n",
+            "  CASE WHEN timestamp_end IS NULL AND event_type <> 'resolved' THEN 'OPEN' ELSE 'closed' END AS state\n",
+            "FROM __CAT__.__SCH__.gold_history_event_log\n",
             "WHERE shift_id = :shift_id\n",
             "ORDER BY duration_minutes DESC NULLS LAST\n",
             "LIMIT 5"
         ],
-        "parameters": [{"name": "shift_id", "type_hint": "STRING", "description": ["The shift to query (e.g. live, shift_1, shift_1_dev). Default: live."], "default_value": {"values": ["shift_1"]}}],
+        "parameters": [{"name": "shift_id", "type_hint": "STRING", "description": ["The shift to query. Default: __SHIFT__, the shift this environment's producer writes. There is no 'live' shift."], "default_value": {"values": ["__SHIFT__"]}}],
     },
     {
         "id": "c2000000000000000000000000000004",
@@ -431,7 +438,7 @@ example_question_sqls = [
             "  AND (status = 'LOW' OR on_hand_qty <= reorder_point)\n",
             "ORDER BY hours_to_depletion NULLS LAST"
         ],
-        "parameters": [{"name": "shift_id", "type_hint": "STRING", "description": ["The shift to query (e.g. live, shift_1, shift_1_dev). Default: live."], "default_value": {"values": ["shift_1"]}}],
+        "parameters": [{"name": "shift_id", "type_hint": "STRING", "description": ["The shift to query. Default: __SHIFT__, the shift this environment's producer writes. There is no 'live' shift."], "default_value": {"values": ["__SHIFT__"]}}],
     },
     {
         "id": "c2000000000000000000000000000005",
@@ -439,15 +446,15 @@ example_question_sqls = [
         "sql": [
             "SELECT machine_id,\n",
             "  COUNT(*) AS total_checks,\n",
-            "  SUM(CASE WHEN result = 'NOK' THEN 1 ELSE 0 END) AS nok_count,\n",
-            "  ROUND(100.0 * SUM(CASE WHEN result = 'NOK' THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0), 2) AS reject_pct\n",
-            "FROM __CAT__.__SCH__.quality_checks\n",
+            "  SUM(CASE WHEN result = 'fail' THEN 1 ELSE 0 END) AS fail_count,\n",
+            "  ROUND(100.0 * SUM(CASE WHEN result = 'fail' THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0), 2) AS reject_pct\n",
+            "FROM __CAT__.__SCH__.quality_checks_bronze\n",
             "WHERE shift_id = :shift_id\n",
             "GROUP BY machine_id\n",
             "HAVING COUNT(*) > 0\n",
             "ORDER BY reject_pct DESC"
         ],
-        "parameters": [{"name": "shift_id", "type_hint": "STRING", "description": ["The shift to query (e.g. live, shift_1, shift_1_dev). Default: live."], "default_value": {"values": ["shift_1"]}}],
+        "parameters": [{"name": "shift_id", "type_hint": "STRING", "description": ["The shift to query. Default: __SHIFT__, the shift this environment's producer writes. There is no 'live' shift."], "default_value": {"values": ["__SHIFT__"]}}],
     },
     {
         "id": "c2000000000000000000000000000006",
@@ -473,7 +480,7 @@ example_question_sqls = [
         "sql": [
             "WITH latest_kpi AS (\n",
             "  SELECT *, ROW_NUMBER() OVER (PARTITION BY shift_id ORDER BY ts DESC) AS rn\n",
-            "  FROM __CAT__.__SCH__.line_kpi WHERE shift_id = :shift_id\n",
+            "  FROM __CAT__.__SCH__.gold_history_line_kpi WHERE shift_id = :shift_id\n",
             "),\n",
             "kpi_row AS (\n",
             "  SELECT 'kpi_now' AS section, CAST(NULL AS STRING) AS subject,\n",
@@ -490,16 +497,16 @@ example_question_sqls = [
             "    CONCAT(event_type, ' / ', severity, ' / ',\n",
             "           ROUND((unix_timestamp(CURRENT_TIMESTAMP()) - unix_timestamp(timestamp_start)) / 60.0, 1),\n",
             "           ' min open') AS detail\n",
-            "  FROM __CAT__.__SCH__.event_log\n",
-            "  WHERE shift_id = :shift_id AND timestamp_end IS NULL\n",
+            "  FROM __CAT__.__SCH__.gold_history_event_log\n",
+            "  WHERE shift_id = :shift_id AND timestamp_end IS NULL AND event_type <> 'resolved' AND NOT EXISTS (SELECT 1 FROM __CAT__.__SCH__.gold_history_event_log r WHERE r.shift_id = gold_history_event_log.shift_id AND r.machine_id = gold_history_event_log.machine_id AND r.event_type = 'resolved' AND r.timestamp_start >= gold_history_event_log.timestamp_start)\n",
             ")\n",
             "SELECT * FROM kpi_row\n",
             "UNION ALL SELECT * FROM open_now"
         ],
-        "parameters": [{"name": "shift_id", "type_hint": "STRING", "description": ["The shift to query (e.g. live, shift_1, shift_1_dev). Default: shift_1."], "default_value": {"values": ["shift_1"]}}],
+        "parameters": [{"name": "shift_id", "type_hint": "STRING", "description": ["The shift to query. Default: __SHIFT__, the shift this environment's producer writes."], "default_value": {"values": ["__SHIFT__"]}}],
         "usage_guidance": [
             "Use for the mid-shift 'How are we doing?' walk-to-the-line check. Returns the latest ",
-            "line_kpi row (OEE, machine counts, throughput, cumulative cases) plus any currently ",
+            "gold_history_line_kpi row (OEE, machine counts, throughput, cumulative cases) plus any currently ",
             "open events with how long they've been open. Tight enough to fit on a phone screen."
         ],
     },
@@ -510,12 +517,11 @@ example_question_sqls = [
             "SELECT operator_id, operator_name, role, assigned_machine, skill_level, status\n",
             "FROM __CAT__.__SCH__.shift_crew\n",
             "WHERE shift_id = :shift_id\n",
-            "ORDER BY CASE role WHEN 'supervisor' THEN 1 WHEN 'lead' THEN 2\n",
-            "                    WHEN 'maintenance' THEN 3 WHEN 'quality' THEN 4\n",
-            "                    WHEN 'operator' THEN 5 ELSE 9 END,\n",
+            "ORDER BY CASE role WHEN 'supervisor' THEN 1 WHEN 'mechanic' THEN 2\n",
+            "                    WHEN 'qa' THEN 3 WHEN 'operator' THEN 4 ELSE 9 END,\n",
             "         assigned_machine"
         ],
-        "parameters": [{"name": "shift_id", "type_hint": "STRING", "description": ["The shift to roster. Default: shift_1."], "default_value": {"values": ["shift_1"]}}],
+        "parameters": [{"name": "shift_id", "type_hint": "STRING", "description": ["The shift to roster. Default: __SHIFT__."], "default_value": {"values": ["__SHIFT__"]}}],
         "usage_guidance": [
             "Returns the full operator roster for the shift, ordered by role seniority. ",
             "Surface absences and skill-level gaps when the briefing flags 'staffing risk'."
@@ -531,7 +537,7 @@ example_question_sqls = [
             "WHERE shift_id = :shift_id\n",
             "ORDER BY planned_start"
         ],
-        "parameters": [{"name": "shift_id", "type_hint": "STRING", "description": ["The shift. Default: shift_1."], "default_value": {"values": ["shift_1"]}}],
+        "parameters": [{"name": "shift_id", "type_hint": "STRING", "description": ["The shift. Default: __SHIFT__."], "default_value": {"values": ["__SHIFT__"]}}],
         "usage_guidance": [
             "Use when the line manager asks about cleaning windows, downtime windows, or 'when is the FILLER offline today'."
         ],
@@ -561,7 +567,7 @@ example_question_sqls = [
             "),\n",
             "latest_kpi AS (\n",
             "  SELECT *, ROW_NUMBER() OVER (PARTITION BY shift_id ORDER BY ts DESC) AS rn\n",
-            "  FROM __CAT__.__SCH__.line_kpi WHERE shift_id = :shift_id\n",
+            "  FROM __CAT__.__SCH__.gold_history_line_kpi WHERE shift_id = :shift_id\n",
             "),\n",
             "kpi_summary AS (\n",
             "  SELECT 'kpi' AS section, CAST(NULL AS STRING) AS subject,\n",
@@ -575,8 +581,8 @@ example_question_sqls = [
             "open_events AS (\n",
             "  SELECT 'open_event' AS section, machine_id AS subject,\n",
             "    CONCAT(event_type, ' / ', severity, ' / ', COALESCE(root_cause, 'unknown_root_cause')) AS detail\n",
-            "  FROM __CAT__.__SCH__.event_log\n",
-            "  WHERE shift_id = :shift_id AND timestamp_end IS NULL\n",
+            "  FROM __CAT__.__SCH__.gold_history_event_log\n",
+            "  WHERE shift_id = :shift_id AND timestamp_end IS NULL AND event_type <> 'resolved' AND NOT EXISTS (SELECT 1 FROM __CAT__.__SCH__.gold_history_event_log r WHERE r.shift_id = gold_history_event_log.shift_id AND r.machine_id = gold_history_event_log.machine_id AND r.event_type = 'resolved' AND r.timestamp_start >= gold_history_event_log.timestamp_start)\n",
             "),\n",
             "cip_windows AS (\n",
             "  SELECT 'cip_window' AS section, machine_id AS subject,\n",
@@ -611,13 +617,13 @@ example_question_sqls = [
             "UNION ALL SELECT * FROM low_inv\n",
             "UNION ALL SELECT * FROM pm_due"
         ],
-        "parameters": [{"name": "shift_id", "type_hint": "STRING", "description": ["The shift to query (e.g. shift_1, shift_1_dev, shift_1_west). Default: shift_1."], "default_value": {"values": ["shift_1"]}}],
+        "parameters": [{"name": "shift_id", "type_hint": "STRING", "description": ["The shift to query. Default: __SHIFT__, the shift this environment's producer writes."], "default_value": {"values": ["__SHIFT__"]}}],
         "usage_guidance": [
             "Single-result-set pre-shift briefing for the incoming crew. The 'section' column groups: ",
             "'plan' (SKU + target cases), 'crew' (one row per role with present/absent/late counts), ",
             "'kpi' (latest OEE + machine counts), 'open_event' (any unresolved event), 'cip_window' ",
             "(CIPs scheduled during the shift), 'low_inventory', 'pm_due_or_overdue'. ",
-            "Set :shift_id to the shift the user names; default shift_1 matches the prod producer."
+            "Set :shift_id to the shift the user names; default __SHIFT__ is what this environment's producer writes."
         ],
     },
     {
@@ -636,7 +642,7 @@ example_question_sqls = [
             "),\n",
             "latest_kpi AS (\n",
             "  SELECT *, ROW_NUMBER() OVER (PARTITION BY shift_id ORDER BY ts DESC) AS rn\n",
-            "  FROM __CAT__.__SCH__.line_kpi WHERE shift_id = :shift_id\n",
+            "  FROM __CAT__.__SCH__.gold_history_line_kpi WHERE shift_id = :shift_id\n",
             "),\n",
             "kpi_row AS (\n",
             "  SELECT 'kpi' AS section, CAST(NULL AS STRING) AS subject,\n",
@@ -656,8 +662,8 @@ example_question_sqls = [
             "top_events AS (\n",
             "  SELECT 'top_event' AS section, machine_id AS subject,\n",
             "    CONCAT(event_type, ' / ', severity, ' / ', ROUND(duration_minutes, 1), 'min',\n",
-            "           CASE WHEN timestamp_end IS NULL THEN ' / OPEN' ELSE '' END) AS detail\n",
-            "  FROM __CAT__.__SCH__.event_log\n",
+            "           CASE WHEN timestamp_end IS NULL AND event_type <> 'resolved' THEN ' / OPEN' ELSE '' END) AS detail\n",
+            "  FROM __CAT__.__SCH__.gold_history_event_log\n",
             "  WHERE shift_id = :shift_id\n",
             "  ORDER BY duration_minutes DESC NULLS LAST\n",
             "  LIMIT 5\n",
@@ -665,8 +671,8 @@ example_question_sqls = [
             "open_at_handover AS (\n",
             "  SELECT 'open_at_handover' AS section, machine_id AS subject,\n",
             "    CONCAT(event_type, ' / ', severity, ' / opened ', CAST(timestamp_start AS STRING)) AS detail\n",
-            "  FROM __CAT__.__SCH__.event_log\n",
-            "  WHERE shift_id = :shift_id AND timestamp_end IS NULL\n",
+            "  FROM __CAT__.__SCH__.gold_history_event_log\n",
+            "  WHERE shift_id = :shift_id AND timestamp_end IS NULL AND event_type <> 'resolved' AND NOT EXISTS (SELECT 1 FROM __CAT__.__SCH__.gold_history_event_log r WHERE r.shift_id = gold_history_event_log.shift_id AND r.machine_id = gold_history_event_log.machine_id AND r.event_type = 'resolved' AND r.timestamp_start >= gold_history_event_log.timestamp_start)\n",
             ")\n",
             "SELECT * FROM plan\n",
             "UNION ALL SELECT * FROM kpi_row\n",
@@ -674,7 +680,7 @@ example_question_sqls = [
             "UNION ALL SELECT * FROM top_events\n",
             "UNION ALL SELECT * FROM open_at_handover"
         ],
-        "parameters": [{"name": "shift_id", "type_hint": "STRING", "description": ["The shift to summarise. Default: shift_1."], "default_value": {"values": ["shift_1"]}}],
+        "parameters": [{"name": "shift_id", "type_hint": "STRING", "description": ["The shift to summarise. Default: __SHIFT__."], "default_value": {"values": ["__SHIFT__"]}}],
         "usage_guidance": [
             "Post-shift handover note. 'section' groups: 'plan_vs_actual' (planned vs actual cases + completion %), ",
             "'kpi' (final OEE breakdown), 'absent_crew' (anyone marked absent / late this shift — flag for HR), ",
@@ -687,8 +693,8 @@ example_question_sqls = [
         "sql": [
             "SELECT 'open_event' AS risk_type, machine_id AS subject,\n",
             "  CONCAT(event_type, ' / ', severity, ' / ', COALESCE(root_cause, '?')) AS detail\n",
-            "FROM __CAT__.__SCH__.event_log\n",
-            "WHERE timestamp_end IS NULL\n",
+            "FROM __CAT__.__SCH__.gold_history_event_log\n",
+            "WHERE timestamp_end IS NULL AND event_type <> 'resolved' AND NOT EXISTS (SELECT 1 FROM __CAT__.__SCH__.gold_history_event_log r WHERE r.shift_id = gold_history_event_log.shift_id AND r.machine_id = gold_history_event_log.machine_id AND r.event_type = 'resolved' AND r.timestamp_start >= gold_history_event_log.timestamp_start)\n",
             "UNION ALL\n",
             "SELECT 'low_inventory', material_id,\n",
             "  CONCAT('on_hand=', CAST(ROUND(on_hand_qty, 1) AS STRING),\n",
@@ -715,11 +721,11 @@ example_question_sqls = [
             "  CAST(timestamp_start AS STRING) AS opened_at,\n",
             "  ROUND((unix_timestamp(CURRENT_TIMESTAMP()) - unix_timestamp(timestamp_start)) / 60.0, 1)\n",
             "    AS open_for_minutes\n",
-            "FROM __CAT__.__SCH__.event_log\n",
-            "WHERE shift_id = :shift_id AND timestamp_end IS NULL\n",
+            "FROM __CAT__.__SCH__.gold_history_event_log\n",
+            "WHERE shift_id = :shift_id AND timestamp_end IS NULL AND event_type <> 'resolved' AND NOT EXISTS (SELECT 1 FROM __CAT__.__SCH__.gold_history_event_log r WHERE r.shift_id = gold_history_event_log.shift_id AND r.machine_id = gold_history_event_log.machine_id AND r.event_type = 'resolved' AND r.timestamp_start >= gold_history_event_log.timestamp_start)\n",
             "ORDER BY timestamp_start"
         ],
-        "parameters": [{"name": "shift_id", "type_hint": "STRING", "description": ["The shift to query (e.g. live, shift_1, shift_1_dev). Default: live."], "default_value": {"values": ["shift_1"]}}],
+        "parameters": [{"name": "shift_id", "type_hint": "STRING", "description": ["The shift to query. Default: __SHIFT__, the shift this environment's producer writes. There is no 'live' shift."], "default_value": {"values": ["__SHIFT__"]}}],
     },
 ]
 
@@ -734,8 +740,8 @@ benchmarks = [
             "format": "SQL",
             "content": [
                 "SELECT shift_id, ROUND(oee_to_now, 1) AS oee_pct, ts\n",
-                "FROM __CAT__.__SCH__.line_kpi\n",
-                "WHERE shift_id = 'live'\n",
+                "FROM __CAT__.__SCH__.gold_history_line_kpi\n",
+                "WHERE ts > current_timestamp() - INTERVAL 15 MINUTES\n",
                 "ORDER BY ts DESC LIMIT 1"
             ]
         }],
@@ -748,7 +754,8 @@ benchmarks = [
             "content": [
                 "WITH latest AS (\n",
                 "  SELECT *, ROW_NUMBER() OVER (PARTITION BY machine_id ORDER BY ts DESC) AS rn\n",
-                "  FROM __CAT__.__SCH__.machine_state WHERE shift_id = 'live'\n",
+                "  FROM __CAT__.__SCH__.gold_history_machine_state\n",
+                "  WHERE ts > current_timestamp() - INTERVAL 15 MINUTES\n",
                 ")\n",
                 "SELECT machine_id, status FROM latest WHERE rn = 1 AND status = 'stopped'"
             ]
@@ -794,49 +801,70 @@ text_instructions_content = [
     "running in the streaming workspace. It is structurally different from ",
     "the static seed schema used by the seed-schema (demo workspace) path. ",
     "Key facts: ",
-    "  * line_kpi emits ~1 row per second per shift_id. To get the CURRENT ",
+    "  * gold_history_line_kpi emits ~1 row per second per shift_id. To get the CURRENT ",
     "    state, take ROW_NUMBER() OVER (PARTITION BY shift_id ORDER BY ts DESC) = 1. ",
-    "  * machine_state emits ~1 row per machine per second. To get the CURRENT ",
+    "  * gold_history_machine_state emits ~1 row per machine per second. To get the CURRENT ",
     "    machine status, take ROW_NUMBER() OVER (PARTITION BY machine_id ORDER BY ts DESC) = 1. ",
     "  * OEE columns (oee_to_now, availability_to_now, performance_to_now, ",
     "    quality_to_now) and speed_pct are stored as PERCENTAGES 0-100. DO NOT ",
     "    multiply by 100. (e.g. oee_to_now = 74.5 means 74.5%.) ",
-    "  * event_log rows with timestamp_end IS NULL are still OPEN — these are ",
+    "  * gold_history_event_log is append-only: a resolved incident gets a separate "
+    "event_type = 'resolved' row and the original keeps timestamp_end IS NULL "
+    "forever. An event is still OPEN only when no 'resolved' row exists for that "
+    "machine at or after its timestamp_start. These are ",
     "    the carryover candidates at any handover. ",
     "  * maintenance_windows has no shift_id; filter by next_pm timestamp. ",
     "    An OVERDUE PM has next_pm < CURRENT_TIMESTAMP(); DUE_SOON within 8h. ",
-    "  * inventory_status.status = 'LOW' OR on_hand_qty <= reorder_point ",
-    "    indicates a material that needs reorder attention. ",
-    "  * shift_crew has 12 rows per shift (roles: operator, lead, maintenance, ",
-    "    quality, supervisor). status IN ('present', 'absent', 'late'). The ",
+    "  * inventory_status.status is OK | LOW | CRITICAL (uppercase). CRITICAL ",
+    "    is at or below safety_stock, LOW is between safety_stock and ",
+    "    reorder_point. status IN ('LOW','CRITICAL') needs reorder attention. ",
+    "  * shift_crew has 12 rows per shift (roles: operator, mechanic, qa, ",
+    "    supervisor — there is no 'lead', 'maintenance' or 'quality' role). ",
+    "    status IN ('present', 'absent', 'late'). The ",
     "    skills column is a COMMA-SEPARATED STRING of machine_ids — use ",
     "    array_contains(split(skills, ','), 'FILLER') or LIKE matching to query. ",
-    "  * production_schedule has ONE ROW per shift_id with planned_cases, ",
+    "  * production_schedule has ONE OR MORE ROWS per shift_id with planned_cases, ",
     "    actual_cases, ideal_rate_bpm, sku/sku_name, start_time/end_time as ",
-    "    ISO-8601 strings, and status (planned | in_progress | completed | aborted). ",
-    "    Completion % = actual_cases / planned_cases * 100. ",
+    "    ISO-8601 strings, and status (completed | changeover | disrupted). ",
+    "    A changeover segment carries planned_cases = 0, so for a shift target ",
+    "    use SUM(planned_cases), not an arbitrary row. ",
+    "    Completion % = SUM(actual_cases) / SUM(planned_cases) * 100. ",
     "  * cip_schedule has 0..N rows per shift_id with planned_start / planned_end ",
     "    as strings and machine_id of the unit being cleaned. ",
-    "  * Machine statuses: running, stopped, degraded, starved, idle. Severities ",
-    "    from most to least critical: critical > major > minor > info. ",
-    "JOIN RULES: event_log, machine_state, quality_checks, telemetry, ",
-    "inventory_status, shift_crew, cip_schedule, production_schedule all share ",
-    "shift_id; event_log, machine_state, quality_checks, telemetry, shift_crew ",
-    "(via assigned_machine) and cip_schedule also reference machine_id. Always ",
-    "filter to a single shift_id first before joining (the live tables are ",
-    "streaming — full-scan joins are slow). For production-target questions, ",
-    "use production_schedule.planned_cases (NOT scenario_index, which has no ",
-    "target column). ",
+    "  * Machine statuses, lowercase: running, blocked, starved, degraded, stopped. ",
+    "    There is no 'idle'. Event severities, most to least critical: ",
+    "    critical > high > medium > low. Quality check result is 'pass' or 'fail'. ",
+    "SHIFT IDs COME IN TWO INCOMPATIBLE FORMS — this is the most common cause of ",
+    "a query that runs cleanly and returns nothing: ",
+    "  * LIVE tables are keyed by the environment-suffixed id the running line ",
+    "    writes, e.g. 'shift_1_dev': gold_history_line_kpi, gold_history_machine_state, ",
+    "    gold_history_event_log, quality_checks_bronze, telemetry_bronze, ",
+    "    inventory_status, gold_history_inventory_status. ",
+    "  * REFERENCE tables are keyed by the base id with no suffix, e.g. 'shift_1': ",
+    "    production_schedule, shift_crew, cip_schedule, maintenance_schedule, ",
+    "    scenario_index, scenario_moments. ",
+    "  * The two sets never overlap. NEVER join a live table to a reference table ",
+    "    on shift_id — the result is always empty. Relate them on machine_id, or ",
+    "    strip a trailing '_dev'/'_prod' before filtering a reference table. ",
+    "  * Reference tables carry nominal scenario timestamps, not wall-clock time. ",
+    "    Never bound a live table by a start_time read from a schedule table. ",
+    "JOIN RULES: within the live set, gold_history_event_log, gold_history_machine_state, ",
+    "quality_checks_bronze and telemetry_bronze share both shift_id and machine_id. ",
+    "shift_crew (via assigned_machine), cip_schedule and maintenance_schedule relate ",
+    "to the live set by machine_id only. Always filter to one shift_id and bound ts ",
+    "before joining — the live tables hold millions of rows and an unbounded join ",
+    "will time out. For production-target questions use production_schedule.planned_cases ",
+    "(NOT scenario_index, which has no target column). ",
     "\n\n",
     "MOBILE BRIEFING QUERIES — this Genie space is the line manager's mobile ",
     "companion. They open the Databricks app on their phone while walking to ",
     "the line and tap one of four chips. Map each chip to the right curated SQL: ",
     "  * 'Brief me for my shift' / 'pre-shift briefing' / 'kickoff' → ",
-    "    use example c2000000000000000000000000000010 (latest line_kpi + open ",
+    "    use example c2000000000000000000000000000010 (latest gold_history_line_kpi + open ",
     "    events + low inventory + due/overdue PMs). ",
     "  * 'How are we doing right now?' / 'mid-shift status' / 'how's the ",
     "    line?' → use example c2000000000000000000000000000009 (latest ",
-    "    line_kpi snapshot + currently-open events with open-duration). ",
+    "    gold_history_line_kpi snapshot + currently-open events with open-duration). ",
     "  * 'Wrap up this shift' / 'post-shift summary' / 'shift wrap' / ",
     "    'handover note' → use example c2000000000000000000000000000011 ",
     "    (final OEE breakdown + top 5 events + still-open events). ",
@@ -845,7 +873,7 @@ text_instructions_content = [
     "    inventory + overdue PMs across the line). ",
     "If the user names a shift (e.g. 'shift_1_dev'), substitute it for the ",
     ":shift_id parameter. If they say 'this shift', 'the live shift', or do ",
-    "not specify, use 'shift_1' (the default, matches the prod producer). ",
+    "not specify, use '__SHIFT__' (what this environment's producer writes). ",
     "Crew, plan, and CIP data ARE in this Genie space (shift_crew, ",
     "production_schedule, cip_schedule). Cite specific operator_names, ",
     "planned_cases targets and CIP windows directly in handover briefings."
@@ -880,6 +908,11 @@ def main():
                         help=f"UC catalog (default: {DEFAULT_CATALOG})")
     parser.add_argument("--schema", default=DEFAULT_SCHEMA,
                         help=f"UC schema (default: {DEFAULT_SCHEMA})")
+    parser.add_argument("--shift-id", default="shift_1",
+                        help="The shift this environment's producer writes (e.g. "
+                             "shift_1_dev). Becomes the default :shift_id in every "
+                             "curated SQL. Getting this wrong is silent: the query "
+                             "runs and returns nothing.")
     parser.add_argument("--title", default="ProdLine CoPilot — Production Line Analytics (streaming)")
     parser.add_argument("--parent-path", default="",
                         help="Workspace folder to register a NEWLY created space under "
@@ -924,9 +957,18 @@ def main():
     serialized_space["instructions"]["example_question_sqls"].sort(key=lambda e: e["id"])
     serialized_space["benchmarks"]["questions"].sort(key=lambda b: b["id"])
 
-    # Substitute the catalog/schema placeholders in every identifier and SQL.
+    # Substitute the catalog/schema placeholders in every identifier and SQL,
+    # and the shift placeholder in every :shift_id default. The shift used to be
+    # hardcoded to shift_1, so the dev space defaulted to a shift its own
+    # producer never writes: every shift-scoped question ran cleanly and
+    # answered "0 machines", which reads as a broken line rather than a
+    # misconfigured space.
     blob = json.dumps(serialized_space)
-    blob = blob.replace("__CAT__", args.catalog).replace("__SCH__", args.schema)
+    blob = (
+        blob.replace("__CAT__", args.catalog)
+        .replace("__SCH__", args.schema)
+        .replace("__SHIFT__", args.shift_id)
+    )
 
     payload_dict = {
         "warehouse_id": args.warehouse_id,
@@ -935,7 +977,7 @@ def main():
             "Live streaming production line analytics for the streaming workspace. "
             "Covers OEE, machine state, events, quality, inventory, and PM scheduling. "
             "Includes pre-shift briefing, post-shift summary, and carryover-risk SQLs "
-            "tailored to the streaming schema (line_kpi, machine_state, event_log, "
+            "tailored to the streaming schema (gold_history_line_kpi, gold_history_machine_state, gold_history_event_log, "
             "inventory_status, maintenance_windows)."
         ),
         "serialized_space": blob,
@@ -952,6 +994,7 @@ def main():
     print(f"  mode         : {'create' if create_mode else 'update'}")
     print(f"  warehouse_id : {args.warehouse_id}")
     print(f"  table prefix : {args.catalog}.{args.schema}")
+    print(f"  default shift: {args.shift_id}")
     print(f"  tables       : {len(tables)}")
     print(f"  sample qs    : {len(sample_questions)}")
     print(f"  example SQLs : {len(example_question_sqls)}")

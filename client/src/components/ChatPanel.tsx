@@ -50,6 +50,10 @@ type StreamEvent =
   | { type: 'snapshot'; content: string }
   | { type: 'status'; content: string }
   | { type: 'tool_update'; content: string }
+  /** A fragment of the answer as the model writes it. */
+  | { type: 'token'; content: string }
+  /** The draft so far was a preamble to a tool call; discard it. */
+  | { type: 'token_reset' }
   | {
       type: 'answer';
       content: string;
@@ -58,6 +62,13 @@ type StreamEvent =
       model_display?: string;
       model_vendor?: string;
       response_time_ms?: number;
+      /**
+       * Echoed back on the next request so the server can load what was said
+       * earlier. Omitting it from this type is how multi-turn memory was lost:
+       * the server created and returned an id every turn, the parse boundary
+       * dropped it, and each question arrived as the first one.
+       */
+      conversation_id?: string;
       reasoning_steps?: ReasoningStep[];
       /** Absent unless the server has both a workspace host and an experiment. */
       trace_url?: string;
@@ -197,10 +208,19 @@ function ThinkingIndicator({
   statusText,
   elapsed,
   toolSteps,
+  draft,
 }: {
   statusText: string;
   elapsed: number;
   toolSteps: string[];
+  /**
+   * The specialist's answer as it is being written. Shown as plain text and
+   * discarded the moment the `answer` event lands: a later reasoning round can
+   * replace it, and the synthesis pass rewrites it into the section format the
+   * message bubble renders. Treating it as the answer would mean formatting
+   * half a markdown document and then swapping it out.
+   */
+  draft: string;
 }) {
   return (
     <div className="flex justify-start">
@@ -224,6 +244,11 @@ function ThinkingIndicator({
                 <span>{step.replace(' ✓', '')}</span>
               </div>
             ))}
+          </div>
+        )}
+        {draft && (
+          <div className="mt-2 border-t border-border/50 pt-1.5 text-xs leading-relaxed text-foreground/80 whitespace-pre-wrap">
+            {draft}
           </div>
         )}
       </div>
@@ -349,12 +374,16 @@ export default function ChatPanel({ shiftId, timestamp, machineId, externalQuery
   const [isLoading, setIsLoading] = useState(false);
   const [statusText, setStatusText] = useState('Analyzing...');
   const [toolSteps, setToolSteps] = useState<string[]>([]);
+  const [draft, setDraft] = useState('');
   const [elapsed, setElapsed] = useState(0);
   const [askedQueries, setAskedQueries] = useState<Set<string>>(new Set());
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const snapshotIdRef = useRef<string | null>(null);
+  // Held in a ref rather than state: it is read while building the next
+  // request and must not schedule a render when it changes.
+  const conversationIdRef = useRef<string | null>(null);
   const lastExternalIdRef = useRef(0);
 
   const availableSuggestions = useMemo(() => ALL_SUGGESTIONS.filter((q) => !askedQueries.has(q)), [askedQueries]);
@@ -366,6 +395,13 @@ export default function ChatPanel({ shiftId, timestamp, machineId, externalQuery
   useEffect(() => {
     scrollToBottom();
   }, [messages, isLoading]);
+
+  // A conversation belongs to one shift — the server stores shift_id on the
+  // row. Carrying the thread across a shift change would prime the model with
+  // a discussion of a different production run.
+  useEffect(() => {
+    conversationIdRef.current = null;
+  }, [shiftId]);
 
   const startTimer = () => {
     setElapsed(0);
@@ -399,6 +435,7 @@ export default function ChatPanel({ shiftId, timestamp, machineId, externalQuery
       setIsLoading(true);
       setStatusText('Analyzing your question...');
       setToolSteps([]);
+      setDraft('');
       snapshotIdRef.current = null;
       startTimer();
 
@@ -414,6 +451,11 @@ export default function ChatPanel({ shiftId, timestamp, machineId, externalQuery
             shift_id: shiftId,
             timestamp: effectiveTimestamp,
             machine_id: machineId,
+            // Absent on the first turn; the server then creates one and
+            // returns it on the answer event. Without this the server made a
+            // new conversation every turn, so "what about the next machine?"
+            // arrived with no idea which machine came before.
+            ...(conversationIdRef.current ? { conversation_id: conversationIdRef.current } : {}),
           }),
           signal: controller.signal,
         });
@@ -458,6 +500,10 @@ export default function ChatPanel({ shiftId, timestamp, machineId, externalQuery
                 setStatusText('Running specialist analysis...');
               } else if (event.type === 'status') {
                 setStatusText(event.content);
+              } else if (event.type === 'token') {
+                setDraft((prev) => prev + event.content);
+              } else if (event.type === 'token_reset') {
+                setDraft('');
               } else if (event.type === 'tool_update') {
                 setStatusText(event.content);
                 setToolSteps((prev) => {
@@ -470,6 +516,12 @@ export default function ChatPanel({ shiftId, timestamp, machineId, externalQuery
                   return prev;
                 });
               } else if (event.type === 'answer') {
+                if (event.conversation_id) {
+                  conversationIdRef.current = event.conversation_id;
+                }
+                // The draft was a preview of this text; the message bubble
+                // takes over and renders the authoritative version.
+                setDraft('');
                 if (snapshotIdRef.current) {
                   setMessages((prev) => prev.filter((m) => m.id !== snapshotIdRef.current));
                 }
@@ -522,6 +574,7 @@ export default function ChatPanel({ shiftId, timestamp, machineId, externalQuery
         clearTimeout(timeoutId);
         setIsLoading(false);
         stopTimer();
+        setDraft('');
         snapshotIdRef.current = null;
       }
     },
@@ -664,7 +717,7 @@ export default function ChatPanel({ shiftId, timestamp, machineId, externalQuery
                 </div>
               )}
               {msg.role === 'assistant' && msg.actions && msg.actions.length > 0 && (
-                <ActionPanel actions={msg.actions} />
+                <ActionPanel actions={msg.actions} source={msg.specialistUsed} />
               )}
               {msg.role === 'assistant' && msg.specialistUsed && (
                 <details className="mt-2 border-t border-border/40 pt-1.5">
@@ -741,7 +794,9 @@ export default function ChatPanel({ shiftId, timestamp, machineId, externalQuery
           </div>
         ))}
 
-        {isLoading && <ThinkingIndicator statusText={statusText} elapsed={elapsed} toolSteps={toolSteps} />}
+        {isLoading && (
+          <ThinkingIndicator statusText={statusText} elapsed={elapsed} toolSteps={toolSteps} draft={draft} />
+        )}
         <div ref={messagesEndRef} />
       </div>
 

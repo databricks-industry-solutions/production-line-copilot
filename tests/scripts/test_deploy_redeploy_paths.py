@@ -134,10 +134,47 @@ def test_steps_needing_project_deps_use_the_project_interpreter(lines):
     storage unprovisioned. That is how the first run of this step failed.
     """
     for script in ("register_prompts.py", "provision_trace_storage.py"):
-        calls = [t for _, t in _code_lines(lines) if script in t and "echo" not in t]
+        # Match the invocation by its path, not by the bare filename: the
+        # filename also appears in echoed headings and in the warning text that
+        # tells the reader which step to look at, and neither is a call.
+        calls = [
+            t for _, t in _code_lines(lines) if f"scripts/{script}" in t and "echo" not in t
+        ]
         assert calls, f"{script} is not called by deploy.sh"
         for call in calls:
             assert "PROJECT_PY" in call, (
                 f"{script} is invoked with the system interpreter ({call!r}); "
                 "it needs the project venv, which deploy.sh exposes as PROJECT_PY"
             )
+
+
+class TestTheVectorSearchGateReadsTheShippedConfig:
+    """Which app.yaml the gate reads decides whether the step runs at all.
+
+    `app.yaml` is the committed prod template and is deliberately blank, so a
+    hardcoded read of it reported "not enabled" for every environment —
+    including one whose gitignored `app.<env>.local.yaml` had just been
+    rendered with an endpoint name a few lines earlier. The step then skipped,
+    the app kept its keyword fallback, and the deploy log said so in a line
+    nobody reads.
+    """
+
+    def test_the_gate_reads_app_source_yaml_not_a_fixed_filename(self, lines):
+        block = "\n".join(lines)
+        gate = block.split("VS_ENDPOINT_NAME=$(", 1)
+        assert len(gate) == 2, "the Vector Search gate has moved or been renamed"
+        snippet = gate[1].split(")\n", 1)[0]
+        assert "$APP_SOURCE_YAML" in snippet, (
+            "the gate must read the file this deploy ships; a literal app.yaml "
+            "is blank in the repo and skips provisioning on every environment"
+        )
+        assert "open('app.yaml')" not in snippet
+
+    def test_the_operator_is_told_the_first_run_is_slow(self, lines):
+        """`--wait` blocks with no output; without a warning it looks hung."""
+        block = "\n".join(lines)
+        vs = block.split("Provisioning Vector Search", 1)[1][:1600]
+        assert "15-40" in vs and "minutes" in vs, (
+            "no duration hint near the provisioning step — someone will Ctrl-C it"
+        )
+        assert "one-time" in vs, "say it is per-environment, not per-deploy"

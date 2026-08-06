@@ -6,8 +6,6 @@ per-mapping orchestration via injected fakes.
 """
 from __future__ import annotations
 
-import pytest
-
 from agent_server.serving import silver_mapper as sm
 
 

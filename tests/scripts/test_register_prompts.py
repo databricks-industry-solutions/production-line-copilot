@@ -30,6 +30,7 @@ if str(ROOT) not in sys.path:
 pytest.importorskip("mlflow")
 
 from scripts.register_prompts import (  # noqa: E402
+    UNREADABLE,
     _is_missing,
     _latest,
     _tags,
@@ -111,16 +112,38 @@ class TestLatest:
         client = FakeClient({"p": [FakeVersion(1, "a"), FakeVersion(3, "c"), FakeVersion(2, "b")]})
         assert _latest(client, "p").version == 3
 
-    def test_a_real_read_failure_still_degrades_to_none(self):
+    def test_a_real_read_failure_is_unreadable_not_missing(self):
+        """An unreadable registry must not be reported as an empty one."""
+
         class Broken:
             def search_prompt_versions(self, name):
                 raise RuntimeError("network on fire")
 
-        assert _latest(Broken(), "p") is None
+        assert _latest(Broken(), "p") is UNREADABLE
 
     def test_missing_is_distinguished_from_broken(self):
         assert _is_missing(FakeRestError("NOT_FOUND: Prompt with name x does not exist."))
         assert not _is_missing(RuntimeError("network on fire"))
+
+    def test_a_credentials_failure_is_not_a_missing_prompt(self):
+        """The bug this guards against cost eleven redundant versions.
+
+        MLflow's credential error explains the DATABRICKS_CONFIG_PROFILE
+        fallback with the words "does not exist". Read as a missing prompt,
+        every prompt in the catalogue gets re-registered on a deploy whose
+        auth is merely misconfigured.
+        """
+        auth_error = FakeRestError(
+            "Reading Databricks credential configuration failed with MLflow "
+            "registry URI 'databricks-uc'. Please ensure that the "
+            "'databricks-sdk' PyPI library is installed, the tracking URI is "
+            "set correctly, and Databricks authentication is properly "
+            "configured. The registry URI can be either 'databricks-uc' (using "
+            "profile name specified by 'DATABRICKS_CONFIG_PROFILE' environment "
+            "variable or using 'DEFAULT' authentication profile if "
+            "'DATABRICKS_CONFIG_PROFILE' environment variable does not exist)."
+        )
+        assert not _is_missing(auth_error)
 
 
 class TestIdempotency:
@@ -174,6 +197,44 @@ class TestIdempotency:
         rec = wired(store)
         assert register_all(CAT, SCH, dry_run=True) == 0
         assert rec.registered == [] and rec.aliased == [] and store == {}
+
+    def test_dry_run_reads_the_registry_so_it_can_report_drift(self, wired, capsys):
+        """A plan that skips the read can only ever say "new".
+
+        That is worse than useless in a deploy log: it reports an in-sync
+        registry as eleven pending registrations.
+        """
+        store: dict[str, list[FakeVersion]] = {}
+        wired(store)
+        register_all(CAT, SCH)
+
+        wired(store)
+        capsys.readouterr()
+        register_all(CAT, SCH, dry_run=True)
+
+        out = capsys.readouterr().out
+        assert "unchanged, still v1" in out
+        assert "would register" not in out
+
+    def test_an_unreadable_registry_mints_nothing(self, wired, capsys):
+        """Skipping loses a deploy's worth of registration; guessing "new"
+        loses the version history."""
+        store: dict[str, list[FakeVersion]] = {}
+        rec = wired(store)
+
+        def broken(self, name):
+            raise RuntimeError("Reading Databricks credential configuration failed")
+
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr(FakeClient, "search_prompt_versions", broken)
+        try:
+            created = register_all(CAT, SCH)
+        finally:
+            monkeypatch.undo()
+
+        assert created == 0
+        assert rec.registered == []
+        assert "registry unreadable" in capsys.readouterr().out
 
 
 class TestTags:

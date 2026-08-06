@@ -3,7 +3,7 @@
 Status: Deployed + smoke-tested on dev (all themes complete and verified live)
 Owner: mohammad.khelghati@databricks.com
 Baseline: v0.1.0 (public: databricks-industry-solutions/production-line-copilot)
-Last updated: 2026-07-28
+Last updated: 2026-08-06
 
 Progress:
 - [x] Theme 1: AppKit 0.48 modernization + deploy self-heal grants
@@ -190,26 +190,47 @@ means giving it a Genie space pointed at tables that actually hold data.
   next deploy; the pre-existing bundle experiment keeps its old traces and is
   left in place, since an experiment that already holds traces cannot be
   converted.
-- **Load prompts from the registry at runtime.** `scripts/register_prompts.py`
-  publishes them today, but the app still reads the constants in
-  `agent_server/prompts/`, so the registry is a record rather than a control
-  surface and traces carry no prompt version. The work is a loader that resolves
-  `<catalog>.<schema>.prompt_<slug>@production` with the code constant as
-  fallback, called from the specialist factories and from `_classify_intent` /
-  `_synthesize_response`. Two things to know before starting: specialists are
-  built once and cached for the process (`_get_specialists`), so this buys
-  version pinning and prompt/trace linkage but *not* hot-swap — a prompt change
-  still needs a restart; and the registered text for a governed-domain
-  specialist is missing the `governed_domain_prompt(<domain>)` suffix the
-  runtime appends, so the loader must keep appending it. Impact: Med.
-  Effort: S–M.
-- **Register the agent as an MLflow LoggedModel.** `mlflow.create_external_model(model_type="agent")`
-  plus `set_active_model` at startup is the intended path for an agent served by
-  its own app rather than Model Serving: traces attach to the model, so quality
-  can be compared across versions, and the model roster, prompt versions and git
-  SHA can be logged as params. Full pyfunc/`ChatAgent` packaging was considered
-  and rejected — a served copy would need its own Genie spaces, Lakebase and
-  warehouse wiring, duplicating the app. Impact: Med. Effort: S.
+- ~~**Load prompts from the registry at runtime.**~~ Done.
+  `agent_server/prompts/loader.py` resolves
+  `<catalog>.<schema>.prompt_<slug>@production` once at startup, with the code
+  constant as a per-prompt fallback, and every call site now goes through
+  `prompt_text(slug)`. It is **off unless `PROMPTS_FROM_REGISTRY` is set**:
+  moving the source of truth for what the model receives is a behaviour change
+  and belongs on dev before prod. Two properties worth knowing. Specialists are
+  still built once and cached (`_get_specialists`), so this buys version pinning
+  and prompt/trace linkage but *not* hot-swap — a prompt change needs a restart.
+  And a loaded template is rejected in favour of the constant unless it is
+  non-empty and still contains every variable its call site fills, because the
+  registry stores Jinja `{{var}}` while the app formats with `{var}`: used
+  unconverted, `str.format` leaves the placeholder in the prompt rather than
+  raising.
+
+  Two gaps found while doing it, both now closed. The `general` route's system
+  prompt was built inline in `agent.py` and so was in no catalogue and no
+  registry — the one route with no tools, and therefore the one most dependent
+  on its prompt, was the one with no version behind it. And
+  `governed_domain_prompt()` appends 734–792 characters at agent construction,
+  roughly 15% of what a governed specialist actually receives, which existed
+  only inside that function. Both are catalogued now, and
+  `TestNoPromptIsBuiltOutsideThePackage` fails the build if a system prompt is
+  ever again assembled from literals outside `agent_server/prompts/`.
+- ~~**Register the agent as an MLflow LoggedModel.**~~ Done.
+  `agent_server/logged_model.py` calls `set_active_model(name=...)` beside the
+  `mlflow.langchain.autolog()` line, so traces attach to a model and the
+  resolved model roster, prompt source and UC location are recorded as params.
+  `set_active_model` creates the model on first boot and reuses it after, so no
+  model id is threaded through the deploy — `create_external_model` turned out
+  to be unnecessary. Every failure is swallowed: an app that will not start
+  because it could not name a model is worse than unlinked traces.
+
+  One thing left to decide. The name defaults to `prodline_copilot` for every
+  deploy, which means one model accumulating all traces. Comparing quality
+  across releases needs `AGENT_MODEL_VERSION` set at deploy time (the script
+  already computes the git SHA for the prompt commit message) so each release
+  gets its own model. Cheap to add; not added, because a name that changes on
+  every deploy also fragments the trace history and that trade is worth making
+  deliberately. Full pyfunc/`ChatAgent` packaging remains rejected — a served
+  copy would need its own Genie spaces, Lakebase and warehouse wiring.
 - **Split `start_server.py` (2770 lines) into FastAPI routers.** Pure refactor;
   defer until live deploy/smoke-test is available to validate route behavior.
   Impact: Med (maintainability). Effort: M.
@@ -217,3 +238,89 @@ means giving it a Genie space pointed at tables that actually hold data.
   synthetic mode. Impact: High. Effort: L.
 - Configurable line topology beyond the fixed 19-machine line. Impact: Med.
   Effort: M.
+
+---
+
+## Backlog: patterns from the CO₂-EOR Digital Twin app
+
+Reviewed 2026-08-06. A sibling Databricks App
+(`production-optimizer-…databricksapps.com`, branded "Production Optimizer",
+titled "CO₂-EOR Digital Twin") covers a different domain — enhanced oil
+recovery in the Delaware Basin — but solves several presentation problems we
+have not. None of the below is started. Screenshots were taken at review time
+but are not committed.
+
+- **Demo Guide as a first-class in-app tab.** Their default landing tab is a
+  presenter talk track: the customer scene, business-case stat cards, then six
+  numbered walkthrough steps, each with a quoted script, a duration (~45–60 s),
+  "point at" bullets, product-name chips, and a button that deep-links into the
+  exact view being discussed. Every other tab is numbered to match. This
+  accelerator is public and will be demoed by people who did not build it, and
+  right now the only guide is a README. Impact: High. Effort: S.
+  Prerequisite we do not have: the app is a single page with no routing, so a
+  deep link needs tab state in the URL — worth doing regardless, since no view
+  in ProdLine CoPilot is currently linkable either.
+
+- **Time-series charts.** We render none. Not one: no OEE across the shift, no
+  sensor history on the machine detail card, no trend behind an incident. The
+  only charts anywhere are inside the embedded Lakeview dashboard on the Data
+  Quality tab. For a real-time monitoring product with sub-second telemetry
+  that is the conspicuous gap, and the data is already in `telemetry_bronze`
+  and `line_kpi_bronze`. (The EOR app has the same gap and it is just as
+  noticeable there, which is how it got onto this list.) Impact: High.
+  Effort: M. AppKit charts are already a dependency.
+
+- **Scenario / what-if surface over the existing optimizers.** Their Scenario
+  tab loads one AI recommendation, exposes three sliders, and returns a
+  per-well predicted table with a plain-English footer stating the transfer
+  function it used. Computed live server-side, ~110 ms. We have nine optimizers
+  in `agent_server/optimizers/` — Monte Carlo forecasting, two-stage stochastic
+  scheduling, MILP recovery, RUL — that only ever run when a specialist decides
+  to call one. There is no way for a user to ask "what if the FILLER runs 10 %
+  slower for the rest of the shift". This is the digital-twin capability, and
+  it is mostly UI over machinery that already exists. Impact: High. Effort: M.
+  Their version is worth studying for what to avoid as much as what to copy —
+  see the failure notes below.
+
+- **Specialist provenance up front, latency after.** Each of their five
+  specialist cards names its backing resource *before it runs* (`Foundation
+  Model API · claude-sonnet-4-5`, `UC SQL · <catalog>.<schema>.<table>`,
+  `Vector Search · <index>`), shows an amber "running…" border, then flips
+  green with an elapsed-time badge; the header carries the total. It makes a
+  parallel fan-out legible in a way a spinner never does. We show the model
+  badge on the answer and have the evidence trail, but nothing before or
+  during, and no timings. Impact: Med. Effort: S.
+
+- **Agent autonomy tiers.** Their API tags each agent `autonomous`,
+  `supervised`, or `advisory`, and only `supervised` agents emit proposals
+  needing human sign-off. That is a cleaner governance primitive than our
+  current position, where every recommended action is a proposal because
+  write-back does not exist. Tiering would let the distinction be a product
+  decision rather than a limitation. Impact: Med. Effort: S.
+
+### What their build got wrong, and what it warns us about
+
+Two of these are failure modes we have already had, which is the reason to
+record them.
+
+- Their flagship Supervisor demo can never succeed: the recommendation
+  dropdown's option `value` is the truncated *display label*, so the backend
+  cannot resolve the id and every run returns DEFER with "resubmit with
+  complete recommendation parameters".
+- One of their own suggested Genie prompts returns "no recommendations
+  available with annual revenue data" while the adjacent tab displays five
+  totalling $2.5M/yr — `gold_recommendations` is empty and the optimizer
+  computes at runtime. This is our five-dead-tables bug in another costume: an
+  empty table returns zero rows rather than an error, and the surface stays
+  confident.
+- Their optimizer contradicts its own simulator — an action advertising
+  +$1,159K/yr returns −$544K/yr when loaded into the scenario at defaults —
+  and contradicts itself, recommending both "switch Apache to water injection"
+  and "increase CO₂ injection on Apache". A what-if surface built on our
+  optimizers has to be reconciled against the recommendation that seeds it, or
+  it will do the same.
+- Their physics is thin where it is most likely to be probed: choke position
+  dominates every outcome with no decline, water-cut or GOR penalty, so the
+  trivially optimal answer is always "open every choke". A domain expert finds
+  that in about ninety seconds. Whatever we expose as a slider needs a
+  penalty term on the axis a line manager would push hardest.

@@ -136,6 +136,35 @@ def _grant(warehouse_id: str, statement: str) -> None:
         cur.close()
 
 
+def _ensure_schema(warehouse_id: str, catalog: str, schema: str) -> None:
+    """Create the trace schema if the setup job has not run yet.
+
+    deploy.sh calls this step long before the one-time setup job that creates
+    the schema, because the experiment id has to be baked into app.yaml before
+    the app is deployed. On a fresh workspace the link therefore failed with
+    SCHEMA_DOES_NOT_EXIST — and since a UC trace link is permanent and cannot
+    be unset, that left an experiment which can never be repaired. The next
+    deploy skipped to the "-2" fallback and the workspace collected a dead
+    experiment per attempt.
+
+    Creating the schema here is cheap and idempotent; the setup job then adds
+    its tables to the same schema.
+    """
+    if not warehouse_id:
+        print("  no warehouse id in profile — cannot pre-create the trace schema")
+        return
+    from _uc_sql import StmtCursor  # local helper over the Statement Execution API
+
+    cur = StmtCursor(warehouse_id)
+    try:
+        cur.execute(f"CREATE SCHEMA IF NOT EXISTS `{catalog}`.`{schema}`")
+        print(f"  schema ready: {catalog}.{schema}")
+    except Exception as exc:  # noqa: BLE001 - the link below reports the real failure
+        print(f"  WARN: could not ensure {catalog}.{schema}: {str(exc)[:160]}")
+    finally:
+        cur.close()
+
+
 def provision(env: str, settings: Path, app_sp: str = "", dry_run: bool = False) -> int:
     import mlflow
     from mlflow.entities import UnityCatalog
@@ -154,6 +183,8 @@ def provision(env: str, settings: Path, app_sp: str = "", dry_run: bool = False)
     if dry_run:
         print("Dry run — nothing created.")
         return 0
+
+    _ensure_schema(warehouse, catalog, schema)
 
     def link(candidate: str) -> tuple[str, dict]:
         """Create the experiment already attached to UC, and verify it took."""

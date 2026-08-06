@@ -4,6 +4,734 @@ All notable changes to ProdLine CoPilot are documented here. The format is based
 on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.3.6] - 2026-08-06
+
+Validated the way a user meets it: both environments destroyed down to service
+principals and permissions, then rebuilt from an empty workspace and tested end
+to end — and then, separately, examined while running, which is where most of
+this release came from.
+
+**84 bugs fixed · 856 new tests (1,458 → 2,314) · 2 new features.**
+Since v0.1.0: 151 bugs fixed, 6 security advisories closed, 27 features added,
+and the test suite grown from 511 to 2,314.
+
+Counts are measured rather than estimated: `pytest --collect-only` reports 1,342
+tests at v0.3.5 and 2,153 here, and the TypeScript suites 116 blocks and 161.
+
+### Added
+
+- **A CI gate, so the test suite is something a merge has to pass.** The suite
+  was large, behavioural and green, and none of that was load bearing: no
+  workflow ran pytest, ruff, tsc, eslint or vitest, so a pull request could
+  merge on a green tick with every one of them failing. The only checks that
+  existed validated the bundle and published docs, and the bundle one skips
+  itself when its repository variable is unset. Two hermetic jobs now run on
+  every pull request — pytest with ruff, and tsc with eslint and vitest —
+  needing no workspace and no secret, so a fork gets the same gate. The
+  Playwright smoke run is deliberately left out: its `webServer` boots the real
+  dev server against a warehouse and Lakebase, and a job that is red for
+  unrelated reasons is a job people learn to ignore.
+
+  Both jobs call `scripts/check.sh`, which is the same command to run locally,
+  so the two definitions of "passing" cannot drift. That indirection earns its
+  keep immediately: some GitHub Enterprise organisations disable hosted runners,
+  and on such a repository *no* workflow can start — the jobs report failure
+  with "hosted runners are disabled" without having run a test, which is how we
+  found that this repository has never completed a single Actions run, including
+  the two workflows that predate this one. Where runners exist the workflow is
+  the gate; where they do not, `./scripts/check.sh` is, and it checks the same
+  things.
+
+- **`scripts/check.sh`, one command for every gate.** Runs ruff, pytest, tsc,
+  eslint and vitest, reports all failures rather than stopping at the first, and
+  skips cleanly when a toolchain is absent. CONTRIBUTING now points at it.
+
+### Fixed
+
+Found by running the deployed app rather than by reading it — most from a single
+screenshot of a number that could not be true, which is the cheapest bug detector
+this project has. None of these failed loudly, which is why they survived a
+release that had already been validated from an empty workspace.
+
+- **Every optimizer divided bottles by 60 and called the answer cases.** The
+  line runs in bottles per minute and the plan is written in cases, 24 bottles
+  to a case. Five modules — the recovery calculator, schedule recovery, the
+  multi-shift planner, the production forecaster and the stochastic scheduler —
+  converted with `bpm × minutes / 60`, the minutes-to-hours conversion for a
+  *per-hour* rate applied to a per-minute one. At the nominal 420 BPM over a
+  480-minute shift that is 3,360 cases against a plan of 8,400: the line looked
+  2.5× slower than it is, and nothing raised.
+
+  It did not stop at a wrong figure in a report, because recovery advice is a
+  feasibility test. A line that would comfortably make its plan was told it
+  could not, and the remedy offered was to run faster than its own stated
+  maximum — 4,200 cases in the 240 minutes left needs 438 BPM against a 450
+  limit, and was reported infeasible. A flawless shift forecast at 3,280 cases,
+  a 61% shortfall invented entirely by a unit conversion.
+
+  The prompts were right the whole time: `prompts/_shared.py` has told the model
+  to "divide by 24 for cases/min" since throughput was last corrected, and the
+  producer that actually makes the cases divides by `BOTTLES_PER_CASE`. Only the
+  arithmetic downstream disagreed. There is now one conversion in
+  `optimizers/_units.py`, pinned by test to the producer's constant, with a
+  grep-level guard so the mistake cannot reappear uniformly the way it arrived.
+  Two existing tests asserted the wrong numbers and were corrected.
+
+  The governed silver model had the same error as a label, advertising the
+  line's `throughput_unit_of_measure` as `cases_per_min` when it carries
+  bottles.
+
+- **The quality model read its own probability table backwards.** The CPT holds
+  P(failure | condition) — FILLER's `fill_level_out_of_spec` is an expert-assigned
+  85% chance of a quality failure. It was fed into an odds-form Bayesian update,
+  which needs a *likelihood*, P(evidence | failure). Observing that condition
+  returned a risk of 0.23 and the label "moderate". Worse, for any value below
+  0.5 the update moved risk the wrong way: a recent fail rate of 6% — above the
+  5% threshold that admits the evidence at all — produced 0.007, below the 5%
+  prior, so noticing a problem left the model calmer than knowing nothing.
+  Now a noisy-OR, which keeps the table's meaning: one cause at 0.85 gives 0.86,
+  more causes only ever raise risk, and `normal` sets the baseline instead of
+  stacking on top of it. A fail rate handed over as `5.0` is also read as 5%
+  rather than 500%.
+
+- **The RUL tool could not accept the argument its own error told you to pass.**
+  `estimate_rul` never declared `custom_thresholds`, so LangChain dropped it —
+  and the maintenance predictor's prompt instructs the model, in step 5, to send
+  exactly that. Every machine-specific sensor therefore came back
+  `unknown_sensor_type` with a message advising the model to do the thing it had
+  just done. The parameter is now in the signature. A half-specified threshold
+  no longer defaults `critical` to zero either, which had made any positive
+  reading an emergency.
+
+- **A shift with a changeover had its plan read as zero cases.** `shift_4` is two
+  rows: a 45-minute changeover with `planned_cases = 0`, then the production
+  segment with 7,600. `load_plan_and_constraints` took `LIMIT 1` with no
+  `ORDER BY`, so the warehouse was free to return the changeover, and every
+  feasibility answer for that shift was computed against a target of nothing —
+  a plan that is met before the shift starts. It now orders by time, picks the
+  segment with cases to make, and reports the segments and their total. Genie
+  was taught the same false "ONE ROW per shift_id" rule and has been corrected.
+
+- **Genie was taught four columns and an enum that do not exist.** The
+  `kpi_recommendations` schema was invented outright — `kpi_metric`,
+  `condition_type`, `threshold_value`, `severity`, `recommendation`,
+  `expected_impact` against a real table of `recommendation_id`, `category`,
+  `title`, `description`, `priority`, `estimated_impact` — so every
+  recommendation question produced failing SQL or nothing. `shift_crew.role` was
+  advertised as `operator | lead | maintenance | quality | supervisor` when the
+  roles are `operator | mechanic | qa | supervisor`, and an example query sorted
+  by three roles that match no rows. Inventory `status` was described as OK or
+  LOW when it is OK, LOW or CRITICAL, with LOW defined wrongly. Per-machine
+  `throughput_per_min` and `nominal_capacity` were both labelled cases/min when
+  they carry bottles — the same 24× error as the governed model above.
+
+- **The prompt said "no others exist" while three tables did.**
+  `maintenance_windows`, and `event_log_bronze` with the `resolution_minutes`
+  and `outcome_*` columns the gold view drops, are now listed — the second is
+  the only way to answer whether a repair actually held.
+
+- **The project gave three answers to which version it was.** `package.json`
+  said 1.0.0, `pyproject.toml` said 0.3.6, and the newest tag said v0.3.5. None
+  of it broke anything — the npm version is read by nothing — which is why it
+  survived several releases and why anyone checking the repository out to find
+  what they had was misled. Pinned to one number, with a test that fails the
+  next time they disagree or a version is bumped without release notes.
+
+- **Downtime was charged to OEE twice.** 43.5% against 3,732 cases made at a
+  6,283-case pace — about 59% of what the line could have done, so sixteen points
+  that no loss on the floor corresponds to. Availability and performance are not
+  independent: a stopped line has no availability and no speed, so both factors
+  go to zero on the same tick. Taking a plain mean of each and multiplying them
+  charges the same downtime to availability, then to performance, then squares
+  the penalty in the product. Performance belongs over run time, not planned
+  time. It is now weighted by availability, which restores the identity that
+  makes the split worth reading: A × P is the time-average of the instantaneous
+  A × P. Replaying 19,961 ticks of a real shift through both versions: 59.4% as
+  shipped, 65.4% fixed, against 64.8% implied by the cases on the floor. The gap
+  scales with downtime, so the tile was worst exactly when someone was most
+  likely to be looking at it. The test that asserted the old behaviour was
+  asserting the bug.
+- **Three unit bugs in what the line reports it is making**, all from one
+  screenshot showing 5,680/min next to a plan of about 17.5 cases/min. The
+  Lakebase sink read `throughput`, but the snapshot it is handed emits
+  `throughput_per_min`, and `dict.get` with a default does not fail — so every
+  serving row carried 0.0 while the same tick reached bronze at ~300/min, and all
+  nineteen machines looked idle on a healthy line. `total_throughput` summed a
+  series line, counting each bottle once per station it passes through; it is now
+  the rate at the last station. And conveyors reported 2% speed, because the
+  sentinel capacity of 9999 that stops them bottlenecking the line reached
+  `speed_pct` as flow/9999 — a belt runs at its set speed or it does not run.
+- **A buffer was sized on the sentinel rather than on what flows through it.**
+  `build_line` sized each buffer off the faster of its two neighbours, which took
+  the conveyor's 9999. Eight of eighteen buffers came out roughly twenty-four
+  times too large, so a stop upstream looked contained for minutes after the line
+  had really begun to starve — the opposite of what a cascade demo is for. The
+  largest buffer drops from 833 units to 35.
+- **Five optimizer and tool bugs that returned plausible wrong answers.** The
+  Pareto chart summed past 100%, because each category divided its own loss by
+  the multiplicative OEE gap; at A = P = Q = 90 the cumulative finished at 110.7%
+  and the ROI ranking built on it was distorted with it. Maintenance timing was a
+  fixed 10% dressed as a search: expected cost rose monotonically with risk and
+  nothing rewarded waiting, so the minimum was always the first candidate,
+  whatever the risk curve. The multi-shift MILP was unreachable — cases produced
+  is speed × time and both are decisions, so the solver rejected the constraint
+  at construction and a guarding `try/except` sent every call to the greedy
+  fallback, leaving the Benders master, the speed continuity and the joint
+  CIP/maintenance placement as dead code advertising an optimization that never
+  ran. IQR quartiles used integer-division nearest-rank, biasing the fences worst
+  at n = 10, exactly where the guard admits data. And `depletion_estimate`
+  defaulted a missing horizon to zero, so a material two hours from empty
+  reported `will_deplete: False` — the caller is an LLM and the argument looks
+  optional, so it now returns `None` with a note rather than a confident wrong no.
+- **One repaired row stopped the live event feed for six hours.** An operator
+  closed a stuck event by setting `timestamp_end`; a Delta streaming source
+  rejects a commit that rewrites files, so the stream died and died again every
+  cycle after, because the offset never advanced past the rewrite. The reader
+  carried `ignoreDeletes`, which covers a delete-only commit and not an update.
+  What turned a one-minute failure into a six-hour one is that nothing said so:
+  the cycle summary was built from the list of streams the loop had *started*,
+  logged before a single query had run, so a stream failing every cycle was named
+  among the drained ones every cycle, and the loop awaited `streams.active`,
+  which a failed query has already left. "Terminated with error" appears zero
+  times in a log containing seven consecutive failures.
+- **Incidents the board could not show were still being reported.** The event log
+  is append-only — resolving an incident appends a separate `resolved` row and the
+  original keeps `timestamp_end` NULL for good — so that column does not mean
+  "still happening"; it matches every incident ever started on the shift. Ten
+  places in the Genie space said otherwise, in both the table description and the
+  example SQL. On prod the two rules disagreed nine to one, which is why the
+  assistant reported unresolved machine incidents against an empty board. The
+  deploy now also reconciles the data, filling in `timestamp_end` from the resolve
+  marker that already closed each incident and ageing out carryover nobody is
+  coming back for.
+- **The snapshot's shift clock was frozen and its line count did not add up.**
+  Time remaining read 240 min in snapshots taken hours apart — exactly what the
+  clock says at 12:00 UTC — because the live overlay advanced the timestamp but
+  left elapsed and remaining as the cached bundle had computed them. Neither
+  environment could have produced a correct number: dev has no scenario row at
+  all, and prod's is dated 2025-01-01, putting the shift end 838,000 minutes in
+  the past. Separately, "16 running, 2 issues" on a nineteen-machine line was
+  missing one: the issue list matched stopped, degraded and starved but not
+  blocked, so a machine that cannot discharge downstream counted as neither.
+- **Ninety seconds was under the work, and losing meant losing the answer.**
+  Reported as a prod-only timeout; it was not. The same question took 88s on dev
+  and 93s on prod against a 90s budget, and a budget inside the spread of the work
+  it bounds decides coin flips rather than protecting anyone. Measured off the
+  event stream: routing at 4.7s, seven tool calls finishing at 38.7s, then forty
+  seconds of silence while the model composes, then ten seconds of prose. The
+  tools are a third of it. The worse half was what a cut did — tokens go out as
+  they arrive but the answer variable is only assigned when a whole message lands,
+  so at the timeout it was still empty even though prose had been on the reader's
+  screen for ten seconds, and the handler replaced all of it with "analysis timed
+  out". Waiting the full budget and watching the answer vanish is worse than
+  either finishing or failing fast. The budget is now 150s, clear of the measured
+  range, and a cut keeps what was streamed.
+- **`analyze_live.py` died with a NameError on its first line.** It reads
+  `os.environ` in its argument parser without importing `os`. Turning ruff on
+  found it; the other 59 violations were import order and whitespace.
+- **The trace diagnostic blamed the wrong thing.** Reported as prod having no
+  MLflow traces — prod has 639 spans, newest matching the very question that
+  prompted the report. Traces in Unity Catalog are served by a SQL warehouse, not
+  by the tracking server, and neither the UI nor the SDK picks one for you, so a
+  full experiment reads as empty until you do. The diagnostic only checked
+  provisioning, so it printed every check green and then guessed "the app SP may
+  lack write access" — sending the reader to re-grant permissions on a working
+  system. It now counts the spans, which is the one fact separating "nothing was
+  written" from "nothing is reading".
+
+An audit of the deploy path from the point of view of someone cloning this into
+an empty workspace, rather than re-running it in the one where it was built.
+Every item below worked here and only here.
+
+- **Trace storage no longer links to a schema that does not exist yet.** Trace
+  provisioning runs early in the deploy, because the experiment id has to be
+  written into `app.yaml` before the app is deployed — well before the one-time
+  setup job creates the UC schema. On a fresh workspace the link therefore
+  failed with `SCHEMA_DOES_NOT_EXIST`, and because a Unity Catalog trace link is
+  permanent and the backend refuses to unset it, the experiment that had just
+  been created was unusable. The next deploy fell through to the `-2` fallback
+  name, so every attempt left another dead experiment behind and the app wrote
+  its spans nowhere. The step now creates the schema itself first; the setup job
+  adds its tables to the same one.
+- **All 95 metric views were failing silently.** The upstream industry data
+  model ships `CREATE SCHEMA` for the domains that hold tables, but not for
+  `_metrics`, where every metric view lives. On a fresh catalog all 95 failed
+  with `SCHEMA_NOT_FOUND` — on the first pass and again on the retry — and the
+  installer still printed its summary and reported success. The schemas are now
+  derived from the view statements themselves and created up front, so a model
+  that adds a second metric schema is covered without another change here.
+
+- **Anthropic answers opened with 6,000 characters of base64.** The block-list
+  filter has always dropped the model's private reasoning, but it only ran when
+  the content parsed as JSON. Streaming accumulates chunk content by string
+  concatenation, so where the first chunk carried the serialised block list and
+  the rest carried prose, the answer arrived as a complete JSON array with the
+  text glued *outside* the closing bracket. `json.loads` rejects that as "Extra
+  data", the guard returned "not a block list", and the whole payload —
+  reasoning signature included — was rendered into the chat as the answer. It
+  parses with `raw_decode` now, taking the array off the front and keeping the
+  remainder as text. On a live prod answer that is 7,420 characters reduced to
+  the 777 the manager was meant to read. Only the non-streaming path was ever
+  clean, which is why every earlier check of this passed.
+- **The answer now streams as the model writes it.** "Streaming" previously
+  described the tool trace only: the specialist's output was accumulated in a
+  worker thread and released as one `answer` event, so the user watched tool
+  chips animate and then a finished multi-paragraph reply appeared in a single
+  jump. The ReAct loop is now consumed in both `updates` and `messages` mode,
+  and the text is forwarded token by token. This costs nothing in latency —
+  those tokens were already crossing the wire, they were just being held.
+  Two filters matter and both were verified against a live endpoint: the
+  `tools` node emits on the same stream, so raw tool JSON would otherwise be
+  typed into the answer, and tool-call arguments arrive there as fragments. A
+  draft is also discarded when the model abandons a preamble to call a tool,
+  which is why the streamed text ends up matching the final answer exactly
+  rather than accumulating the model's thinking-aloud. The draft stays a
+  draft: the `answer` event remains authoritative, since synthesis can rewrite
+  it.
+- **Multi-turn memory was switched off by omission in the UI.** The server has
+  a conversation store, a history window and a context overlay; it created a
+  conversation, saved both sides of every exchange and returned the id on each
+  answer. The client neither declared `conversation_id` on its event type nor
+  sent it back, so every question opened a new conversation and arrived with no
+  knowledge of the one before it — "what about the next machine?" answered
+  cold, with nothing logging a problem. The client now round-trips the id and
+  drops it when the shift changes. Fixing that exposed a second defect
+  underneath: `load_history` ordered `created_at` ascending under a `LIMIT 6`,
+  returning the *oldest* six messages. That is identical to the newest six for
+  the first three turns — long enough to look correct — after which the window
+  froze on the opening exchange for the rest of the conversation.
+- **The assistant's SSE stream went silent for up to 90 seconds.** Frames are
+  emitted per tool call, so a question needing no tools sent nothing between
+  the routing status and the final answer. The app sits behind a proxy entitled
+  to drop an idle connection, which surfaces as a spinner that never resolves.
+  The drain loop already woke once a second; it now emits an SSE comment on
+  each idle tick, which the client's reader skips and the token accounting no
+  longer bills as model output.
+- **A timed-out specialist kept its worker.** `future.result(timeout=…)` stops
+  waiting but cannot stop a thread, so an abandoned run held one of six slots
+  until it finished on its own — the pool starvation that widening the pool was
+  meant to prevent. The ReAct loop now checks a cancellation flag between
+  super-steps, bounding the overrun to the call already in flight.
+- **The proxy reported the wrong error for any non-JSON upstream response.**
+  `proxyToAgent` called `.json()` unconditionally; an HTML 502 or a truncated
+  body threw a parse error that became `502: Unexpected token < in JSON`,
+  discarding the real status and message. It now inspects the content type and
+  forwards the upstream status either way.
+- **Action chips claimed to execute and did nothing.** The panel header read
+  "Click to execute" and clicking advanced a chip to a green ✅ "done" that was
+  purely local, discarded on the next render, and backed by no request: the ids
+  the server emits have no endpoint, and write-back is designed but explicitly
+  unimplemented. A cosmetic button is bad; one that reports completion is worse,
+  because someone stops chasing work the screen says is handled. Removing the
+  buttons fixed the lie and left a flat list the panel itself told the operator
+  to hand onward, by retyping it. So the buttons are back doing the thing the
+  panel actually asks for: one click copies a ready-to-paste handoff carrying
+  the system, the action and its provenance. No row reports work as complete,
+  and the execution path stays wired for a real connector. The README's Key
+  Capabilities said operators could "approve and act on" these; it now says what
+  they are and links the write-back design doc, which is explicit that nothing
+  is implemented.
+
+- **Vector Search had never once run, in any environment.** Two independent
+  defects, each individually silent, and both hidden by the same fallback.
+  First, the app could not authenticate: `VectorSearchClient()` with no
+  arguments resolves credentials through MLflow, which wants a personal access
+  token, and a Databricks App is only ever given OAuth client credentials — so
+  the constructor raised on every call. Second, even with credentials the
+  parser read column names from `result.columns`, a key no server returns; they
+  arrive under `manifest.columns`, so the parse raised `KeyError`. Both
+  exceptions were caught and turned into keyword search, which returns
+  well-formed, plausible results — so the endpoint stayed online, billed by the
+  hour, and served nothing, while the unit test asserted the invented response
+  shape and reported the semantic path as green. The client is now handed the
+  app service principal explicitly, the parser reads the real envelope, and the
+  test fixture is a response captured from a live index.
+- **Enabling Vector Search meant hand-editing `app.yaml`, and the deploy step
+  read the wrong file anyway.** The provisioning gate parsed a literal
+  `app.yaml` — the committed prod template, deliberately blank — instead of the
+  gitignored `app.<env>.local.yaml` the deploy actually ships, so it reported
+  "not enabled" on every environment including one whose endpoint name had been
+  rendered into place seconds earlier. It now reads `$APP_SOURCE_YAML`, and the
+  endpoint is set once via `vector_search_endpoint` in project-settings, from
+  which `render_app_yaml.py` derives both `VS_ENDPOINT` and the cost panel's
+  billing flag — previously two hand-maintained values whose drift is how the
+  panel came to invoice ~$58/month for an endpoint nobody had provisioned.
+  Clearing the setting turns the feature off, rather than being skipped as an
+  unfilled placeholder like every other field.
+- **The first Vector Search deploy looks hung.** Creating an endpoint takes
+  15–40 minutes and `--wait` prints nothing throughout, on a script that has
+  otherwise emitted a line every few seconds. The step now checks whether the
+  endpoint already exists and says which kind of run this is before it blocks,
+  and the settings file states the cost in both time and money at the point of
+  the decision.
+
+- **The setup job created five tables nothing ever writes.** `machine_state`,
+  `line_kpi`, `event_log`, `telemetry` and `quality_checks` were left over from
+  a layering the pipeline moved off long ago; the producer writes `*_bronze` and
+  the quality gate publishes `gold_history_*`. Their only remaining effect was
+  harm: they are the names a model guesses first, and a query against an empty
+  table returns zero rows rather than an error, so a specialist would answer
+  confidently from nothing and the sole symptom was confidence drifting down.
+  The DDL is gone, so the same mistake now raises `TABLE_OR_VIEW_NOT_FOUND`,
+  which a specialist reports and a human can act on. `setup_synced_tables.py`
+  no longer mirrors three of them into Lakebase either — that provisioned a
+  billed sync pipeline over permanently empty tables whose output nothing read.
+- **A fresh deploy had no quality or event data.** Both tables fill only when a
+  scenario fires, so a newly deployed line runs clean and stays empty
+  indefinitely, which silently disables `quality_specialist` and
+  `retrieve_similar_cases`. The setup job now seeds a shift of routine QC and a
+  plausible spread of resolved events via `backfill_quality_and_events.py`,
+  which until now no deploy step invoked.
+- **Lakebase playback tables were created by a file nobody ran.** The DDL for
+  the four `ai_serving.*_history` tables lived only in
+  `scripts/migrate_history_tables.sql`. On a fresh Lakebase the producer's
+  dual-write failed soft every tick and the live line never animated. The app
+  creates them itself now, like every other table it owns.
+- **Chat persistence needed a hand-run grant.** `init_lakebase_role.py` granted
+  only `ai_serving`, never `ai_chatbot`, and ran before the app had created
+  either schema — so the first grant raised, aborted the remaining statements,
+  and the deploy printed a warning and carried on. It now creates both schemas
+  first, grants both, and fails loudly on a partial result.
+- **The placeholder guard passed on unfilled placeholders.** It tested whether a
+  value started and ended with `<…>`, so embedded ones such as
+  `projects/<your-lakebase-project>/branches/main` were reported as filled and
+  failed later inside Lakebase registration. `lakebase_checkpoint_volume` was
+  not checked at all and sent streaming checkpoints to a nonexistent catalog.
+- **The Data Quality tab embedded a 404 in other people's workspaces.** Three
+  things must be true for `/embed/dashboardsv3/<id>` to resolve — the dashboard
+  exists, it is published with embedded credentials, and the viewer can read it
+  — and all three were assumed. `SET_ME` is a non-empty string, so it passed the
+  `-n` test and the publish and grant calls ran against a literal id of
+  `SET_ME`; the grants that did land went to the app service principal only, so
+  the tab worked for whoever deployed it and 404'd for everyone they showed it
+  to; and publishing lived in a bash script that only runs under
+  `scripts/deploy.sh` and warned-and-continued on failure, so a plain
+  `databricks bundle deploy` produced a dashboard that existed, resolved by
+  name, and rendered Databricks' bare "The resource is not available" page with
+  nothing anywhere to explain it. `scripts/ensure_dashboard_embed.py` now
+  publishes, grants the app SP *and* human viewers (`DASHBOARD_VIEWER_GROUPS`
+  for a team), and reads the state back — and it fails the deploy rather than
+  warning. The app checks publish status too, so if it is ever wrong again the
+  tab shows the reason and the command to fix it instead of a blank Databricks
+  page.
+- **Vector Search shipped switched on.** `app.yaml` named an endpoint and set
+  `OPS_VS_ENDPOINT_ALWAYS_ON=true` by default, so the cost panel billed roughly
+  $58/month for an index that provisioning frequently skipped. Both now default
+  off, and the skip no longer blames `VS_ENDPOINT` when the real cause is an
+  unresolved catalog.
+- **Legacy AppKit queries under `config/queries/`.** Never reachable at runtime
+  and never validated: five targeted the dead tables, one targeted
+  `machine_telemetry` — a table that never existed — one selected a column that
+  never existed, and one queried `consumption_log`, also absent. Repointed to
+  the live tables, or deleted where they described a schema that is gone.
+- **`analyze_live.py` scored broken tools as healthy.** The tools catch their
+  own exceptions and return `status: success` with the failure in the body, so
+  the payload has to decide. `UNRESOLVED_COLUMN` (how Spark reports every wrong
+  column), timeouts, `DIVIDE_BY_ZERO`, errors under a `message` key or past the
+  first row, and nested-empty results all read as `ok`. `--since` also defaulted
+  to the epoch, letting a trace from an earlier run of the same question supply
+  this run's tool statistics; it is now inferred from the run file.
+- **The eval gate passed when it measured nothing.** Every threshold passes at
+  `n == 0`, which is right for a metric that does not apply to a question and
+  wrong for all of them at once — a run against an empty workspace was
+  indistinguishable from a green one. A run that scored no assertions now fails.
+- **Tests that could not fail.** The intent test asserted its own fixture
+  against a copy of the specialist list rather than calling the router; the
+  response-quality test built a fake answer by joining the keywords it then
+  asserted were present; `test_recursion_limit_set` was `pass`. Two golden
+  records were fully satisfiable by restating the question.
+- **The SQL validator crashed on startup.** It counted rows across every object
+  in `information_schema` as one `UNION ALL`, and a Vector Search index in the
+  same schema answers `count(*)` with `DATA_SOURCE_NOT_FOUND` — taking down the
+  whole run, which is why it had stopped being run. Counts are best-effort now,
+  and coverage extends to `config/queries/*.sql`, which found five of the bugs
+  above.
+- **The agent could reason about two shifts at once.** `build_context` used the
+  `shift_id` it was given while `_overlay_live_state` read `SIM_SHIFT_ID` from
+  the environment, so past events could describe one shift and live machine
+  state, KPIs and active incidents another. Routing reads `active_incidents`,
+  which meant the specialist could be chosen by an incident on a shift nobody
+  asked about. The HTTP path never showed it — `_server_shift_id` deliberately
+  overrides whatever the browser sends, so the halves agreed by coincidence —
+  but `evaluations/run_eval.py` calls `invoke` directly with the shift from its
+  dataset, so the judges were the ones seeing it. The overlay now takes the
+  shift as an argument and treats the environment as a fallback.
+- **A failed specialist claimed a fallback had run.** The synchronous error path
+  returned "Falling back to a general analysis" and then did no such thing;
+  `_should_skip_synthesis` matches "encountered an error", so the synthesis pass
+  was skipped too. It now says no analysis was produced.
+- **The timeout was documented as a resource ceiling and is not one.**
+  `future.result(timeout=…)` releases the caller, not the thread — nothing in
+  Python interrupts a call in flight. The streaming path checks a cancellation
+  flag between ReAct super-steps, so it stops after the model or tool call
+  already running; the synchronous path is one blocking `invoke` with no such
+  seam and can hold a worker past the timeout the user already saw. The
+  recursion limit is what actually bounds the work, and the comments now say so.
+
+- **`estimate_rul` could never succeed.** The maintenance_predictor prompt told
+  the model to send `{"ts": …}`; the estimator read `r["timestamp_minute"]` as a
+  bare subscript, so every correctly-formed call raised `KeyError` — on the one
+  tool that specialist has and no other does. Both spellings are accepted now,
+  the prompt asks for the right one, and a malformed reading gets an explanation
+  rather than a stack trace. The prompt also asked the model to convert
+  timestamps to minutes from shift start using a `shift_start` field that does
+  not exist in the context; the trend is invariant to the time origin, so it now
+  just asks for minutes since the first reading.
+- **An unrecognised sensor reported CRITICAL for a healthy machine.** Thresholds
+  fell back to `{"warning": 0, "critical": 0}`, and every positive reading is
+  above zero, so the tool answered "exceeds critical threshold (0). Immediate
+  maintenance required." The prompt makes that the normal case, not an edge: it
+  tells the model to pick a real channel from `machine_sensors`, whose names are
+  machine-specific and are not the five hardcoded types. The tool now says it
+  has no thresholds and asks for the `alarm_low`/`alarm_high` it was already
+  reading in step 1.
+- **A percentage OEE forecast a perfect shift.** The Monte Carlo simulators
+  clamp with `min(1.0, …)` while everything the model can see — the KPI table,
+  the context bundle, and `prompts/oee_coach.py` in as many words — carries OEE
+  as 0-100. A model that followed its instructions had all 1000 simulations
+  pinned to a flawless line, returning P10 = P50 = P90 at the maximum with
+  nothing logged. Both simulators and the `calculator` OEE operation now accept
+  either scale; `calculator` previously turned `oee(85, 90, 98)` into an
+  `oee_pct` of 74,970,000.
+- **MTTR calibration averaged an event type nothing writes.** The query filtered
+  `event_type = 'major_stop'`, which belongs to the legacy seed generator — the
+  producer and backfill write `machine_breakdown`, `minor_stop`,
+  `sensor_failure` and friends. Averaging zero rows is not an error, so MTTR sat
+  at its 15-minute default in every forecast. It now averages the unplanned
+  stops that need a repair, and a test pins the query's event types to the ones
+  the backfill actually writes.
+- **The shift briefing looked for three fields that do not exist.** It compared
+  `current_qty` against `reorder_point` (the column is `on_hand_qty`), called
+  inventory items `item_id` (`material_id`), and looked for quality checks with
+  `NOK` (the values are lowercase `pass`/`fail`). All three matched nothing
+  silently, so the briefing reported no stock risk and no quality holds on a
+  shift that had them — on the specialist that runs at every shift change.
+- **The shift briefing was handed `sql_query` and no list of tables.** It is the
+  one specialist that inlines its own output template rather than importing the
+  shared block, and the table list went with it. Its own worked example is "last
+  3 events on a specific machine", so the model did the reasonable thing with no
+  schema in front of it and wrote `FROM event_log` — zero rows, no error, and a
+  handover reporting a clean shift. Naming no table turns out to be as harmful
+  as naming the wrong one, and neither dead-table guard could see it: the bad
+  name existed only in the model's guess, never in the prompt or the repository.
+- **The citation rule shown to all seven specialists named a dead table.** Its
+  worked example was "Based on machine_state data…", a table with zero rows,
+  fourteen lines before the schema block gives the real name.
+- **Two tools returned failures shaped like data.** `retrieve_similar_cases`
+  passed the SQL error envelope through as a similar case, so the model got one
+  "case" with no root cause and no corrective action and summarised it.
+  `load_plan_and_constraints` filtered the error rows out and returned
+  `{"plan": {}, "constraints": []}`, which reads as "this shift has no plan"
+  rather than "the warehouse is down".
+- **Confidence was tallied against the wrong specialist.** `analyze_live` bucketed
+  each answer's confidence by the *expected* specialist, so every mis-routed
+  question credited a specialist that never ran, systematically rather than
+  randomly. Unparsed confidence is now counted too, instead of vanishing and
+  leaving a distribution with no denominator.
+
+A second pass, run against the two environments while they were live rather
+than against the deploy path. Most of what follows is data that was present,
+well-formed and wrong — the kind a pipeline ingests, a quality gate passes and
+a dashboard charts without anything failing.
+
+- **Dev's producer was consuming prod's incidents.** Every environment shares
+  one Lakebase database and both producers polled the same `scenario_commands`
+  table with no shift filter. Whichever polled first claimed the row, applied
+  the fault to its own line, emitted the event into its own bronze schema and
+  flipped the shared row to `active` — after which the environment the operator
+  was watching never saw it pending. Intermittent, because it is a race.
+  Rehydration after a restart had never run either: it addressed an attribute
+  `CommandStore` has never had, against an already-qualified table name, and
+  both raised into a bare `except`. Same symptom, so it hid behind the race.
+- **Deploys left the streaming jobs running the previous build.** `bundle
+  deploy` replaces the files a job runs from, but a run already in flight keeps
+  executing what it started with, and the producer and quality-sync jobs are
+  continuous, so they never terminate on their own. Every deploy after the first
+  ran the day before's code. Found the hard way: the shift-scoping fix above
+  went out to both environments and changed nothing. A fix that deploys cleanly
+  and has no effect sends you hunting a second bug that does not exist. The
+  deploy now cancels the active runs; continuous brings them straight back.
+  The restart step then failed on its own first outing, because `--suffix -dev`
+  reads as a flag with no argument to `argparse`.
+- **Every read left the connection idle in transaction.** The pooled connection
+  runs with autocommit off and `query()` returned straight after fetching, so
+  the backend held an ACCESS SHARE lock on everything it had touched until some
+  later query happened to end it. The SSE stream reads `scenario_commands` every
+  second, so one was almost always open: a deploy's `ALTER TABLE` could never
+  take ACCESS EXCLUSIVE, and because an exclusive request queues ahead of later
+  readers, every producer poll then blocked behind the ALTER. One dev deploy
+  stalled fourteen minutes and froze incident handling in both environments
+  while it waited. Reads now end their own transaction, guarded by a write-unit
+  depth so a read nested inside `transaction()` cannot discard the writer, and
+  the role script sets `lock_timeout` so DDL fails fast instead of taking the
+  line down.
+- **Recover could not clear three different kinds of event.** It resolves the
+  `scenario_command` a producer holds a fault open for, so it was a no-op on any
+  event without one and the handler discarded the `count: 0` that said so — the
+  button flickered and the row stayed open, indistinguishable from a fault
+  refusing to clear. A resolve request for a command the producer no longer held
+  in memory, which is every command that outlived a deploy, fell through to the
+  terminal UPDATE without emitting the resolve marker the feed pairs events on;
+  dev's CASE_PACKER sat active for hours with its command already terminal. And
+  the seeded carryover event has no command behind it at all. The endpoint now
+  appends the marker itself when no command is holding the fault, so nothing on
+  the board is unclearable, and the producer rebuilds an incident from the
+  command row when its own memory has been cycled.
+- **An open event nothing resolves stayed active forever.** `event_log_bronze`
+  is append-only, so the producer cannot close the original row — it appends a
+  synthetic `resolved` row and the feed pairs the two up. An event whose marker
+  never arrives is therefore active for good, and the backfill seeds exactly one
+  as shift carryover. The feed now ages an unresolved event out after one shift:
+  carryover is defined against the current shift, so once that shift is over the
+  row is either resolved without a marker or stale. An explicit `timestamp_end`
+  still wins, and an unparseable start is left visible rather than hidden.
+- **The server judged an event open by a field that is never set.** Closure
+  lives in the marker row described above, so `timestamp_end IS NULL` does not
+  mean "still happening" — it means "written as an opener", which every incident
+  row is. The browser has applied the real rule since the feed was built; the
+  server had not. Asked to diagnose a stopped FILLER, the snapshot reported three
+  open DEPALLETIZER breakdowns closed ninety minutes earlier and no FILLER at
+  all, while the line state, read from a different source, correctly named
+  FILLER as the only issue. The specialists were handed the same unreconciled
+  list under the name `active_events`, and the intent router was shown resolve
+  markers as though they were incidents. The rule now lives in one module that
+  deliberately mirrors the TypeScript so the two cannot drift.
+- **Three million rows of noise on the sensor a machine is judged by.**
+  `depal_cycle_time` had no `nominal_value`. The synthesizer jitters 2% around
+  nominal and fell back to 0, so the band became ±1 absolute and the sensor
+  emitted `uniform(-1, 1)` — a cycle time, in seconds, going negative, on the
+  one sensor DEPALLETIZER is primary-mapped to. Nine speed sensors had a
+  setpoint but no alarm band, which is what `estimate_rul` projects a trend
+  against. And the 2% jitter ignored the band entirely, so a filler with limits
+  at 325/335 ml breached its own fill spec at random; jitter is now capped at
+  40% of the distance to the nearer limit. A missing nominal raises instead of
+  synthesizing around zero.
+- **A rate was being accumulated, and a level refilled at someone else's
+  threshold.** `insp_vision_nok_count` and `label_vision_nok_count` are declared
+  EA/min with an alarm at 10 and were emitted as monotonic counters — over the
+  alarm within minutes of every shift, climbing without bound, then dropping to
+  zero on restart, which reads as a defect rate that suddenly healed. Both are
+  primary-mapped, so that was the number the inspector and labeller were judged
+  by. Separately, level refill triggered at a flat 20% whatever the sensor's own
+  alarm said: `washer_caustic_level` alarms at 60 and so sat under its own
+  threshold for most of a shift, 586 breaches in fifteen minutes on a machine
+  reporting `running`. Jitter was applied after the zero floor rather than
+  before, so `shrink_film_remaining` reported −0.09% of a roll, and the
+  probabilistic refill could leave a `running` LABELLER on an empty label roll.
+- **`alert_thresholds` is advertised to every specialist as per-sensor limits
+  and holds none.** Its `sensor_name` column carries `speed_pct` and
+  `alarm_count` for four machines; not one of the 66 sensors appears. Looking one
+  up returns zero rows, silently, which is the trap the same prompt warns about
+  two paragraphs earlier. Documented for what it is and pointed at
+  `machine_sensors`. Two neighbours in the same prompt: inventory status is
+  uppercase `OK`/`LOW`/`CRITICAL` while the prompt states status values are
+  lowercase, so filtering it for `low` quietly matched nothing; and
+  `machine_bom`, 34 rows mapping material to machine, was missing from a list
+  that claims to be exhaustive, so the supply chain advisor could say crown caps
+  run out in forty minutes but not that the CAPPER stops.
+- **Answers were cut off before the section that says how much to trust them.**
+  Every specialist carried `max_tokens=2048`, generous against the prompt's
+  250-word contract and not generous at all against a reasoning model, which
+  spends most of a completion budget on reasoning tokens nobody sees. The answer
+  truncates from the bottom, so what goes is Priority Actions, Estimated
+  Recovery and Confidence — and what is left still reads as a finished answer.
+  Raising the number only moves the cliff, so the answer paths now set no cap;
+  length stays bounded three ways that fail loudly instead of silently. The
+  router keeps its cap of 50, because it returns a specialist name.
+- **Chat answers rendered literal asterisks around every metric.** Two
+  formatting rules collide: bullets lead with a bolded key, and every metric is
+  bolded inline. Models apply the second inside the first and emit
+  `**OEE **74.2%****`, which markdown cannot nest.
+- **The dashboard and the assistant disagreed about OEE.** Line Status showed
+  1.3% and the assistant, reading the same shift five minutes later, said 0.0%.
+  The line was in a full cascade stop, so the assistant was right. The UI carries
+  the previous frame across a tick where OEE is zero while throughput is not,
+  because the producer emits `avg_speed_pct=0` for a single tick mid-cascade;
+  its comment says "for this tick only" three times over and nothing bounded it.
+  A stopped line satisfies the same condition on every tick, so the hold never
+  released. Bounded to one tick and moved to a pure function with tests.
+- **`*_to_now` was computed from the current tick.** The columns meant "right
+  now" while their names promised "since the shift began", and the row
+  contradicted itself the moment a line stopped: `oee_to_now` 0.0 next to
+  `cumulative_cases` 1965. Every consumer reads them as shift metrics, and it is
+  what led the UI to treat a legitimate zero as a compute glitch. They are now
+  the time-average since the shift began, so three hours of healthy running
+  followed by ten minutes down reads 72.5 rather than 0.0.
+- **The QC failures tile queried a table that does not exist.** It asked for
+  `quality_checks` with `result = 'FAIL'`; the producer writes
+  `quality_checks_bronze` with lowercase values, so the tile rendered "Unable to
+  render visualization" in every workspace it was ever deployed to, and would
+  have returned nothing even with the right table name. Dashboard SQL was the
+  third blind spot in `validate_sql_against_uc.py`, which is why a non-existent
+  table shipped at all.
+- **Trace links landed on the list the trace was somewhere in.** The workspace
+  redirects `/traces/<id>` to a tab whose list is keyed on the full id, and
+  `search_traces` returns `trace:/<catalog>.<schema>.<prefix>/<hex>` verbatim, so
+  a bare hex matched no row and the page rendered the unfiltered overview —
+  looking as though it had ignored the link. A query parameter carries the
+  slashes a path segment cannot, once percent-encoded.
+- **A deploy could not rebuild a Genie space it had lost.** Provisioning sat
+  inside the `RUN_SETUP=1` branch, and `RUN_SETUP` is auto-detected by probing
+  for a bronze table. Once the schema existed, every later deploy skipped the
+  step, so a space deleted after the first deploy could only be restored by
+  deploying into an empty schema. The app meanwhile advertised itself as
+  Genie-enabled because the only check was that the environment variable was
+  non-empty, so every `genie_query` failed against a space in the trash while
+  the System Map drew the connection. Rebuilding it surfaced two more: the
+  curated SQLs hardcoded `shift_1` as the default `:shift_id`, so a dev space
+  defaulted to a shift its own producer never writes and answered every
+  shift-scoped question with "0 machines" — a query that runs cleanly and
+  returns nothing. And Genie spaces are workspace files, so two environments in
+  one workspace collide on name.
+- **Nothing said when trace storage had not been provisioned.** Reported from
+  another workspace: the app deployed, the experiment existed, and every span
+  was dropped, because the app was still writing to the bundle's classic
+  experiment. Export is async and non-fatal and the deploy treats provisioning
+  as non-fatal on purpose, so the last thing on screen was "Deploy complete"
+  while the step's own failure sat five hundred lines up. The deploy now reports
+  it under the summary, including the fact that a UC link is permanent, so a
+  half-linked experiment is scrap rather than something to retry into.
+  `scripts/diagnose_trace_storage.py` separates the three causes, which are
+  indistinguishable in the UI.
+- **Sixteen assertions had stopped running while the suite reported green.**
+  `EventFeed.test.ts` imported its subjects through the component, which
+  re-exports them but also pulls in charts that resolve a nested dependency that
+  is not installed, so the file failed to load. It now imports from the utility
+  module directly.
+- **The System Map and About tab still sold a deleted feature.** "Ask the line"
+  was removed, and both surfaces went on drawing it as a live product surface,
+  the map with a `DIRECT · NO ORCHESTRATOR` tag. The README screenshot showed it
+  too.
+
+### Changed
+
+- **`retrieve_similar_cases` told the model it was doing semantic search when it
+  usually is not.** The docstring is what the LLM reads when deciding whether to
+  call a tool and how much to trust the result; it named Vector Search
+  unconditionally, while the keyword path is the default (an endpoint bills
+  hourly). It now describes both paths and points at the `retrieval` and
+  `match_score` fields that say which one answered. The module header, which
+  claimed no index exists anywhere, was left behind by this week's Vector Search
+  work and has been rewritten.
+- **The governed-model note assumed the governed model is deployed.** It is
+  optional, and where it is absent the specialist got told to expect zero rows
+  from tables that do not resolve. The note now names that case and sends the
+  model back to the live tables instead of reporting a data problem with the
+  line. Unlike the Genie suffix it cannot self-suppress: these prompts are
+  registered in the Prompt Registry as constants, so a prompt that varied by
+  environment would no longer match its registered version.
+- **Docs corrected against the code.** `ARCHITECTURE.md` described
+  `langgraph.prebuilt.create_react_agent` with a recursion limit of 10; all
+  eight specialists migrated to `langchain.agents.create_agent` and the limit is
+  16. `README.md` claimed each specialist reaches its own governed Genie space —
+  `production` serves three, `asset` serves two, and the shift briefing has
+  none, as `ARCHITECTURE.md`'s own table already said. The README also now
+  states that the spaces are opt-in per domain via `GENIE_SPACE_*`, which a
+  reader previously had to reach `/ops/topology` to discover. `tests/docs/`
+  pins both claims to the code so they cannot drift again silently.
+
 ## [0.3.5] - 2026-08-04
 
 ### Added
@@ -1091,6 +1819,9 @@ GenAI copilot for production-line operations, real-time streaming
 simulator (Zerobus → Lakebase), one-command `deploy.sh`, Data Quality
 dashboard, and a baseline MLflow eval harness.
 
+[0.3.6]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.3.6
+[0.3.5]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.3.5
+[0.3.4]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.3.4
 [0.3.3]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.3.3
 [0.3.2]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.3.2
 [0.3.1]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.3.1

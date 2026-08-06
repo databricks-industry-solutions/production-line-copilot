@@ -12,7 +12,7 @@ from langchain.agents import create_agent
 from langchain_core.messages import SystemMessage
 
 from agent_server.model_roster import resolve
-from agent_server.prompts.supply_chain_advisor import SUPPLY_CHAIN_SYSTEM
+from agent_server.prompts.loader import prompt_text
 from agent_server.tools.calculator import calculator
 from agent_server.tools.governed_domain_query import (
     governed_domain_prompt,
@@ -25,7 +25,7 @@ from agent_server.tools.sql_query import sql_query
 
 def create_supply_chain_advisor():
     """Build the ReAct agent registered as 'supply_chain_advisor'."""
-    llm = ChatDatabricks(endpoint=resolve("supply_chain_advisor"), max_tokens=2048)
+    llm = ChatDatabricks(endpoint=resolve("supply_chain_advisor"))
     tools = [
         sql_query, load_plan_and_constraints, calculator, retrieve_similar_cases,
         *governed_domain_tools("inventory"),
@@ -35,6 +35,7 @@ def create_supply_chain_advisor():
         model=llm,
         tools=tools,
         system_prompt=SystemMessage(
-            content=SUPPLY_CHAIN_SYSTEM + governed_domain_prompt("inventory"),
+            content=prompt_text("supply_chain_advisor_system")
+            + governed_domain_prompt("inventory"),
         ),
     )

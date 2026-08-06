@@ -88,9 +88,21 @@ SENSORS: list[SensorDef] = [
     # DEPALLETIZER
     _sensor("DEPALLETIZER", "depal_in_count", "counter", "EA"),
     _sensor("DEPALLETIZER", "depal_out_count", "counter", "EA"),
-    _sensor("DEPALLETIZER", "depal_cycle_time", "process", "sec"),
+    # Nominal matters more here than it looks. The synthesizer jitters a process
+    # sensor around its nominal and falls back to 0 when there is none, which
+    # made this emit uniform(-1, 1) — a negative cycle time, on the one sensor
+    # DEPALLETIZER is primary-mapped to. Diagnosing a stop on this machine then
+    # found no usable signal and reported low confidence, correctly.
+    # 12 s/layer feeds the line's 420 BPM at ~84 bottles a layer; below 9 s is
+    # implausible and above 18 s starves the filler.
+    _sensor("DEPALLETIZER", "depal_cycle_time", "process", "sec", 12.0, 9.0, 18.0),
     # CONVEYOR_1
-    _sensor("CONVEYOR_1", "conv1_belt_speed", "speed", "m/min", 25.0),
+    # Speed sensors carried a setpoint but no alarm band, and the band is what
+    # estimate_rul reads as its threshold — without one the tool has no limit to
+    # project a trend against and the maintenance specialist cannot answer.
+    # Belts: ±20 % of setpoint. Carousels: floor at 380 BPM, ceiling at the
+    # line's own max_speed_bpm constraint (C001, 450).
+    _sensor("CONVEYOR_1", "conv1_belt_speed", "speed", "m/min", 25.0, 20.0, 30.0),
     _sensor("CONVEYOR_1", "conv1_jam_count", "counter", "EA"),
     # UNCASER
     _sensor("UNCASER", "uncaser_in_count", "counter", "EA"),
@@ -99,7 +111,7 @@ SENSORS: list[SensorDef] = [
     # BOTTLE_WASHER
     _sensor("BOTTLE_WASHER", "washer_in_count", "counter", "EA"),
     _sensor("BOTTLE_WASHER", "washer_out_count", "counter", "EA"),
-    _sensor("BOTTLE_WASHER", "washer_tunnel_speed", "speed", "m/min", 25.0),
+    _sensor("BOTTLE_WASHER", "washer_tunnel_speed", "speed", "m/min", 25.0, 20.0, 30.0),
     _sensor("BOTTLE_WASHER", "washer_caustic_temp", "process", "°C", 80, 70, 90),
     _sensor("BOTTLE_WASHER", "washer_caustic_level", "level", "%", 85, 60, None),
     # EMPTY_INSPECTOR
@@ -108,19 +120,19 @@ SENSORS: list[SensorDef] = [
     _sensor("EMPTY_INSPECTOR", "insp_vision_nok_count", "quality", "EA/min", 2, None, 10),
     _sensor("EMPTY_INSPECTOR", "insp_reject_count", "quality", "EA"),
     # CONVEYOR_2
-    _sensor("CONVEYOR_2", "conv2_belt_speed", "speed", "m/min", 25.0),
+    _sensor("CONVEYOR_2", "conv2_belt_speed", "speed", "m/min", 25.0, 20.0, 30.0),
     _sensor("CONVEYOR_2", "conv2_accumulation_pressure", "process", "%", 20, None, 80),
     # FILLER
     _sensor("FILLER", "filler_in_count", "counter", "EA"),
     _sensor("FILLER", "filler_out_count", "counter", "EA"),
-    _sensor("FILLER", "filler_carousel_speed", "speed", "BPM", 420),
+    _sensor("FILLER", "filler_carousel_speed", "speed", "BPM", 420, 380, 450),
     _sensor("FILLER", "filler_fill_volume_avg", "process", "ml", 330, 325, 335),
     _sensor("FILLER", "filler_fill_low_alarm_count", "quality", "EA"),
     _sensor("FILLER", "filler_bowl_level", "level", "%", 75, 30, None),
     # CAPPER
     _sensor("CAPPER", "capper_in_count", "counter", "EA"),
     _sensor("CAPPER", "capper_out_count", "counter", "EA"),
-    _sensor("CAPPER", "capper_carousel_speed", "speed", "BPM", 420),
+    _sensor("CAPPER", "capper_carousel_speed", "speed", "BPM", 420, 380, 450),
     _sensor("CAPPER", "capper_torque_avg", "process", "Nm", 2.0, 1.5, 2.5),
     _sensor("CAPPER", "capper_cap_hopper_level", "level", "%", 80, 15, None),
     # PASTEURIZER
@@ -131,7 +143,7 @@ SENSORS: list[SensorDef] = [
     # LABELLER
     _sensor("LABELLER", "label_in_count", "counter", "EA"),
     _sensor("LABELLER", "label_out_count", "counter", "EA"),
-    _sensor("LABELLER", "label_carousel_speed", "speed", "BPM", 420),
+    _sensor("LABELLER", "label_carousel_speed", "speed", "BPM", 420, 380, 450),
     _sensor("LABELLER", "label_vision_nok_count", "quality", "EA/min", 2, None, 10),
     _sensor("LABELLER", "label_glue_temp", "process", "°C", 145, 135, 155),
     _sensor("LABELLER", "label_roll_remaining", "level", "%", 80, 15, None),
@@ -140,12 +152,12 @@ SENSORS: list[SensorDef] = [
     _sensor("CODER", "coder_out_count", "counter", "EA"),
     _sensor("CODER", "coder_ink_level", "level", "%", 70, 15, None),
     # CONVEYOR_3
-    _sensor("CONVEYOR_3", "conv3_belt_speed", "speed", "m/min", 25.0),
+    _sensor("CONVEYOR_3", "conv3_belt_speed", "speed", "m/min", 25.0, 20.0, 30.0),
     _sensor("CONVEYOR_3", "conv3_accumulation_pressure", "process", "%", 20, None, 80),
     # CASE_PACKER
     _sensor("CASE_PACKER", "packer_in_count", "counter", "EA"),
     _sensor("CASE_PACKER", "packer_out_count", "counter", "EA"),
-    _sensor("CASE_PACKER", "packer_speed", "speed", "cases/min", 17.5),
+    _sensor("CASE_PACKER", "packer_speed", "speed", "cases/min", 17.5, 14.0, 20.0),
     _sensor("CASE_PACKER", "packer_reject_case_count", "quality", "EA"),
     _sensor("CASE_PACKER", "packer_carton_magazine_level", "level", "%", 75, 15, None),
     # SHRINK_WRAPPER
@@ -161,7 +173,7 @@ SENSORS: list[SensorDef] = [
     _sensor("CHECKWEIGHER", "chkwt_weight_avg", "process", "g", 7920, 7800, 8100),
     _sensor("CHECKWEIGHER", "chkwt_reject_count", "quality", "EA"),
     # CONVEYOR_4
-    _sensor("CONVEYOR_4", "conv4_belt_speed", "speed", "m/min", 25.0),
+    _sensor("CONVEYOR_4", "conv4_belt_speed", "speed", "m/min", 25.0, 20.0, 30.0),
     _sensor("CONVEYOR_4", "conv4_accumulation_pressure", "process", "%", 20, None, 80),
     # PALLETIZER
     _sensor("PALLETIZER", "pallet_in_count", "counter", "EA"),

@@ -39,17 +39,21 @@ export function formatTimestamp(iso: string | number): string {
   return d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
 
+/**
+ * Parse a backend timestamp to epoch ms.
+ *
+ * The serving layer sends zone-qualified strings ('2026-08-06
+ * 13:57:24.899302+00:00'), which parse to the same instant in every client
+ * time zone. Keep it that way: a string with no offset is read as local time,
+ * so it would disagree with the UTC arithmetic in shiftWindow.ts on any
+ * client outside UTC and could place an event on the wrong side of a shift
+ * boundary.
+ *
+ * There used to be an epochToIso counterpart here that emitted local
+ * components with no offset, on the since-outdated premise that UC held naive
+ * strings. Nothing but its own test ever called it, so it was removed rather
+ * than left as a mixed-zone trap for the next caller.
+ */
 export function isoToEpoch(iso: string): number {
   return new Date(iso).getTime();
-}
-
-/**
- * Convert epoch ms to local-time ISO string WITHOUT 'Z' suffix.
- * Data in UC uses plain ISO strings (e.g. '2025-01-01T10:00:00'),
- * so we must match that format for SQL string comparisons.
- */
-export function epochToIso(epoch: number): string {
-  const d = new Date(epoch);
-  const pad = (n: number) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }

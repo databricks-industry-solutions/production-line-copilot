@@ -43,10 +43,19 @@ class TestCleanupResetsDeployManagedState:
         Dropping tables individually leaves the volume behind, and a checkpoint
         pins its source table's id — so the next deploy's streaming job fails on
         startup against tables that no longer exist.
+
+        Scoped to the Unity Catalog block: the Lakebase purge legitimately drops
+        a table (AppKit's cache lives in `public`, which is not ours to drop).
         """
         assert "DROP SCHEMA IF EXISTS" in CLEANUP
         assert "CASCADE" in CLEANUP
-        assert "DROP TABLE" not in CLEANUP
+
+        uc_block = CLEANUP.split("from _uc_sql import StmtCursor")[1].split("PY")[0]
+        assert "DROP SCHEMA IF EXISTS" in uc_block, "the UC purge block moved"
+        assert "DROP TABLE" not in uc_block, (
+            "the UC purge drops tables individually, leaving the checkpoint "
+            "volume behind for the next deploy's streaming job to trip over"
+        )
 
     def test_uc_purge_is_opt_in(self):
         """Data loss must never be the default for a teardown command."""

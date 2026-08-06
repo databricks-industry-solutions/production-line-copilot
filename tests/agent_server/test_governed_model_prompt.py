@@ -38,10 +38,10 @@ def test_note_keeps_honesty_caveats():
 
 def test_expected_specialists_carry_the_note():
     from agent_server.prompts.downtime_analyst import DOWNTIME_ANALYST_SYSTEM
-    from agent_server.prompts.quality_specialist import QUALITY_SPECIALIST_SYSTEM
     from agent_server.prompts.maintenance_predictor import MAINTENANCE_PREDICTOR_SYSTEM
-    from agent_server.prompts.supply_chain_advisor import SUPPLY_CHAIN_SYSTEM
     from agent_server.prompts.oee_coach import OEE_COACH_SYSTEM
+    from agent_server.prompts.quality_specialist import QUALITY_SPECIALIST_SYSTEM
+    from agent_server.prompts.supply_chain_advisor import SUPPLY_CHAIN_SYSTEM
 
     for name, prompt in (
         ("downtime_analyst", DOWNTIME_ANALYST_SYSTEM),

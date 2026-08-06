@@ -17,6 +17,7 @@ import KPIStrip from './components/KPIStrip';
 import InventoryPanel from './components/InventoryPanel';
 import EventFeed from './components/EventFeed';
 import { isEventActive, buildResolvedTsByMachine } from './lib/eventFeedUtils';
+import { emptyKpiHoldState, resolveKpiFrame, type KpiHoldState } from './lib/kpiHold';
 import ChatPanel from './components/ChatPanel';
 import AboutTab from './components/AboutTab';
 import MultiAITab from './components/MultiAITab';
@@ -382,18 +383,11 @@ function App() {
   }, [sseLive.machines, machineStatusOverrides]);
 
   // Tier-1 KPI from SSE payload only (computed upstream: producers → Delta → Synced Tables → Lakebase).
-  // ``lastGoodKpiRef`` carries the previous frame's A/P/OEE through a single
-  // mathematically-impossible tick (oee==0 while throughput>0). The producer's
-  // line_kpi_derived.compute_tier1_line_kpi_row briefly emits avg_speed_pct=0
-  // mid-cascade during a resolve, which collapses OEE to 0 for one tick before
-  // the cascade settles — see line_kpi_derived.py. We hold the last healthy
-  // OEE/A/P for that single frame so the UI doesn't flash 0 -> 75% on every
-  // recovery; the underlying row is preserved for any downstream consumer.
-  const lastGoodKpiRef = useRef<null | {
-    oee_to_now: number;
-    availability_to_now: number;
-    performance_to_now: number;
-  }>(null);
+  // The producer recomputes A/P/OEE per tick and can emit avg_speed_pct=0 for a
+  // single tick mid-cascade, collapsing OEE to 0 before the line settles. The
+  // decision of whether such a zero is that blip or the line's real state lives
+  // in lib/kpiHold.ts, with the reasoning and its tests.
+  const kpiHoldRef = useRef<KpiHoldState>(emptyKpiHoldState);
   const kpiAtT = useMemo(() => {
     const k = sseLive.kpi ?? {};
     const running = toNumber(k.machines_running);
@@ -403,26 +397,21 @@ function App() {
     const total = running + stopped + degraded + starved;
     if (total === 0 && sseLive.machines.length === 0 && Object.keys(k).length === 0) return null;
 
-    let oee = toNumber(k.oee_to_now);
-    let availability = toNumber(k.availability_to_now);
-    let performance = toNumber(k.performance_to_now);
     const quality = toNumber(k.quality_to_now);
     const totalThroughput = toNumber(k.total_throughput);
 
-    // Detect impossible compute glitch: a line with throughput cannot have
-    // OEE = 0. Reuse last good frame's A/P/OEE for this tick only.
-    const isGlitch = oee === 0 && totalThroughput > 0 && lastGoodKpiRef.current !== null;
-    if (isGlitch && lastGoodKpiRef.current) {
-      oee = lastGoodKpiRef.current.oee_to_now;
-      availability = lastGoodKpiRef.current.availability_to_now;
-      performance = lastGoodKpiRef.current.performance_to_now;
-    } else if (oee > 0) {
-      lastGoodKpiRef.current = {
-        oee_to_now: oee,
-        availability_to_now: availability,
-        performance_to_now: performance,
-      };
-    }
+    const resolved = resolveKpiFrame(
+      {
+        oee_to_now: toNumber(k.oee_to_now),
+        availability_to_now: toNumber(k.availability_to_now),
+        performance_to_now: toNumber(k.performance_to_now),
+      },
+      totalThroughput,
+      kpiHoldRef.current,
+    );
+    kpiHoldRef.current = resolved.state;
+    const { oee_to_now: oee, availability_to_now: availability, performance_to_now: performance } =
+      resolved.value;
 
     return {
       oee_to_now: oee,

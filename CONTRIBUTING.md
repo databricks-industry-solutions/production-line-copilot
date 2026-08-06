@@ -1,3 +1,23 @@
+### Before you open a pull request
+
+Run the gate:
+
+```bash
+./scripts/check.sh          # ruff, pytest, tsc, eslint, vitest
+./scripts/check.sh python   # or just one half
+```
+
+`.github/workflows/tests.yml` runs this same script, so passing locally and
+passing in CI mean the same thing. Run it locally regardless: some GitHub
+Enterprise organisations disable hosted runners, and where they are disabled the
+workflow cannot start — it reports a failure without having run anything, so a
+red check there does not necessarily mean a broken change, and a missing check
+does not mean a safe one.
+
+The Playwright smoke test is not part of the gate, because it boots the real
+server against a warehouse and a Lakebase instance. Run `npm run test:smoke`
+yourself if you have a workspace and your change touches the UI.
+
 ### Contributor License Agreement (CLA)
 
 By submitting a contribution to this repository, you certify that:

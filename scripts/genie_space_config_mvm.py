@@ -708,6 +708,10 @@ def main():
     parser.add_argument("--catalog", default=DEFAULT_CATALOG,
                         help=f"MVM catalog (default: {DEFAULT_CATALOG})")
     parser.add_argument("--title", default="")
+    parser.add_argument("--title-suffix", default="",
+                        help="Appended to every space title (e.g. 'dev'). Needed "
+                             "when one workspace hosts more than one environment, "
+                             "since Genie spaces collide on name.")
     parser.add_argument(
         "--domain",
         default="all",
@@ -761,6 +765,13 @@ def main():
     else:
         title = args.title or DOMAINS[args.domain]["title"]
         description = DOMAINS[args.domain]["description"]
+
+    # Genie spaces are workspace files, so two envs in one workspace collide on
+    # name ("Node named '<title>.geniespace.json' already exists"). --title only
+    # names one space and this script creates five, so the suffix is applied
+    # here rather than asking the caller to name each one.
+    if (args.title_suffix or "").strip():
+        title = f"{title} — {args.title_suffix.strip()}"
 
     # Genie's export proto enforces alphabetical ordering everywhere. Sort in
     # place before serialization so the script is order-independent.

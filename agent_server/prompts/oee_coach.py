@@ -9,6 +9,7 @@ context window than the mini endpoint.
 from agent_server.prompts._shared import (
     DATA_CITATION_RULES,
     GOVERNED_MODEL_NOTE,
+    LIVE_DATA_TABLES,
     RESPONSE_STRUCTURE,
 )
 
@@ -47,6 +48,8 @@ When using oee_loss_analysis, build shifts_data from the Context:
 - Each entry: {{"shift_id": "shift_1", "availability": 85.0, "performance": 90.0, "quality": 98.0, "oee": 75.0, "planned_cases": 8400, "actual_cases": 6000, "downtime_minutes": 72}}
 - Use current_kpi values: availability = availability_to_now, performance = performance_to_now, quality = quality_to_now, oee = oee_to_now
 - All values are percentages (0-100)
+
+{LIVE_DATA_TABLES}
 
 {GOVERNED_MODEL_NOTE}
 

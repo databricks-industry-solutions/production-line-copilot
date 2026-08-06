@@ -18,7 +18,7 @@ from agent_server.model_roster import resolve
 from agent_server.optimizers.production_forecaster import production_forecast
 from agent_server.optimizers.schedule_recovery import schedule_recovery
 from agent_server.optimizers.stochastic_schedule import stochastic_schedule_recovery
-from agent_server.prompts.schedule_optimizer import SCHEDULE_OPTIMIZER_SYSTEM
+from agent_server.prompts.loader import prompt_text
 from agent_server.tools.calculator import calculator
 from agent_server.tools.governed_domain_query import (
     governed_domain_prompt,
@@ -30,7 +30,7 @@ from agent_server.tools.sql_query import sql_query
 
 def create_schedule_optimizer():
     """Build the ReAct agent registered as 'schedule_optimizer'."""
-    llm = ChatDatabricks(endpoint=resolve("schedule_optimizer"), max_tokens=2048)
+    llm = ChatDatabricks(endpoint=resolve("schedule_optimizer"))
     tools = [
         sql_query, load_plan_and_constraints, calculator,
         schedule_recovery, production_forecast, stochastic_schedule_recovery,
@@ -41,6 +41,7 @@ def create_schedule_optimizer():
         model=llm,
         tools=tools,
         system_prompt=SystemMessage(
-            content=SCHEDULE_OPTIMIZER_SYSTEM + governed_domain_prompt("production"),
+            content=prompt_text("schedule_optimizer_system")
+            + governed_domain_prompt("production"),
         ),
     )

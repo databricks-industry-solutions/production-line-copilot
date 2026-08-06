@@ -6,6 +6,8 @@ anomalous readings grouped by sensor.
 import logging
 import math
 import re
+import statistics
+from datetime import datetime, timezone
 
 from langchain_core.tools import tool
 
@@ -17,7 +19,32 @@ ZSCORE_THRESHOLD = 2.5
 IQR_MULTIPLIER = 1.5
 
 _SAFE_ID = re.compile(r"^[a-zA-Z0-9_\-]+$")
-_SAFE_TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2})?(\.\d+)?$")
+# The offset group is not decoration. The context hands the model
+# `scenario.current_timestamp`, which is `datetime.now(timezone.utc).isoformat()`
+# and therefore ends in `+00:00`. Rejecting that rejected the one timestamp the
+# model had every reason to trust, so every call built from context failed
+# validation before it reached the warehouse.
+_SAFE_TIMESTAMP = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2})?(\.\d+)?(Z|[+-]\d{2}:?\d{2})?$"
+)
+
+
+def _normalize_timestamp(value: str) -> str:
+    """``value`` as a naive UTC ``YYYY-MM-DD HH:MM:SS`` literal.
+
+    The offset is resolved here rather than passed through: the column is a
+    plain TIMESTAMP, so comparing it against an offset-bearing string literal
+    leaves the interpretation to the engine's session timezone. An hour of
+    silent skew in an anomaly window is worse than an outright rejection.
+    """
+    text = value.strip().replace("Z", "+00:00").replace(" ", "T", 1)
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return value
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _zscore_anomalies(values: list[float], timestamps: list[str], sensor: str) -> list[dict]:
@@ -54,10 +81,12 @@ def _iqr_anomalies(values: list[float], timestamps: list[str], sensor: str) -> l
     if len(values) < 10:
         return []
 
-    sorted_vals = sorted(values)
-    n = len(sorted_vals)
-    q1 = sorted_vals[n // 4]
-    q3 = sorted_vals[3 * n // 4]
+    # Interpolate between ranks. Integer-division indexing (sorted[n//4],
+    # sorted[3*n//4]) is a nearest-rank quartile that skews toward the upper
+    # tail and never lands between samples, so the fences it produces are
+    # biased and flag the wrong readings near the boundary. The error is
+    # largest at n = 10, which is exactly where the guard above admits data.
+    q1, _median, q3 = statistics.quantiles(values, n=4, method="inclusive")
     iqr = q3 - q1
 
     if iqr == 0:
@@ -100,16 +129,40 @@ def detect_anomalies(
         if not _SAFE_TIMESTAMP.match(val):
             return {"anomalies": [], "error": f"Invalid {name} format: {val!r}", "total_points": 0}
 
+    timestamp_start = _normalize_timestamp(timestamp_start)
+    timestamp_end = _normalize_timestamp(timestamp_end)
+
+    # DESC, because the 500-row cap has to fall somewhere and the end of the
+    # window is the part worth testing. Ascending took the oldest 500 readings,
+    # which on a busy machine is the first few seconds of the window — the
+    # statistics then described a moment nobody asked about.
     rows = sql_query.invoke(
         f"SELECT timestamp, sensor_name, value "
-        f"FROM machine_telemetry "
+        f"FROM telemetry_bronze "
         f"WHERE machine_id = '{machine_id}' AND shift_id = '{shift_id}' "
         f"AND timestamp >= '{timestamp_start}' AND timestamp <= '{timestamp_end}' "
-        f"ORDER BY timestamp LIMIT 500"
+        f"ORDER BY timestamp DESC LIMIT 500"
     )
 
-    if not rows or (len(rows) == 1 and isinstance(rows[0], dict) and "error" in rows[0]):
-        return {"anomalies": [], "error": "No telemetry data found", "total_points": 0}
+    # Three different things used to arrive here as one message. The model
+    # cannot recover from "No telemetry data found" — it reads like a finding
+    # about the line. It can recover from being told the filter looks wrong.
+    if rows and isinstance(rows[0], dict) and "error" in rows[0]:
+        return {"anomalies": [], "error": f"Telemetry query failed: {rows[0]['error']}",
+                "total_points": 0}
+    if not rows:
+        return {
+            "anomalies": [],
+            "error": (
+                f"No telemetry rows for machine_id={machine_id!r} shift_id={shift_id!r} "
+                f"between {timestamp_start} and {timestamp_end}. This is a filter "
+                f"mismatch far more often than an idle machine: telemetry is keyed by "
+                f"the environment-suffixed shift id and stamped with real wall-clock "
+                f"time, so a window taken from the production schedule will never "
+                f"match. Retry with a window relative to now."
+            ),
+            "total_points": 0,
+        }
 
     sensor_data: dict[str, tuple[list[float], list[str]]] = {}
     for row in rows:
@@ -130,6 +183,12 @@ def detect_anomalies(
             sensor_data[sensor] = ([], [])
         sensor_data[sensor][0].append(fval)
         sensor_data[sensor][1].append(str(ts))
+
+    # Rows arrive newest-first from the query above; the anomaly reports read as
+    # a time series, so put each sensor back in chronological order.
+    for values, timestamps in sensor_data.values():
+        values.reverse()
+        timestamps.reverse()
 
     all_anomalies: list[dict] = []
     for sensor, (values, timestamps) in sensor_data.items():

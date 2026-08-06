@@ -319,6 +319,7 @@ python3 scripts/sync_project_settings.py --deployer-email "$DEPLOYER_EMAIL" --ta
 # you'd get cryptic auth errors deep in the stack.
 echo "=== SET_ME guard: $PROJECT_SETTINGS_YAML profile for $BUNDLE_TARGET ==="
 python3 - "$ROOT_DIR/$PROJECT_SETTINGS_YAML" "$BUNDLE_TARGET" <<'PY'
+import re
 import sys
 import yaml
 
@@ -354,6 +355,10 @@ REQUIRED = {
     "lakebase_pg_host",
     "lakebase_endpoint",
     "zerobus_server_endpoint",
+    # Ships as /Volumes/<your_catalog>/... and was never checked, so an unfilled
+    # value sent streaming checkpoints to a volume in a catalog that does not
+    # exist — a failure that surfaces inside the quality-sync job, not here.
+    "lakebase_checkpoint_volume",
 }
 
 unfilled: list[str] = []
@@ -363,7 +368,12 @@ for profile_name, prof in matching:
         if value is None:
             continue
         text = str(value).strip()
-        if text == "SET_ME" or text.startswith("<") and text.endswith(">"):
+        # An EMBEDDED placeholder counts. Several settings are paths with the
+        # token in the middle — `projects/<your-lakebase-project>/branches/main`
+        # — which passed a startswith/endswith check, so the guard reported the
+        # config complete and the deploy failed later, deep in Lakebase role
+        # registration, with the literal text as a project name.
+        if text == "SET_ME" or re.search(r"<[^<>]+>", text):
             unfilled.append(f"  {profile_name}.{key} = {text!r}")
 
 if unfilled:
@@ -797,6 +807,18 @@ echo "$TRACE_OUT"
 if echo "$TRACE_OUT" | grep -q 'MLFLOW_EXPERIMENT_ID updated'; then
   NEEDS_REDEPLOY=1
 fi
+# Held for the closing summary. Failing here is non-fatal by design, but the
+# consequence is invisible in the product: MLFLOW_EXPERIMENT_ID keeps the
+# template's `valueFrom: experiment`, the app writes to the bundle's classic
+# experiment, and its spans upload to a storage host the Apps runtime cannot
+# reach. What you get is an experiment that looks alive, holds no spans, and
+# offers to "Enable UC trace storage" — with a green "Deploy complete" above
+# it. A warning 500 lines up is a warning nobody reads.
+TRACE_WARNING=""
+if ! echo "$TRACE_OUT" | grep -qE 'MLFLOW_EXPERIMENT_ID (updated|already correct)'; then
+  TRACE_WARNING=$(echo "$TRACE_OUT" | grep -E '^(ERROR|.*SystemExit|profile has no)' | head -2)
+  TRACE_WARNING="${TRACE_WARNING:-see the provision_trace_storage.py output above}"
+fi
 
 # ── 4c. Second bundle deploy (only if SP captured or IDs changed) ───────
 if [[ "$NEEDS_REDEPLOY" -eq 1 ]]; then
@@ -887,6 +909,15 @@ for prof in d.get('profiles', {}).values():
         break
 " 2>/dev/null || echo "")
 
+# `SET_ME` is a non-empty string, so the old -n test passed and this ran the
+# grant/publish calls against a literal id of "SET_ME": the PATCH failed, the
+# real dashboard was never published, and the Data Quality tab embedded a 404.
+if [[ "$DASHBOARD_ID" == "SET_ME" ]]; then
+  DASHBOARD_ID=""
+  echo "WARN: OPS_DATA_QUALITY_DASHBOARD_ID is still SET_ME — refresh_app_yaml_ids.py" >&2
+  echo "      did not fill it. The Data Quality tab will not embed." >&2
+fi
+
 if [[ -n "$DASHBOARD_ID" && -n "$WAREHOUSE_ID" && -n "$DEPLOY_USER" ]]; then
   echo "=== grant_app_jobs_view.sh — Data Quality dashboard ==="
   # The dashboard is uploaded under the BUNDLE TARGET name (not the CLI
@@ -902,8 +933,55 @@ if [[ -n "$DASHBOARD_ID" && -n "$WAREHOUSE_ID" && -n "$DEPLOY_USER" ]]; then
     echo "      Re-run manually with the env block printed above." >&2
   }
 else
-  echo "WARN: skipping Data Quality dashboard grants (DASHBOARD_ID='$DASHBOARD_ID', WAREHOUSE_ID='$WAREHOUSE_ID')." >&2
-  echo "      The Quality tab iframe will likely show 'Unable to render visualization.'" >&2
+  echo "WARN: skipping the dashboard folder-chain grants (DASHBOARD_ID='$DASHBOARD_ID', WAREHOUSE_ID='$WAREHOUSE_ID')." >&2
+fi
+
+# The step above grants the workspace folder chain the app SP needs to traverse.
+# This one owns what the tab actually depends on — published, with embedded
+# credentials, readable by the app AND by the humans opening it — and reads the
+# state back instead of assuming.
+#
+# It deliberately sits OUTSIDE the block above. That block needs an id from
+# app.yaml, and the case that produced a 404 in a colleague's workspace was
+# precisely the one where the id was still SET_ME, so every dashboard step was
+# skipped over a warning. This resolves the dashboard by display name on its
+# own, so a missing id is no longer a reason to do nothing.
+#
+# It is also the only step here that fails the deploy. An unpublished dashboard
+# renders as a bare Databricks "The resource is not available" page with nothing
+# anywhere to explain it, and a warning this far into a long deploy log is a
+# warning nobody reads.
+if [[ -n "$WAREHOUSE_ID" ]]; then
+  echo
+  echo "=== Data Quality dashboard: publish + grants ==="
+  DASHBOARD_VIEWER_ARGS=()
+  [[ -n "$DEPLOY_USER" ]] && DASHBOARD_VIEWER_ARGS+=(--viewer "$DEPLOY_USER")
+  # Comma-separated groups who should be able to open the tab, e.g.
+  # DASHBOARD_VIEWER_GROUPS="data-team,plant-managers" ./scripts/deploy.sh prod
+  if [[ -n "${DASHBOARD_VIEWER_GROUPS:-}" ]]; then
+    IFS=',' read -ra _dash_groups <<< "$DASHBOARD_VIEWER_GROUPS"
+    for _g in "${_dash_groups[@]}"; do
+      [[ -n "${_g// /}" ]] && DASHBOARD_VIEWER_ARGS+=(--viewer-group "${_g// /}")
+    done
+  fi
+  if ! DATABRICKS_CONFIG_PROFILE="$PROFILE" \
+      "${PROJECT_PY[@]}" scripts/ensure_dashboard_embed.py \
+        --profile "$PROFILE" \
+        --warehouse-id "$WAREHOUSE_ID" \
+        --dashboard-id "$DASHBOARD_ID" \
+        --app-name "$APP_NAME" \
+        --app-sp "${APP_SP_ID:-}" \
+        "${DASHBOARD_VIEWER_ARGS[@]}"; then
+    echo >&2
+    echo "ERROR: the Data Quality dashboard is not embeddable." >&2
+    echo "       The tab will show Databricks' 'The resource is not available' page." >&2
+    echo "       Fix the cause above and re-run, or set SKIP_DASHBOARD_EMBED=1 to" >&2
+    echo "       deploy without it." >&2
+    [[ "${SKIP_DASHBOARD_EMBED:-0}" == "1" ]] || exit 1
+  fi
+else
+  echo "WARN: no SQL warehouse resolved — skipping the dashboard publish step." >&2
+  echo "      The Data Quality tab will not embed until you set sql_warehouse_id." >&2
 fi
 
 # ── 6b. Auto-detect a fresh environment ─────────────────────────────────
@@ -943,54 +1021,82 @@ if [[ "${RUN_SETUP:-0}" == "1" ]]; then
     exit 1
   }
   echo "=== Setup job complete — UC schema provisioned for $BUNDLE_TARGET ==="
+fi
 
-  # ── 7a. Genie space auto-provisioning ─────────────────────────────────
-  # The curated space references catalog.schema.<table>, which only exist
-  # AFTER the setup job above — so create/refresh it here (not earlier).
-  # Fresh env (genie_space_id=SET_ME): POST-create via the public
-  # /api/2.0/genie/spaces API, capture the new id, write it back, grant the
-  # app SP CAN_RUN, then re-wire GENIE_SPACE_ID into the app + redeploy.
-  # Existing env: PATCH the space so the curated config stays fresh.
-  GENIE_ID=$(_profile_field genie_space_id)
-  UC_CATALOG=$(_profile_field uc_catalog)
-  UC_SCHEMA=$(_profile_field uc_schema)
-  if [[ -z "$WAREHOUSE_ID" || -z "$UC_CATALOG" || "$UC_CATALOG" == "SET_ME" ]]; then
-    echo "WARN: skipping Genie provisioning (warehouse='$WAREHOUSE_ID', catalog='$UC_CATALOG')." >&2
-  else
-    GENIE_ARGS=(--profile "$PROFILE" --warehouse-id "$WAREHOUSE_ID" --catalog "$UC_CATALOG" --schema "$UC_SCHEMA")
-    if [[ -z "$GENIE_ID" || "$GENIE_ID" == "SET_ME" ]]; then
-      echo "=== Creating Genie space (fresh env) ==="
-      GENIE_OUT=$(python3 scripts/genie_space_config_streaming.py "${GENIE_ARGS[@]}" \
-        --parent-path "/Users/$DEPLOY_USER" 2>&1) || {
-        echo "$GENIE_OUT" >&2
-        echo "WARN: Genie space create failed — briefing features unavailable until fixed." >&2
-        GENIE_OUT=""
-      }
-      [[ -n "$GENIE_OUT" ]] && echo "$GENIE_OUT"
-      NEW_GENIE_ID=$(printf '%s\n' "$GENIE_OUT" | awk -F= '/^GENIE_SPACE_ID=/{print $2; exit}')
-      if [[ -n "$NEW_GENIE_ID" ]]; then
-        write_genie_space_id "$NEW_GENIE_ID"
-        GENIE_ID="$NEW_GENIE_ID"
-        if [[ -n "${APP_SP_ID:-}" ]]; then
-          echo "=== Granting app SP $APP_SP_ID CAN_RUN on Genie space $GENIE_ID ==="
-          GENIE_PERMS_JSON=$(printf '{"access_control_list":[{"service_principal_name":"%s","permission_level":"CAN_RUN"}]}' "$APP_SP_ID")
-          databricks api patch "/api/2.0/permissions/genie/$GENIE_ID" --profile "$PROFILE" \
-            --json "$GENIE_PERMS_JSON" >/dev/null \
-            || echo "WARN: could not grant app SP CAN_RUN on Genie space — grant manually." >&2
-        fi
-        echo "=== Re-wiring GENIE_SPACE_ID into the app + redeploying ==="
-        python3 scripts/render_app_yaml.py "$ENV" --settings "$ROOT_DIR/$PROJECT_SETTINGS_YAML" || true
-        do_app_yaml_swap
-        run_bundle_deploy
-        databricks apps deploy "$APP_NAME" --profile "$PROFILE" \
-          ${APP_SRC_PATH:+--source-code-path "$APP_SRC_PATH"} \
-          || echo "WARN: app redeploy after Genie wiring failed — re-run deploy to pick up GENIE_SPACE_ID." >&2
+# ── 7a. Genie space provisioning ──────────────────────────────────────────
+# The curated space references catalog.schema.<table>, so this has to run
+# after the setup job above — but NOT only when that job runs. It used to sit
+# inside the RUN_SETUP branch, and RUN_SETUP is auto-detected by probing for
+# machine_state_bronze. Once the schema exists every later deploy resolves to
+# RUN_SETUP=0, so a Genie space deleted after the first deploy could never be
+# restored by redeploying: dev lost its space to a teardown, project-settings
+# correctly reset the id to SET_ME, and no subsequent deploy so much as looked
+# at it. Step 7b (the governed MVM space) was already unconditional; this is
+# the same shape.
+#
+# Fresh or repaired (genie_space_id=SET_ME, or an id that no longer resolves):
+# POST-create via the public /api/2.0/genie/spaces API, capture the new id,
+# write it back, grant the app SP CAN_RUN, then re-wire GENIE_SPACE_ID into
+# the app + redeploy. Existing: PATCH so the curated config stays fresh.
+GENIE_ID=$(_profile_field genie_space_id)
+UC_CATALOG=$(_profile_field uc_catalog)
+UC_SCHEMA=$(_profile_field uc_schema)
+# A configured id is not the same as a live space. A trashed space still fails
+# every genie_query while the app reports itself configured, so treat an id
+# that does not resolve exactly like SET_ME and rebuild it.
+if [[ -n "$GENIE_ID" && "$GENIE_ID" != "SET_ME" ]] \
+   && ! databricks api get "/api/2.0/genie/spaces/$GENIE_ID" --profile "$PROFILE" >/dev/null 2>&1; then
+  echo "WARN: Genie space $GENIE_ID no longer resolves (deleted or trashed) — recreating it." >&2
+  GENIE_ID=""
+fi
+if [[ -z "$WAREHOUSE_ID" || -z "$UC_CATALOG" || "$UC_CATALOG" == "SET_ME" ]]; then
+  echo "WARN: skipping Genie provisioning (warehouse='$WAREHOUSE_ID', catalog='$UC_CATALOG')." >&2
+else
+  # The curated SQLs default :shift_id, and a default naming a shift this
+  # environment's producer never writes returns zero rows from a query that
+  # ran cleanly — dev's space defaulted to shift_1 and answered every
+  # shift-scoped question with "0 machines".
+  GENIE_SHIFT=$(_profile_field sim_shift_id)
+  # Title has to differ per env. Many workspaces host dev and prod side by
+  # side, and Genie spaces are workspace files: a second space created — or
+  # refreshed into — the same folder under the same name fails with "Node
+  # named '<title>.geniespace.json' already exists".
+  GENIE_TITLE="ProdLine CoPilot — Production Line Analytics (streaming)"
+  [[ "$ENV" != "prod" ]] && GENIE_TITLE="$GENIE_TITLE — $ENV"
+  GENIE_ARGS=(--profile "$PROFILE" --warehouse-id "$WAREHOUSE_ID" --catalog "$UC_CATALOG" --schema "$UC_SCHEMA"
+              --title "$GENIE_TITLE" ${GENIE_SHIFT:+--shift-id "$GENIE_SHIFT"})
+  if [[ -z "$GENIE_ID" || "$GENIE_ID" == "SET_ME" ]]; then
+    echo "=== Creating Genie space (fresh env) ==="
+    GENIE_OUT=$(python3 scripts/genie_space_config_streaming.py "${GENIE_ARGS[@]}" \
+      --parent-path "/Users/$DEPLOY_USER" 2>&1) || {
+      echo "$GENIE_OUT" >&2
+      echo "WARN: Genie space create failed — briefing features unavailable until fixed." >&2
+      GENIE_OUT=""
+    }
+    [[ -n "$GENIE_OUT" ]] && echo "$GENIE_OUT"
+    NEW_GENIE_ID=$(printf '%s\n' "$GENIE_OUT" | awk -F= '/^GENIE_SPACE_ID=/{print $2; exit}')
+    if [[ -n "$NEW_GENIE_ID" ]]; then
+      write_genie_space_id "$NEW_GENIE_ID"
+      GENIE_ID="$NEW_GENIE_ID"
+      if [[ -n "${APP_SP_ID:-}" ]]; then
+        echo "=== Granting app SP $APP_SP_ID CAN_RUN on Genie space $GENIE_ID ==="
+        GENIE_PERMS_JSON=$(printf '{"access_control_list":[{"service_principal_name":"%s","permission_level":"CAN_RUN"}]}' "$APP_SP_ID")
+        databricks api patch "/api/2.0/permissions/genie/$GENIE_ID" --profile "$PROFILE" \
+          --json "$GENIE_PERMS_JSON" >/dev/null \
+          || echo "WARN: could not grant app SP CAN_RUN on Genie space — grant manually." >&2
       fi
-    else
-      echo "=== Refreshing existing Genie space $GENIE_ID (curated config) ==="
-      python3 scripts/genie_space_config_streaming.py "${GENIE_ARGS[@]}" --space-id "$GENIE_ID" \
-        || echo "WARN: Genie space refresh failed — space kept its previous config." >&2
+      echo "=== Re-wiring GENIE_SPACE_ID into the app + redeploying ==="
+      python3 scripts/render_app_yaml.py "$ENV" --settings "$ROOT_DIR/$PROJECT_SETTINGS_YAML" || true
+      do_app_yaml_swap
+      run_bundle_deploy
+      databricks apps deploy "$APP_NAME" --profile "$PROFILE" \
+        ${APP_SRC_PATH:+--source-code-path "$APP_SRC_PATH"} \
+        || echo "WARN: app redeploy after Genie wiring failed — re-run deploy to pick up GENIE_SPACE_ID." >&2
     fi
+  else
+    echo "=== Refreshing existing Genie space $GENIE_ID (curated config) ==="
+    python3 scripts/genie_space_config_streaming.py "${GENIE_ARGS[@]}" --space-id "$GENIE_ID" \
+      || echo "WARN: Genie space refresh failed — space kept its previous config." >&2
   fi
 fi
 
@@ -1014,7 +1120,9 @@ for prof in (d.get('profiles') or {}).values():
 MVM_CAT=$(_profile_field mvm_catalog)
 MVM_GENIE_ID=$(_profile_field mvm_genie_space_id)
 if [[ "$MVM_SILVER" == "true" && -n "$WAREHOUSE_ID" && -n "$MVM_CAT" && "$MVM_CAT" != "SET_ME" ]]; then
+  # Same name-collision rule as the streaming space above.
   MVM_GENIE_ARGS=(--profile "$PROFILE" --warehouse-id "$WAREHOUSE_ID" --catalog "$MVM_CAT")
+  [[ "$ENV" != "prod" ]] && MVM_GENIE_ARGS+=(--title-suffix "$ENV")
   if [[ -z "$MVM_GENIE_ID" || "$MVM_GENIE_ID" == "SET_ME" ]]; then
     echo "=== Creating governed MVM Genie space (fresh) ==="
     MVM_GENIE_OUT=$(python3 scripts/genie_space_config_mvm.py "${MVM_GENIE_ARGS[@]}" \
@@ -1183,8 +1291,129 @@ else
   echo "WARN: skipping prompt registration (catalog='$UC_CATALOG_PROMPTS', schema='$UC_SCHEMA_PROMPTS')." >&2
 fi
 
+# Vector Search for retrieve_similar_cases. Opt in by setting
+# `vector_search_endpoint` in config/project-settings(.local).yaml, which
+# render_app_yaml turns into VS_ENDPOINT below; empty means the tool ranks past
+# events by keyword overlap instead, which is a real fallback and not an error.
+#
+# Two reasons it is opt-in rather than on: an endpoint bills hourly whether or
+# not anything queries it, and the run that first creates one is SLOW — 15-40
+# minutes, against seconds for everything else in this script. Idempotent after
+# that: the endpoint and index are created once and later runs only re-sync the
+# case library, so the wait is a one-time cost per environment, not per deploy.
+# Read the file this deploy actually ships ($APP_SOURCE_YAML), not app.yaml.
+# app.yaml is the committed prod template and is kept deliberately blank here,
+# so a hardcoded read of it reported "not enabled" for every environment —
+# including the one whose gitignored app.<env>.local.yaml had just been
+# rendered with the endpoint name a few lines above.
+VS_ENDPOINT_NAME=$(python3 -c "
+import yaml
+try:
+    env = yaml.safe_load(open('$APP_SOURCE_YAML')).get('env') or []
+    print(next((e.get('value','') for e in env if e.get('name')=='VS_ENDPOINT'), ''))
+except Exception:
+    print('')
+" 2>/dev/null || echo "")
+
+# Read the catalog/schema from settings rather than reusing $UC_CATALOG: that
+# variable is only assigned inside the RUN_SETUP=1 branch, so on a code-only
+# redeploy it is empty and this step skipped while blaming VS_ENDPOINT.
+VS_CATALOG=$(_profile_field uc_catalog)
+VS_SCHEMA=$(_profile_field uc_schema)
+
+if [[ -n "$VS_ENDPOINT_NAME" && -n "$WAREHOUSE_ID" && -n "$VS_CATALOG" && "$VS_CATALOG" != "SET_ME" ]]; then
+  echo "=== Provisioning Vector Search ($VS_ENDPOINT_NAME) ==="
+  # Say up front which kind of run this is. Without it the deploy looks hung:
+  # `--wait` blocks with no output while the endpoint comes up, and someone
+  # watching a script that has printed a line every few seconds until now will
+  # reasonably assume it has died and Ctrl-C it half way through.
+  # PROJECT_PY, not bare python3: the SDK lives in the project venv, and a
+  # system interpreter without it would report "unknown" on every run.
+  VS_EXISTS=$(DATABRICKS_CONFIG_PROFILE="$PROFILE" "${PROJECT_PY[@]}" -c "
+from databricks.sdk import WorkspaceClient
+try:
+    names = {e.name for e in WorkspaceClient().vector_search_endpoints.list_endpoints()}
+    print('yes' if '$VS_ENDPOINT_NAME' in names else 'no')
+except Exception:
+    print('unknown')
+" 2>/dev/null || echo "unknown")
+  if [[ "$VS_EXISTS" == "yes" ]]; then
+    echo "    (endpoint already exists — re-syncing the case library, a few seconds)"
+  else
+    # Includes the unknown case on purpose: warning about a wait that does not
+    # happen costs nothing, while staying quiet through a 40-minute silence
+    # gets the deploy killed half way through creating an endpoint.
+    if [[ "$VS_EXISTS" == "no" ]]; then
+      echo "    NOTE: this endpoint does not exist yet, so this step will take 15-40"
+    else
+      echo "    NOTE: could not tell whether this endpoint exists. If it does not,"
+      echo "          creating it takes 15-40"
+    fi
+    echo "          minutes while Databricks provisions it. That is a one-time cost —"
+    echo "          later deploys re-use the endpoint and finish in seconds. Leave it"
+    echo "          running; --wait prints nothing until it is ready."
+  fi
+  DATABRICKS_CONFIG_PROFILE="$PROFILE" \
+    "${PROJECT_PY[@]}" scripts/provision_vector_search.py \
+      --catalog "$VS_CATALOG" --schema "$VS_SCHEMA" \
+      --warehouse-id "$WAREHOUSE_ID" --endpoint "$VS_ENDPOINT_NAME" --wait \
+    || echo "  WARN: Vector Search provisioning failed — retrieve_similar_cases falls back to keyword search." >&2
+elif [[ -z "$VS_ENDPOINT_NAME" ]]; then
+  echo "Skipping Vector Search provisioning (not enabled — keyword retrieval will be used)."
+  echo "    To enable: set vector_search_endpoint in config/project-settings.local.yaml"
+  echo "    (adds 15-40 min to the next deploy, then bills hourly while it is online)."
+else
+  echo "WARN: VS_ENDPOINT='$VS_ENDPOINT_NAME' is set but catalog/warehouse are not" >&2
+  echo "      (catalog='$VS_CATALOG' warehouse='$WAREHOUSE_ID') — index NOT provisioned," >&2
+  echo "      yet the app will try the semantic path. Blank VS_ENDPOINT or fix settings." >&2
+fi
+
+# ── Restart the continuous streaming jobs onto the code just deployed ──────
+# bundle deploy replaces the files these jobs run from, but a run already in
+# flight keeps executing what it started with — and these never terminate on
+# their own. Without this, every deploy after the first leaves the producer and
+# quality-sync running yesterday's build, which presents as a fix that changed
+# nothing. Cancelling is the restart; `continuous` brings them straight back.
+echo
+echo "=== Restarting continuous streaming jobs onto the new code ==="
+JOB_SUFFIX=""
+[[ "$ENV" == "dev" ]] && JOB_SUFFIX="-dev"
+"${PROJECT_PY[@]}" scripts/restart_continuous_jobs.py \
+  --profile "$PROFILE" --suffix="$JOB_SUFFIX" \
+  || echo "  WARN: could not restart the streaming jobs — they may still be running the previous build." >&2
+echo "    (a fresh run appears within a minute or two; the SSE stream gaps briefly)"
+
+# The event log is append-only: resolving an incident appends a 'resolved' row
+# and the original keeps timestamp_end NULL for good, so every incident of the
+# shift still matches "timestamp_end IS NULL". The board reconciles against the
+# resolve markers and shows nothing; anything that does not, counts the lot.
+# Reconcile the stored rows so both rules agree, and close carryover nobody is
+# coming back for. Must run AFTER the job restart above, because it UPDATEs a
+# Delta source the quality-sync stream reads and that stream needs the
+# ignoreChanges build to survive it.
+echo
+echo "=== Closing incidents that were resolved but still look open ==="
+SIM_SHIFT=$(_profile_field sim_shift_id)
+"${PROJECT_PY[@]}" scripts/close_open_incidents.py \
+  --catalog "$UC_CATALOG" --schema "$UC_SCHEMA" \
+  --shift-id "${SIM_SHIFT:-shift_1}" --warehouse-id "$WAREHOUSE_ID" \
+  || echo "  WARN: incident reconciliation failed — the assistant may report incidents the board does not show." >&2
+
 echo
 echo "=== Deploy complete (env=$ENV target=$BUNDLE_TARGET app=$APP_NAME) ==="
 if [[ "${RUN_SETUP:-0}" != "1" ]]; then
   echo "    (Existing env — skipped one-time setup. Force re-provision with: RUN_SETUP=1 $0 $ENV)"
+fi
+if [[ -n "$TRACE_WARNING" ]]; then
+  echo
+  echo "    !! The app is running, but MLflow traces will be empty." >&2
+  echo "       UC-backed trace storage was not provisioned:" >&2
+  echo "       $TRACE_WARNING" >&2
+  echo "       The app falls back to the bundle's experiment, whose spans upload to a" >&2
+  echo "       storage host the Apps runtime cannot reach — so the MLflow UI will show" >&2
+  echo "       traces with no spans and offer to 'Enable UC trace storage'." >&2
+  echo "       Usual cause: uc_catalog / sql_warehouse_id / mlflow_experiment_path still" >&2
+  echo "       SET_ME in config/project-settings.local.yaml. Fix, then re-run this deploy." >&2
+  echo "       A UC link is permanent, so a half-linked experiment is scrap; the script" >&2
+  echo "       moves to the next name (-2, -3) rather than reusing it." >&2
 fi

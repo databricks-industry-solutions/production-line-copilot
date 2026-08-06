@@ -59,6 +59,11 @@ FIELD_TO_ENV = {
     "genie_space_quality": "GENIE_SPACE_QUALITY",
     "genie_space_inventory": "GENIE_SPACE_INVENTORY",
     "genie_space_production": "GENIE_SPACE_PRODUCTION",
+    # Empty means retrieve_similar_cases uses keyword search. Opting in is one
+    # line here rather than an edit to app.yaml, because the endpoint bills by
+    # the hour and the first deploy that creates it takes far longer than the
+    # rest of the deploy put together — see scripts/provision_vector_search.py.
+    "vector_search_endpoint": "VS_ENDPOINT",
     # Tells the app whether THIS environment writes the governed MVM tables.
     # They are catalog-level with no environment suffix, so a shared catalog
     # would otherwise let a non-writing environment report another's rows.
@@ -212,8 +217,15 @@ def _remove_env(path: Path, names: set[str]) -> list[str]:
 
 
 def _is_placeholder(value: object) -> bool:
+    """True for anything still carrying an unfilled template token.
+
+    The token can sit anywhere in the value, not just wrap it: settings like
+    ``projects/<your-lakebase-project>/branches/main`` are paths with the
+    placeholder embedded. An endswith check missed those and rendered the
+    literal text straight into the app's environment.
+    """
     text = str(value).strip()
-    return text == "" or text == "SET_ME" or (text.startswith("<") and text.endswith(">"))
+    return text == "" or text == "SET_ME" or bool(re.search(r"<[^<>]+>", text))
 
 
 def main() -> None:
@@ -274,6 +286,24 @@ def main() -> None:
     orch = prof.get("model_orchestrator_endpoint")
     if orch is not None and not _is_placeholder(orch):
         env_to_val["MODEL_ORCHESTRATOR"] = str(orch).strip()
+
+    # Vector Search is the one setting where "empty" is a real instruction
+    # rather than "not filled in yet". The generic loop above skips empty values
+    # so a half-finished settings file cannot blank out a working app, but that
+    # rule inverted here: clearing the endpoint is how an operator turns the
+    # feature — and its hourly bill — OFF, and skipping the empty would leave
+    # the old endpoint name in app.yaml and the app still pointed at it.
+    #
+    # A profile that never mentions the key at all (older local settings) is
+    # still left alone; only an explicit empty turns it off.
+    if "vector_search_endpoint" in prof:
+        vs = str(prof.get("vector_search_endpoint") or "").strip()
+        vs = "" if _is_placeholder(vs) else vs
+        env_to_val["VS_ENDPOINT"] = vs
+        # Derived, never set by hand. This flag only tells the cost panel to
+        # bill an idle endpoint; the two drifting apart is how the panel came
+        # to invent ~$58/month for an endpoint nobody had provisioned.
+        env_to_val["OPS_VS_ENDPOINT_ALWAYS_ON"] = "true" if vs else "false"
 
     role_env = _role_overrides(prof.get("model_roles"))
     env_to_val.update(role_env)

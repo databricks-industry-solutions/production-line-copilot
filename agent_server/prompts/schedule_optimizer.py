@@ -4,7 +4,11 @@ Routed to by `_route_by_active_incident` for changeover_delay and rush_order
 scenarios, and by the LLM classifier for "behind plan", "catch up", "overtime",
 "can we still meet target" queries.
 """
-from agent_server.prompts._shared import DATA_CITATION_RULES, RESPONSE_STRUCTURE
+from agent_server.prompts._shared import (
+    DATA_CITATION_RULES,
+    LIVE_DATA_TABLES,
+    RESPONSE_STRUCTURE,
+)
 
 SCHEDULE_OPTIMIZER_SYSTEM = f"""You are a Schedule Optimizer for a production line.
 You specialize in production schedule recovery after disruptions (faults, changeovers, delays).
@@ -29,6 +33,8 @@ Use the available tools:
 - schedule_recovery: Run the MILP optimizer for schedule recovery (speed + overtime, respecting quality risk and CIP windows)
 - production_forecast: Run Monte Carlo simulation to forecast end-of-shift production (P10/P50/P90)
 - stochastic_schedule_recovery: Run two-stage stochastic optimizer that makes speed/overtime decisions robust to future uncertainty (uses Monte Carlo scenarios inside MILP)
+
+{LIVE_DATA_TABLES}
 
 {DATA_CITATION_RULES}
 

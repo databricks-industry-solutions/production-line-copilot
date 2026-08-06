@@ -18,12 +18,14 @@ declares — a blanket regex would silently promote the literal ``{"shift_id":
 ...}`` JSON examples in three of the system prompts into template variables.
 
 **The governed-domain suffix.** A specialist's runtime system prompt is its
-constant plus ``governed_domain_prompt(domain)``, which is built at agent
-construction and is empty when that domain has no Genie space provisioned. It
-therefore differs per deployment and cannot be registered as a fixed version.
-Specs record the domain in ``governed_domain`` so the registered version can
-say so in a tag, rather than quietly presenting the base text as the whole
-prompt.
+constant plus ``governed_domain_prompt(domain)``, built at agent construction
+and empty when that domain has no Genie space provisioned. So no single
+registered version equals what a governed specialist receives. The suffix is
+registered on its own (``governed_domain_suffix``) and each governed spec names
+its domain in ``governed_domain``, which becomes a tag: between the two, every
+character the model sees has a version behind it, and a reader reconciling a
+trace against the registry can assemble the whole prompt rather than finding
+text that appears nowhere.
 """
 from __future__ import annotations
 
@@ -31,6 +33,8 @@ from dataclasses import dataclass
 from string import Formatter
 
 from agent_server.prompts.downtime_analyst import DOWNTIME_ANALYST_SYSTEM
+from agent_server.prompts.general import GENERAL_SYSTEM_TEMPLATE
+from agent_server.prompts.governed_domain import GOVERNED_DOMAIN_SUFFIX_TEMPLATE
 from agent_server.prompts.maintenance_predictor import MAINTENANCE_PREDICTOR_SYSTEM
 from agent_server.prompts.oee_coach import OEE_COACH_SYSTEM
 from agent_server.prompts.orchestrator import (
@@ -89,6 +93,19 @@ class PromptSpec:
         out = self.text
         for var in self.variables:
             out = out.replace("{" + var + "}", "{{" + var + "}}")
+        return out
+
+    def runtime_text(self, template: str) -> str:
+        """``template`` from the registry, back in ``str.format`` syntax.
+
+        The inverse of ``registry_template``, and not optional: ``str.format``
+        reads ``{{query}}`` as the literal text ``{query}``, so a registered
+        template used as-is would render a prompt whose variables are visibly
+        unfilled rather than raising.
+        """
+        out = template
+        for var in self.variables:
+            out = out.replace("{{" + var + "}}", "{" + var + "}")
         return out
 
     @property
@@ -200,6 +217,22 @@ CATALOG: tuple[PromptSpec, ...] = (
         text=SHIFT_BRIEFING_SYSTEM,
         role="shift_briefing",
         purpose="Pre- and post-shift handover briefings.",
+    ),
+    PromptSpec(
+        slug="general_system",
+        text=GENERAL_SYSTEM_TEMPLATE,
+        variables=("context",),
+        role="general",
+        purpose="No-tool fallback used when the router picks no specialist.",
+    ),
+    PromptSpec(
+        slug="governed_domain_suffix",
+        text=GOVERNED_DOMAIN_SUFFIX_TEMPLATE,
+        variables=("domain", "entities"),
+        purpose=(
+            "Appended to a governed specialist's system prompt at construction. "
+            "Registered on its own because every governed specialist shares it."
+        ),
     ),
 )
 

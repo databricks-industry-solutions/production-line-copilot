@@ -23,6 +23,13 @@ logger = logging.getLogger(__name__)
 # connection can only execute one statement at a time regardless. Slow scans
 # belong on ``new_readonly_connection`` and never take this lock.
 _lock = threading.RLock()
+
+# How many ``transaction()`` blocks are open on this connection. Reads end their
+# own transaction when it is zero (see ``_end_read_transaction``); inside a write
+# unit they must not, because the rollback would discard the writer's work.
+# ``_lock`` is held for the whole of ``transaction()`` and reacquired by every
+# read, so only the block's own thread can observe a non-zero depth.
+_write_depth = 0
 _connection = None
 _last_token_time = 0.0
 _TOKEN_REFRESH_SECONDS = 3000
@@ -170,6 +177,79 @@ ALTER TABLE ai_serving.scenario_commands
 -- pickup phase runs. ``ALTER COLUMN ... SET DEFAULT`` is idempotent.
 ALTER TABLE ai_serving.scenario_commands
     ALTER COLUMN status SET DEFAULT 'pending';
+
+-- ── Playback history ─────────────────────────────────────────────────
+-- These four back the SSE cursor that drives the live line UI. They used
+-- to exist only in scripts/migrate_history_tables.sql, which no deploy
+-- step ran, so a fresh Lakebase simply did not have them: the producer's
+-- dual-write failed soft on every tick and the dashboard never animated.
+-- It worked in environments where someone had run the file by hand once,
+-- which is the worst kind of working. Creating them here means the app
+-- provisions its own storage on first connect, like every other table
+-- above.
+CREATE TABLE IF NOT EXISTS ai_serving.machine_state_history (
+    shift_id            TEXT        NOT NULL,
+    machine_id          TEXT        NOT NULL,
+    ts                  TIMESTAMPTZ NOT NULL,
+    status              TEXT,
+    throughput_per_min  DOUBLE PRECISION,
+    speed_pct           DOUBLE PRECISION,
+    alarm_count         INTEGER,
+    PRIMARY KEY (shift_id, machine_id, ts)
+);
+-- Cursor query: WHERE shift_id=? AND ts > cursor ORDER BY ts ASC LIMIT 19.
+CREATE INDEX IF NOT EXISTS idx_machine_state_history_shift_ts
+    ON ai_serving.machine_state_history (shift_id, ts);
+
+CREATE TABLE IF NOT EXISTS ai_serving.line_kpi_history (
+    shift_id              TEXT        NOT NULL,
+    ts                    TIMESTAMPTZ NOT NULL,
+    machines_running      INTEGER,
+    machines_stopped      INTEGER,
+    machines_degraded     INTEGER,
+    machines_starved      INTEGER,
+    total_throughput      DOUBLE PRECISION,
+    cumulative_cases      DOUBLE PRECISION,
+    avg_speed_pct         DOUBLE PRECISION,
+    availability_to_now   DOUBLE PRECISION,
+    performance_to_now    DOUBLE PRECISION,
+    quality_to_now        DOUBLE PRECISION,
+    oee_to_now            DOUBLE PRECISION,
+    PRIMARY KEY (shift_id, ts)
+);
+CREATE INDEX IF NOT EXISTS idx_line_kpi_history_shift_ts
+    ON ai_serving.line_kpi_history (shift_id, ts);
+
+CREATE TABLE IF NOT EXISTS ai_serving.inventory_status_history (
+    shift_id                  TEXT        NOT NULL,
+    material_id               TEXT        NOT NULL,
+    ts                        TIMESTAMPTZ NOT NULL,
+    on_hand_qty               DOUBLE PRECISION,
+    safety_stock              DOUBLE PRECISION,
+    reorder_point             DOUBLE PRECISION,
+    status                    TEXT,
+    consumption_rate_per_hour DOUBLE PRECISION,
+    PRIMARY KEY (shift_id, material_id, ts)
+);
+CREATE INDEX IF NOT EXISTS idx_inventory_status_history_shift_ts
+    ON ai_serving.inventory_status_history (shift_id, ts);
+
+CREATE TABLE IF NOT EXISTS ai_serving.event_log_history (
+    event_id           TEXT NOT NULL,
+    shift_id           TEXT NOT NULL,
+    machine_id         TEXT,
+    event_type         TEXT,
+    severity           TEXT,
+    timestamp_start    TIMESTAMPTZ,
+    timestamp_end      TIMESTAMPTZ,
+    duration_minutes   DOUBLE PRECISION,
+    root_cause         TEXT,
+    description        TEXT,
+    corrective_action  TEXT,
+    PRIMARY KEY (event_id)
+);
+CREATE INDEX IF NOT EXISTS idx_event_log_history_shift_ts
+    ON ai_serving.event_log_history (shift_id, timestamp_start);
 """
 
 _tables_initialized = False
@@ -249,23 +329,59 @@ def _get_pg_user() -> str:
     return "postgres"
 
 
+def iter_statements(sql: str):
+    """Yield executable statements from ``sql``, ignoring ``--`` comments.
+
+    Splitting on ``;`` alone breaks on a semicolon inside a comment: the line
+    "-- polls by status every tick; a covering index avoids a seq scan" becomes
+    a comment-only fragment (psycopg2: "can't execute an empty query") followed
+    by "a covering index avoids a seq scan" (a syntax error). Stripping the
+    comments first is enough here — the DDL contains no string literal holding
+    a semicolon, and a full parser would be more machinery than that earns.
+    """
+    stripped = "\n".join(line.split("--", 1)[0] for line in sql.splitlines())
+    for statement in stripped.split(";"):
+        statement = statement.strip()
+        if statement:
+            yield statement
+
+
 def _init_tables(conn):
-    """Create schema and tables if they don't exist."""
+    """Create schema and tables if they don't exist.
+
+    Every statement runs on its own. The app service principal is granted
+    CREATE on ai_serving and ai_chatbot but *not* on the database, so the
+    leading ``CREATE SCHEMA IF NOT EXISTS`` raises "permission denied for
+    database" — and when the whole batch shared one try/except, that first
+    statement cost the twenty-five CREATE TABLEs the app was entitled to run.
+    The schemas are created by the deploy (scripts/init_lakebase_role.py), so
+    that particular failure is expected and harmless; losing everything after
+    it was not, and the bland "may already exist" warning made it invisible.
+    """
     global _tables_initialized
     if _tables_initialized:
         return
     old_autocommit = conn.autocommit
     try:
         conn.autocommit = True
+        failed: list[str] = []
         with conn.cursor() as cur:
-            for stmt in _INIT_SQL.strip().split(";"):
-                stmt = stmt.strip()
-                if stmt:
+            for stmt in iter_statements(_INIT_SQL):
+                try:
                     cur.execute(stmt)
+                except Exception as exc:  # noqa: BLE001 - reported together below
+                    failed.append(f"{stmt.splitlines()[0][:60]} -> {str(exc).strip()[:120]}")
         _tables_initialized = True
-        logger.info("Lakebase tables initialized")
+        if failed:
+            logger.warning(
+                "Lakebase init: %d statement(s) failed (the rest applied). "
+                "The deploy provisions this schema; these are only a fallback:\n  %s",
+                len(failed), "\n  ".join(failed),
+            )
+        else:
+            logger.info("Lakebase tables initialized")
     except Exception:
-        logger.warning("Could not auto-initialize Lakebase tables (may already exist)")
+        logger.warning("Could not auto-initialize Lakebase tables", exc_info=True)
     finally:
         # Restore in a finally: the old code restored only on the success path,
         # so a failed init (routine when the app SP can't CREATE) silently left
@@ -450,6 +566,16 @@ def query(sql: str, params: tuple | None = None, *, fetch: str = "all"):
     Errors that are NOT connection problems (bad SQL, missing table) are raised
     after a rollback: retrying cannot help, and swallowing them would hide real
     bugs behind an empty panel.
+
+    The read's transaction is closed before returning. The connection runs with
+    ``autocommit = False``, and this used to just return, leaving the backend
+    ``idle in transaction`` holding an ACCESS SHARE lock on everything it had
+    touched until some later query happened to end it. With the SSE stream
+    reading ``scenario_commands`` every second there was almost always one open,
+    so a deploy's ``ALTER TABLE`` could never take ACCESS EXCLUSIVE: it queued,
+    and because an exclusive request queues ahead of later readers, every
+    producer poll then blocked behind the ALTER. One dev deploy stalled 14
+    minutes and froze incident handling in both environments while it waited.
     """
     import psycopg2
 
@@ -461,11 +587,15 @@ def query(sql: str, params: tuple | None = None, *, fetch: str = "all"):
             with _lock, conn.cursor() as cur:
                 cur.execute(sql, params)
                 if cur.description is None:
+                    _end_read_transaction(conn)
                     return None
                 if fetch == "one":
                     row = cur.fetchone()
-                    return dict(row) if row else None
-                return [dict(r) for r in cur.fetchall()]
+                    result = dict(row) if row else None
+                else:
+                    result = [dict(r) for r in cur.fetchall()]
+                _end_read_transaction(conn)
+                return result
         except (psycopg2.OperationalError, psycopg2.InterfaceError) as exc:
             # The connection itself is broken — rolling it back is pointless,
             # but it must not be handed to the next caller.
@@ -487,6 +617,23 @@ def query(sql: str, params: tuple | None = None, *, fetch: str = "all"):
             _reset_after_error(conn)
             raise
     return None
+
+
+def _end_read_transaction(conn) -> None:
+    """Close the implicit transaction a read opened, unless a write owns it.
+
+    Rollback rather than commit: the statement was a read, so there is nothing
+    to keep, and rollback is the cheaper way to release the snapshot and the
+    ACCESS SHARE locks it holds. Called with ``_lock`` held.
+    """
+    if _write_depth:
+        return
+    try:
+        conn.rollback()
+    except Exception:  # noqa: BLE001 — the read already succeeded; a failure
+        # here means the connection died after it, and the next caller's health
+        # check will discard it.
+        pass
 
 
 @contextmanager
@@ -513,8 +660,10 @@ def transaction():
     if conn is None:
         yield None
         return
+    global _write_depth
     with _lock:
         cur = conn.cursor()
+        _write_depth += 1
         try:
             yield cur
             conn.commit()
@@ -525,6 +674,7 @@ def transaction():
                 pass
             raise
         finally:
+            _write_depth -= 1
             try:
                 cur.close()
             except Exception:  # noqa: BLE001

@@ -14,7 +14,17 @@
 --   inventory_status_history ~16 rows/s × 86 400 × 7 = 9.7 M rows ≈ 1.4 GB
 --   event_log_history        sparse (~10 rows/min)   ≈ negligible
 --
--- Run as a user with CREATE on schema ai_serving:
+-- YOU DO NOT NORMALLY NEED TO RUN THIS.
+--
+-- The same DDL now lives in agent_server/memory/pg_pool.py::_INIT_SQL, so the
+-- app creates these tables itself on first connect. It used to exist only
+-- here, and no deploy step ran it: a fresh Lakebase simply had no history
+-- tables, the producer's dual-write failed soft on every tick, and the live
+-- line never animated. It worked only where someone had run this file by hand
+-- once. Kept as a standalone repair for an existing database, or to read the
+-- schema without digging through Python.
+--
+-- To run it anyway, as a user with CREATE on schema ai_serving:
 --   databricks psql --project <project> --branch <branch> --endpoint primary
 --                   --profile <profile> -- -d databricks_postgres
 --                   -f scripts/migrate_history_tables.sql

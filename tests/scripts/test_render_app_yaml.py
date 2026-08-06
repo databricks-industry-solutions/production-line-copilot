@@ -464,3 +464,43 @@ class TestTheEnvBlockIsParsedAtAll:
         # Only complain when there is something we would have dropped.
         path = self._write(tmp_path, "resources: []\n")
         assert render._insert_missing_env(path, {}) == []
+
+
+class TestVectorSearchIsDerivedFromSettings:
+    """VS_ENDPOINT is a billing switch, so it follows a different rule.
+
+    Everywhere else an empty setting means "not filled in yet" and is skipped,
+    so a half-written settings file cannot blank out a working app. For Vector
+    Search that rule inverts: clearing the endpoint is precisely how an
+    operator turns the feature — and an hourly bill — off, and skipping the
+    empty would leave the app pointed at an endpoint the settings no longer
+    name.
+    """
+
+    def test_naming_an_endpoint_turns_the_feature_and_its_billing_line_on(
+        self, monkeypatch, tmp_path
+    ):
+        out = _run(monkeypatch, tmp_path, {"bundle_target": "line_manager_dev", "vector_search_endpoint": "prodline-copilot-vs"})
+        assert "prodline-copilot-vs" in out
+        # Derived, never hand-set: the two drifting apart is how the cost panel
+        # came to bill for an endpoint nobody had provisioned.
+        assert "OPS_VS_ENDPOINT_ALWAYS_ON" in out
+        assert "'true'" in out.split("OPS_VS_ENDPOINT_ALWAYS_ON")[1][:40]
+
+    def test_clearing_the_setting_turns_it_off_rather_than_being_ignored(
+        self, monkeypatch, tmp_path
+    ):
+        out = _run(monkeypatch, tmp_path, {"bundle_target": "line_manager_dev", "vector_search_endpoint": ""})
+        block = out.split("VS_ENDPOINT")[1][:40]
+        assert "''" in block, "an explicit empty must reach the app, not be skipped"
+        assert "'false'" in out.split("OPS_VS_ENDPOINT_ALWAYS_ON")[1][:40]
+
+    def test_a_profile_that_never_mentions_it_is_left_alone(self, monkeypatch, tmp_path):
+        """Older local settings predate the key; do not touch what they omit."""
+        out = _run(monkeypatch, tmp_path, {"bundle_target": "line_manager_dev", "uc_catalog": "cat"})
+        assert "VS_ENDPOINT" not in out
+
+    def test_an_unfilled_placeholder_does_not_provision_anything(self, monkeypatch, tmp_path):
+        out = _run(monkeypatch, tmp_path, {"bundle_target": "line_manager_dev", "vector_search_endpoint": "SET_ME"})
+        assert "SET_ME" not in out.split("VS_ENDPOINT")[1][:40]
+        assert "'false'" in out.split("OPS_VS_ENDPOINT_ALWAYS_ON")[1][:40]

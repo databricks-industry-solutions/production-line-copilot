@@ -43,6 +43,7 @@ import logging
 import os
 import queue
 import re
+import threading
 import time
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
@@ -50,14 +51,25 @@ from concurrent.futures import TimeoutError as FuturesTimeout
 
 import mlflow
 from databricks_langchain import ChatDatabricks
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 
 from agent_server.context_builder import build_context
+from agent_server.events import active_events, context_now_ts, shift_progress, to_epoch
 from agent_server.llm_output import message_text
+from agent_server.logged_model import activate as activate_logged_model
 from agent_server.memory.conversation_store import ConversationStore
 from agent_server.model_roster import ROSTER, describe, resolve
-from agent_server.prompts.orchestrator import INTENT_CLASSIFY_TEMPLATE, ORCHESTRATOR_SYSTEM
-from agent_server.prompts.response_synthesis import SYNTHESIS_TEMPLATE
+
+# Imported as a module: this file already has a local named ``prompt_text``,
+# and the prompts are resolved through ``loader.prompt_text(slug)`` so the
+# registry can supply them without the call sites caring which source won.
+from agent_server.prompts import loader
 from agent_server.specialists.downtime_analyst import create_downtime_analyst
 from agent_server.specialists.maintenance_predictor import create_maintenance_predictor
 from agent_server.specialists.oee_coach import create_oee_coach
@@ -75,6 +87,10 @@ logger = logging.getLogger(__name__)
 # we can query latency + tool-call breakdowns from the experiment view.
 mlflow.langchain.autolog()
 
+# Give those spans a model to hang off, so traces can be compared per release
+# rather than only per experiment. Best-effort by construction — see the module.
+activate_logged_model()
+
 # Intent classification, the "general" fallback path and response synthesis are
 # three different jobs, so they no longer share one endpoint. Routing picks one
 # label from nine and every request waits on it, which wants the cheapest fast
@@ -84,8 +100,22 @@ _ROUTER_ROLE = "intent_router"
 _GENERAL_ROLE = "general"
 
 
-def _overlay_live_state(context: dict) -> dict:
+def _overlay_live_state(context: dict, shift_id: str | None = None) -> dict:
     """Replace operational slices of `context` with the live Lakebase snapshot.
+
+    ``shift_id`` must be the shift the caller asked about — the same one passed
+    to ``build_context``. It used to be read from ``SIM_SHIFT_ID`` here while
+    the historical half of the context came from the caller's argument, so the
+    two halves could describe different shifts: historical events for one,
+    live machine state, KPIs and active incidents for another. Routing reads
+    ``active_incidents``, so the specialist could be chosen by an incident on a
+    shift nobody asked about.
+
+    The HTTP path never hit it, because ``_server_shift_id`` deliberately
+    overrides whatever the browser sends with the environment's id, making both
+    halves agree by coincidence rather than by construction. The eval harness
+    does hit it: ``evaluations/run_eval.py`` calls ``invoke`` directly with the
+    shift from its dataset.
 
     Live machine / KPI / event / inventory / incident state is read from the
     same ``ai_serving.*`` Lakebase tables that feed the dashboard SSE stream, so
@@ -117,7 +147,9 @@ def _overlay_live_state(context: dict) -> dict:
             read_machine_state_latest,
         )
 
-        shift_id = os.environ.get("SIM_SHIFT_ID", "shift_1")
+        # The environment id is the fallback for callers that do not track a
+        # shift at all, not an override of one that does.
+        shift_id = (shift_id or "").strip() or os.environ.get("SIM_SHIFT_ID", "shift_1")
         machines = read_machine_state_latest(shift_id)
         if not machines:
             # No live rows (Lakebase unavailable, or the shift hasn't started
@@ -154,10 +186,20 @@ def _overlay_live_state(context: dict) -> dict:
         # specialist historical UC readings under a live scenario name and a
         # current timestamp. That is the half-overlaid state this function's own
         # docstring calls worse than a clean fallback.
+        # The shift clock has to move with the timestamp. Advancing
+        # current_timestamp while leaving elapsed/remaining as the UC bundle
+        # computed them froze the clock at whatever it read when the bundle was
+        # built: the snapshot said "Time remaining: 240 min" hours apart, and
+        # in dev — where scenario_index has no row at all — the figure was
+        # never live to begin with. Derive it the way the producer and the
+        # header do, from the UTC-aligned shift window, so all three agree.
+        elapsed_min, remaining_min = shift_progress()
         context["scenario"] = {
             **context.get("scenario", {}),
             "current_timestamp": now_iso,
             "scenario_name": "Live Real-Time (Lakebase)",
+            "elapsed_minutes": elapsed_min,
+            "remaining_minutes": remaining_min,
         }
 
         logger.info(
@@ -170,7 +212,14 @@ def _overlay_live_state(context: dict) -> dict:
 
     return context
 
-SPECIALIST_TIMEOUT_SECONDS = int(os.environ.get("SPECIALIST_TIMEOUT_SECONDS", "90"))
+# 90 was under the work. Timing the downtime analyst end to end, on both
+# environments: about 34s across seven tool calls, then roughly 40s of silence
+# while the model composes over their combined output, then ten seconds of
+# prose — 88s on dev and 93s on prod for the same question. A budget inside
+# that spread does not bound a runaway, it decides coin flips, and the losing
+# side of the flip threw the answer away. The tools are not the cost here and
+# trimming them would not have bought enough.
+SPECIALIST_TIMEOUT_SECONDS = int(os.environ.get("SPECIALIST_TIMEOUT_SECONDS", "150"))
 
 # LangGraph counts super-steps, and one ReAct round costs two of them — the
 # model node, then the tool node — with a final model node to write the answer.
@@ -179,15 +228,30 @@ SPECIALIST_TIMEOUT_SECONDS = int(os.environ.get("SPECIALIST_TIMEOUT_SECONDS", "9
 # Quality Specialist spends one round on its governed domain, one on live SQL,
 # one more when the first live query names a column that doesn't exist, and it
 # was failing roughly two runs in three. Seven rounds leaves room to recover
-# without becoming the thing that bounds a runaway loop — SPECIALIST_TIMEOUT_SECONDS
-# is the real ceiling, and it applies to wall clock rather than to step count.
+# without becoming the thing that bounds a runaway loop. SPECIALIST_TIMEOUT_SECONDS
+# bounds how long the USER waits, in wall clock rather than step count — but see
+# below: it does not bound how long the work runs.
 SPECIALIST_RECURSION_LIMIT = int(os.environ.get("SPECIALIST_RECURSION_LIMIT", "16"))
-# One specialist run holds a worker for as long as it takes, up to
-# SPECIALIST_TIMEOUT_SECONDS. At two workers a third simultaneous question waited
-# behind two runs that can each last 90s and the gateway returned 502 before the
-# app ever answered — which is what a room full of people asking at once looks
-# like. These threads are almost entirely blocked on the serving endpoint and the
-# warehouse, so the cost of more of them is concurrent load on those, not CPU here.
+# A specialist run holds a worker until it finishes, which is NOT the same as
+# "up to SPECIALIST_TIMEOUT_SECONDS". `future.result(timeout=…)` stops the
+# caller waiting; it cannot interrupt the callable, because nothing in Python
+# can interrupt a thread mid-call. The streaming path narrows this by checking
+# a cancellation flag between ReAct super-steps, so an abandoned run stops
+# after the model or tool call already in flight. The synchronous path
+# (`_run_specialist`, one blocking `agent.invoke`) has no such seam and can
+# hold its worker well past the timeout the user already saw.
+#
+# So the recursion limit, not the timeout, is what actually bounds resource
+# use. Sizing follows from that: at two workers a third simultaneous question
+# waited behind two runs that can each last 90s and the gateway returned 502
+# before the app ever answered — which is what a room full of people asking at
+# once looks like. These threads are almost entirely blocked on the serving
+# endpoint and the warehouse, so the cost of more of them is concurrent load on
+# those, not CPU here.
+#
+# The streaming path additionally uses one unbounded daemon thread per request
+# to drain the event queue; that thread spends its life blocked on this pool,
+# so concurrency is still bounded here, but the thread count is not.
 _SPECIALIST_WORKERS = int(os.environ.get("SPECIALIST_WORKERS", "6"))
 _executor = ThreadPoolExecutor(
     max_workers=_SPECIALIST_WORKERS, thread_name_prefix="specialist"
@@ -212,6 +276,17 @@ def _get_specialists() -> dict:
             "shift_briefing": create_shift_briefing(),
         }
     return _specialists
+
+# Every name the router may return. A module constant rather than a literal
+# inside _classify_intent because the evaluation scenarios have to be checked
+# against it: when that set was inlined, the test suite kept its own copy and
+# so could not notice a scenario naming a specialist the router would never
+# emit — it would just be silently downgraded to "general" at runtime.
+VALID_SPECIALISTS: frozenset[str] = frozenset({
+    "downtime_analyst", "quality_specialist", "supply_chain_advisor",
+    "oee_coach", "schedule_optimizer", "maintenance_predictor",
+    "strategic_advisor", "shift_briefing", "general",
+})
 
 INCIDENT_TO_SPECIALIST: dict[str, str] = {
     "machine_breakdown": "downtime_analyst",
@@ -265,14 +340,28 @@ def _classify_intent(query: str, context: dict) -> str:
     Wrapped in an MLflow span so the trace shows the routing decision as a
     named step distinct from the specialist execution below.
     """
-    # max_tokens=50 is enough for any specialist name + slack. Anything longer
-    # is almost certainly the model echoing the question — we'd discard it.
+    # The only completion cap left in the system, and the only one where
+    # truncation is harmless: this returns a specialist name, so a cut-off
+    # completion either still matches or falls through to the default. 50 is
+    # enough for any name plus slack, and anything longer is the model echoing
+    # the question back — which we would discard anyway.
+    #
+    # The answer paths carry no cap. Their output contract is 250 words, but a
+    # reasoning model spends most of a completion budget on reasoning tokens
+    # that count against it and never reach the user, so a cap sized for the
+    # answer truncates it instead — from the bottom, taking Priority Actions,
+    # Estimated Recovery and Confidence, and leaving something that still looks
+    # like a finished answer. Length is already bounded three other ways: the
+    # prompt's word cap, SPECIALIST_RECURSION_LIMIT on calls, and
+    # SPECIALIST_TIMEOUT_SECONDS on the wait.
     llm = ChatDatabricks(endpoint=resolve(_ROUTER_ROLE), max_tokens=50)
 
-    # Build summary strings for the classification prompt
+    # Build summary strings for the classification prompt. Unreconciled, this
+    # fed the router resolve markers as though they were incidents
+    # ("DEPALLETIZER: resolved") alongside faults that were already over.
     events_summary = ", ".join(
         f"{e.get('machine_id', '?')}: {e.get('event_type', '?')}"
-        for e in context.get("active_events", [])[:5]
+        for e in active_events(context.get("active_events", []), context_now_ts(context))[:5]
     ) or "None"
 
     line_summary_parts = []
@@ -280,7 +369,7 @@ def _classify_intent(query: str, context: dict) -> str:
         line_summary_parts.append(f"{m.get('machine_id', '?')}={m.get('status', '?')}")
     line_summary = ", ".join(line_summary_parts) or "All running"
 
-    prompt_text = INTENT_CLASSIFY_TEMPLATE.format(
+    prompt_text = loader.prompt_text("intent_classify").format(
         shift_id=context.get("scenario", {}).get("shift_id", "?"),
         scenario_name=context.get("scenario", {}).get("scenario_name", "?"),
         timestamp=context.get("scenario", {}).get("current_timestamp", "?"),
@@ -290,19 +379,14 @@ def _classify_intent(query: str, context: dict) -> str:
     )
 
     messages = [
-        SystemMessage(content=ORCHESTRATOR_SYSTEM),
+        SystemMessage(content=loader.prompt_text("orchestrator_system")),
         HumanMessage(content=prompt_text),
     ]
 
     try:
         response = llm.invoke(messages)
         intent = message_text(response).strip().lower().replace(" ", "_")
-        valid = {
-            "downtime_analyst", "quality_specialist", "supply_chain_advisor",
-            "oee_coach", "schedule_optimizer", "maintenance_predictor",
-            "strategic_advisor", "shift_briefing", "general",
-        }
-        if intent not in valid:
+        if intent not in VALID_SPECIALISTS:
             logger.warning("Unknown intent '%s', defaulting to general", intent)
             return "general"
         return intent
@@ -310,7 +394,75 @@ def _classify_intent(query: str, context: dict) -> str:
         logger.exception("Intent classification failed")
         return "general"
 
-def _quick_snapshot(context: dict) -> str:
+_SEVERITY_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+
+
+def _event_detail(event: dict) -> str:
+    """The event's description, unless it only restates the event type.
+
+    The producer writes ``description = f"Incident started: {scenario_id}"`` and
+    ``event_type = scenario_id``, so rendering both gave the operator
+    "machine_breakdown (high): Incident started: machine_breakdown" — three
+    words of signal padded out to a full line. Backfilled events carry real
+    prose ("Label web break during reel changeover") and that is worth showing.
+    """
+    detail = (event.get("description") or "").strip()
+    if not detail:
+        return ""
+    event_type = (event.get("event_type") or "").strip()
+    if event_type and detail.replace("_", " ").lower().endswith(
+        event_type.replace("_", " ").lower()
+    ):
+        # "Incident started: machine_breakdown" against event_type
+        # "machine_breakdown" — the description ends where the type begins.
+        remainder = detail[: -len(event_type)].strip(" :-—")
+        if not remainder or remainder.lower() in ("incident started", "incident resolved"):
+            return ""
+    return detail[:80]
+
+
+def _snapshot_alerts(events: list, context: dict, query: str = "") -> list[dict]:
+    """The (at most three) open alerts worth putting in front of the operator.
+
+    Three separate problems produced the DEPALLETIZER report on a FILLER
+    question. Resolved incidents counted as open, because closure lives in a
+    marker row rather than in ``timestamp_end``. The same machine appeared once
+    per repeat fault, so one flapping unit could fill all three slots. And the
+    list was ordered by recency alone, with no idea which machine had been asked
+    about, so the machine in the question could be crowded out entirely.
+    """
+    open_events = active_events(events, context_now_ts(context))
+
+    # One line per machine: the operator needs to know a machine is down, not
+    # how many times it has gone down. Most severe wins, then most recent.
+    by_machine: dict[str, dict] = {}
+    for e in open_events:
+        machine = e.get("machine_id") or "?"
+        held = by_machine.get(machine)
+        if held is None or (
+            _SEVERITY_RANK.get((e.get("severity") or "").lower(), 9),
+            -to_epoch(e.get("timestamp_start")),
+        ) < (
+            _SEVERITY_RANK.get((held.get("severity") or "").lower(), 9),
+            -to_epoch(held.get("timestamp_start")),
+        ):
+            by_machine[machine] = e
+
+    asked_about = {
+        m for m in by_machine
+        if m and re.search(rf"\b{re.escape(m)}\b", query or "", re.IGNORECASE)
+    }
+    return sorted(
+        by_machine.values(),
+        key=lambda e: (
+            0 if (e.get("machine_id") or "") in asked_about else 1,
+            _SEVERITY_RANK.get((e.get("severity") or "").lower(), 9),
+            -to_epoch(e.get("timestamp_start")),
+        ),
+    )[:3]
+
+
+def _quick_snapshot(context: dict, query: str = "") -> str:
     """Build a deterministic markdown snapshot of the line, no LLM involved.
 
     Yielded immediately after routing so the user has something concrete to
@@ -349,17 +501,27 @@ def _quick_snapshot(context: dict) -> str:
         else:
             parts.append(f"  Cases: **{a:,}** / {p:,} ({pct:.0f}% of plan)")
 
-    stopped = [m.get("machine_id", "?") for m in line_state if m.get("status") in ("stopped", "degraded", "starved")]
+    # "blocked" is a status the cascade sets when a machine cannot discharge
+    # downstream. Leaving it out counted such a machine as neither running nor
+    # an issue, so the line did not add up: 16 running and 2 issues on a
+    # 19-machine line, with the third silently missing.
+    stopped = [
+        m.get("machine_id", "?") for m in line_state
+        if m.get("status") in ("stopped", "degraded", "starved", "blocked")
+    ]
     running_count = sum(1 for m in line_state if m.get("status") == "running")
     if stopped:
-        parts.append(f"  Line: {running_count} running, **{len(stopped)} issue(s)**: {', '.join(stopped[:5])}")
+        shown = ", ".join(stopped[:5])
+        if len(stopped) > 5:
+            shown += f", +{len(stopped) - 5} more"
+        parts.append(f"  Line: {running_count} running, **{len(stopped)} issue(s)**: {shown}")
     else:
         parts.append(f"  Line: All {running_count} machines running")
 
-    active = [e for e in events if not e.get("timestamp_end")]
-    if active:
-        for e in active[:3]:
-            parts.append(f"  Alert: **{e.get('machine_id', '?')}** — {e.get('event_type', '?')} ({e.get('severity', '?')}): {(e.get('description') or '')[:80]}")
+    for e in _snapshot_alerts(events, context, query):
+        line = f"  Alert: **{e.get('machine_id', '?')}** — {e.get('event_type', '?')} ({e.get('severity', '?')})"
+        detail = _event_detail(e)
+        parts.append(f"{line}: {detail}" if detail else line)
 
     remaining = scenario.get("remaining_minutes")
     if remaining is not None:
@@ -386,8 +548,13 @@ def _trim_context(context: dict, specialist_name: str) -> dict:
         "production_plan": context.get("production_plan", {}),
     }
 
+    # ``active_events`` is the recent-events feed, not a list of open ones, and
+    # handing it to a specialist under that name is how a FILLER diagnosis came
+    # to reason about three DEPALLETIZER breakdowns that had been resolved
+    # ninety minutes earlier. Closure lives in a separate marker row, so it has
+    # to be reconciled before the slice.
     events = context.get("active_events", [])
-    slim["active_events"] = events[:10]
+    slim["active_events"] = active_events(events, context_now_ts(context))[:10]
 
     line_state = context.get("line_state", [])
     if specialist_name in ("downtime_analyst", "maintenance_predictor"):
@@ -644,6 +811,23 @@ def _run_specialist_streaming(specialist_name: str, query: str, context: dict, e
         HumanMessage(content=f"Context:\n{context_str}\n\nUser query: {query}"),
     ]
 
+    # A timed-out future is abandoned, not stopped: `future.result(timeout=…)`
+    # gives up waiting but the worker keeps running the ReAct loop, holding one
+    # of SPECIALIST_WORKERS slots for as long as the model and its tools take.
+    # A handful of slow questions could therefore starve the pool for everyone
+    # else — the failure the pool was widened to six to avoid in the first
+    # place. Python cannot kill a thread, so the loop below cooperates: it
+    # checks this between super-steps and stops, which bounds the overrun to
+    # the one model or tool call already in flight.
+    cancelled = threading.Event()
+
+    # What the model has said so far, as the tokens go out. `final_content` only
+    # becomes the answer once a whole message lands, so on a timeout it is still
+    # NO_ANSWER even when prose has been streaming for ten seconds — and the
+    # bare timeout string would replace, in the UI, an answer the reader had
+    # already started reading. This is the submitting thread's window into that.
+    streamed: list[str] = []
+
     def _stream_invoke() -> tuple[str, str | None]:
         final_content = NO_ANSWER
         try:
@@ -651,10 +835,46 @@ def _run_specialist_streaming(specialist_name: str, query: str, context: dict, e
             # nest under one "specialist.<name>" parent (see _invoke above).
             with mlflow.start_span(name=f"specialist.{specialist_name}", span_type="AGENT") as span:
                 span.set_inputs({"query": query, "specialist": specialist_name})
-                for event in agent.stream(
+                # Two stream modes at once. "updates" carries whole messages
+                # per super-step and is what the tool trace is built from;
+                # "messages" carries the model's output token by token. Asking
+                # for both changes the item shape to (mode, payload) — with a
+                # single mode LangGraph yields the payload bare.
+                #
+                # Token streaming costs nothing in latency: the tokens were
+                # already crossing the wire, they were simply accumulated in
+                # this worker and released in one piece at the end.
+                for mode, payload in agent.stream(
                     {"messages": input_messages},
                     {"recursion_limit": SPECIALIST_RECURSION_LIMIT},
+                    stream_mode=["updates", "messages"],
                 ):
+                    if cancelled.is_set():
+                        logger.warning(
+                            "Specialist %s abandoned after timeout; releasing the worker",
+                            specialist_name,
+                        )
+                        break
+
+                    if mode == "messages":
+                        chunk = payload[0] if isinstance(payload, tuple) else payload
+                        # The tools node emits on this stream too, so an
+                        # unfiltered handler would type raw tool JSON into the
+                        # answer. Only the model's own prose qualifies, and
+                        # only when it is not the arguments of a tool call
+                        # being assembled a fragment at a time.
+                        if (
+                            isinstance(chunk, AIMessageChunk)
+                            and not getattr(chunk, "tool_calls", None)
+                            and not getattr(chunk, "tool_call_chunks", None)
+                        ):
+                            token = message_text(chunk)
+                            if token:
+                                streamed.append(token)
+                                event_queue.put(("token", token))
+                        continue
+
+                    event = payload
                     for node_name, node_output in event.items():
                         msgs = node_output.get("messages", [])
                         for msg in msgs:
@@ -667,6 +887,16 @@ def _run_specialist_streaming(specialist_name: str, query: str, context: dict, e
                                     if call_evidence:
                                         event_queue.put(("tool_evidence", (display, call_evidence)))
                             if isinstance(msg, ToolMessage):
+                                # Anything the model said before reaching for a
+                                # tool was thinking aloud, not the answer — it
+                                # is discarded from `final_content` when the
+                                # next message supersedes it. Without this the
+                                # streamed draft would keep the preamble and
+                                # glue the real answer onto the end of it.
+                                event_queue.put(("token_reset", None))
+                                # Same reason the UI resets: what came before a
+                                # tool call was thinking aloud, not the answer.
+                                streamed.clear()
                                 tool_name = getattr(msg, 'name', '') or ''
                                 result_evidence = evidence_from_result(tool_name, msg.content)
                                 if result_evidence:
@@ -706,11 +936,25 @@ def _run_specialist_streaming(specialist_name: str, query: str, context: dict, e
         future = _executor.submit(_stream_invoke)
         result, trace_url = future.result(timeout=SPECIALIST_TIMEOUT_SECONDS)
     except FuturesTimeout:
+        cancelled.set()
         logger.error("Specialist %s timed out after %ds (stream)", specialist_name, SPECIALIST_TIMEOUT_SECONDS)
-        result = (
-            f"The {specialist_name.replace('_', ' ')} analysis timed out. "
-            "Please try a more specific question."
-        )
+        # The answer starts streaming late — the tools finish early and the
+        # model then spends a long stretch composing — so a cut usually lands
+        # partway through prose the reader can already see. Cut answers are
+        # worth keeping: the sections are ordered root cause first, so what
+        # arrived is the part that matters most.
+        partial = "".join(streamed).strip()
+        if partial:
+            result = (
+                f"{partial}\n\n---\n*This analysis was cut short at "
+                f"{SPECIALIST_TIMEOUT_SECONDS}s. The findings above are complete as far as "
+                "they go; ask about one machine or one time window for the rest.*"
+            )
+        else:
+            result = (
+                f"The {specialist_name.replace('_', ' ')} analysis timed out before it "
+                "reached an answer. Ask about one machine or one time window to narrow it."
+            )
 
     event_queue.put(("done", result))
     if trace_url:
@@ -728,10 +972,12 @@ def _run_specialist(specialist_name: str, query: str, context: dict) -> str:
         # "General" is the no-tool path: a single chat call with the trimmed
         # context as a system message. Used when the LLM router couldn't find
         # a specialist match — usually "give me a status" or "what's going on".
-        llm = ChatDatabricks(endpoint=resolve(_GENERAL_ROLE), max_tokens=1500)
+        llm = ChatDatabricks(endpoint=resolve(_GENERAL_ROLE))
         context_str = json.dumps(trimmed, indent=2, default=str)
         messages = [
-            SystemMessage(content=f"You are a helpful Line Manager AI assistant. Here is the current context:\n{context_str}"),
+            SystemMessage(
+                content=loader.prompt_text("general_system").format(context=context_str)
+            ),
             HumanMessage(content=query),
         ]
         try:
@@ -777,9 +1023,14 @@ def _run_specialist(specialist_name: str, query: str, context: dict) -> str:
         )
     except Exception as exc:
         logger.exception("Specialist %s failed: %s", specialist_name, exc)
+        # No fallback runs. This used to promise "Falling back to a general
+        # analysis", which was read by an operator as "something still looked
+        # at my question" — nothing did, and `_should_skip_synthesis` matches
+        # "encountered an error" and skips the synthesis pass too. Telling
+        # someone an analysis happened when none did is worse than the error.
         return (
             f"The {specialist_name.replace('_', ' ')} encountered an error: {type(exc).__name__}. "
-            "Falling back to a general analysis. Please try rephrasing your question."
+            "No analysis was produced. Please try rephrasing your question."
         )
 
 @mlflow.trace(name="synthesize_response", span_type="LLM")
@@ -804,10 +1055,10 @@ def _synthesize_response(specialist_name: str, specialist_response: str, context
     scenario = context.get("scenario", {})
     plan = context.get("production_plan", {})
 
-    llm = ChatDatabricks(endpoint=resolve(_GENERAL_ROLE), max_tokens=2000)
+    llm = ChatDatabricks(endpoint=resolve(_GENERAL_ROLE))
 
     kpi = context.get("current_kpi", {})
-    synthesis_prompt = SYNTHESIS_TEMPLATE.format(
+    synthesis_prompt = loader.prompt_text("response_synthesis").format(
         specialist=specialist_name,
         specialist_response=specialist_response,
         shift_id=scenario.get("shift_id", "?"),
@@ -1052,9 +1303,9 @@ def invoke(
     recent_history = _conversation_store.load_history(conversation_id, limit=6)
 
     context = build_context(shift_id, timestamp, machine_id)
-    context = _overlay_live_state(context)
+    context = _overlay_live_state(context, shift_id)
 
-    snapshot = _quick_snapshot(context)
+    snapshot = _quick_snapshot(context, query)
 
     if recent_history and len(recent_history) > 1:
         context["conversation_history"] = [
@@ -1130,9 +1381,9 @@ def invoke_stream(
     recent_history = _conversation_store.load_history(conversation_id, limit=6)
 
     context = build_context(shift_id, timestamp, machine_id)
-    context = _overlay_live_state(context)
+    context = _overlay_live_state(context, shift_id)
 
-    snapshot = _quick_snapshot(context)
+    snapshot = _quick_snapshot(context, query)
 
     yield f"data: {_json.dumps({'type': 'snapshot', 'content': snapshot})}\n\n"
 
@@ -1151,8 +1402,6 @@ def invoke_stream(
     tool_queue: queue.Queue = queue.Queue()
     tool_trace: list[dict] = []
 
-    import threading
-
     def _run_in_thread():
         _run_specialist_streaming(specialist_name, query, context, tool_queue)
 
@@ -1164,7 +1413,15 @@ def invoke_stream(
     while True:
         try:
             evt_type, evt_data = tool_queue.get(timeout=1.0)
-            if evt_type == "tool":
+            if evt_type == "token":
+                # A draft, not the answer. The authoritative text still arrives
+                # on the `answer` event below — synthesis may rewrite it, and a
+                # later ReAct round may replace it outright — so the client
+                # shows these as they land and drops them when the answer does.
+                yield f"data: {_json.dumps({'type': 'token', 'content': evt_data})}\n\n"
+            elif evt_type == "token_reset":
+                yield f"data: {_json.dumps({'type': 'token_reset'})}\n\n"
+            elif evt_type == "tool":
                 tool_trace.append({"step": len(tool_trace) + 1, "action": evt_data, "status": "running"})
                 yield f"data: {_json.dumps({'type': 'tool_update', 'content': evt_data})}\n\n"
             elif evt_type == "tool_evidence":
@@ -1183,6 +1440,16 @@ def invoke_stream(
         except queue.Empty:
             if not thread.is_alive():
                 break
+            # A question that needs no tools produces no events at all between
+            # the status frame and the answer — one LLM call, up to
+            # SPECIALIST_TIMEOUT_SECONDS of complete silence on the wire. The
+            # app sits behind a proxy that is entitled to drop an idle
+            # connection, and the user sees a spinner that never resolves.
+            #
+            # An SSE comment costs two bytes of traffic a second and is not a
+            # message: the client's reader skips any line that does not begin
+            # with "data: ", so this cannot reach the event parser.
+            yield ": ping\n\n"
 
     thread.join(timeout=SPECIALIST_TIMEOUT_SECONDS + 10)
 

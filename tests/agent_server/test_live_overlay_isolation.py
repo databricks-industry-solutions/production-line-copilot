@@ -104,3 +104,69 @@ class TestWhenLakebaseIsEmpty:
         second = agent._overlay_live_state(copy.copy(cached))
         assert second["scenario"]["scenario_name"] == "Historical UC"
         assert second["line_state"] == [{"machine_id": "OLD"}]
+
+
+class TestTheOverlayReadsTheShiftTheCallerAsked_About:
+    """The live half and the historical half must describe the same shift.
+
+    `build_context(shift_id, …)` used the caller's argument while the overlay
+    read `SIM_SHIFT_ID` from the environment, so the two could disagree: past
+    events for one shift, live machine state, KPIs and active incidents for
+    another. Routing reads `active_incidents`, so the specialist could be
+    chosen by an incident on a shift nobody asked about.
+
+    The HTTP path hid it — `_server_shift_id` overrides whatever the browser
+    sends with the environment's id, so both halves matched by coincidence.
+    `evaluations/run_eval.py` calls `invoke` directly with the shift from its
+    dataset, which is how a mixed-shift context reaches the judges.
+    """
+
+    @pytest.fixture
+    def asked_shift(self, monkeypatch):
+        seen: list[str] = []
+        from agent_server.serving import realtime_store
+
+        monkeypatch.setattr(
+            realtime_store, "read_machine_state_latest",
+            lambda sid, *a, **k: (seen.append(sid), [{"machine_id": "F", "status": "running"}])[1],
+        )
+        for name in ("read_line_kpi_latest",):
+            monkeypatch.setattr(realtime_store, name, lambda *a, **k: {"oee_to_now": 80.0})
+        for name in ("read_event_log_recent", "read_inventory_latest", "read_commands_active"):
+            monkeypatch.setattr(realtime_store, name, lambda *a, **k: [])
+        return seen
+
+    def test_the_argument_wins_over_the_environment(self, asked_shift, monkeypatch):
+        monkeypatch.setenv("SIM_SHIFT_ID", "shift_1_dev")
+        _, handed_out = _cached_bundle()
+        agent._overlay_live_state(handed_out, "shift_7")
+        assert asked_shift == ["shift_7"], (
+            "the overlay read the environment's shift while the historical "
+            "context came from the caller's — the two halves disagree"
+        )
+
+    def test_the_environment_is_the_fallback_for_callers_without_one(
+        self, asked_shift, monkeypatch
+    ):
+        monkeypatch.setenv("SIM_SHIFT_ID", "shift_1_dev")
+        _, handed_out = _cached_bundle()
+        agent._overlay_live_state(handed_out)
+        assert asked_shift == ["shift_1_dev"]
+
+    def test_an_empty_shift_id_falls_back_rather_than_querying_for_nothing(
+        self, asked_shift, monkeypatch
+    ):
+        monkeypatch.setenv("SIM_SHIFT_ID", "shift_1_dev")
+        _, handed_out = _cached_bundle()
+        agent._overlay_live_state(handed_out, "   ")
+        assert asked_shift == ["shift_1_dev"]
+
+    def test_both_entry_points_pass_the_shift_they_were_given(self):
+        """Threading it through the function is only half the fix."""
+        import inspect
+
+        src = inspect.getsource(agent)
+        assert src.count("_overlay_live_state(context, shift_id)") == 2, (
+            "invoke() and invoke_stream() must both forward their shift_id"
+        )
+        assert "_overlay_live_state(context)\n" not in src

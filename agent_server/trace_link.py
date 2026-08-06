@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+from urllib.parse import quote
 
 import mlflow
 
@@ -34,8 +35,19 @@ _TRACES_TAB = "{host}/ml/experiments/{experiment_id}/traces"
 # path segment, so interpolating that whole string splits it across three and
 # the router matches nothing — the page renders its own 404 while the server
 # still answers 200, which is why this could not be caught by checking status
-# codes. The UI wants the trailing hex on its own.
+# codes.
+#
+# Dropping the location and linking the trailing hex stops the 404 but does not
+# open the trace. The workspace redirects /traces/<id> to the tab with
+# ?selectedEvaluationId=<id>, and the tab's list is keyed on the *full* id —
+# search_traces returns 'trace:/<catalog>.<schema>.<prefix>/<hex>' verbatim — so
+# a bare hex selects nothing and the user lands on the unfiltered overview.
+# A query parameter can carry the slashes that a path segment cannot, once
+# percent-encoded, so UC traces link straight at the selection.
 _UC_TRACE_PREFIX = "trace:/"
+
+# Where the redirect above lands, built directly so the selection actually matches.
+_SELECTED_TRACE = "{host}/ml/experiments/{experiment_id}/traces?selectedEvaluationId={trace_id}"
 
 # Values the deploy templates ship before a real id is substituted in. Treated
 # as unset, because a link built from "SET_ME" is worse than no link: it looks
@@ -60,17 +72,15 @@ def workspace_host() -> str:
     return host.rstrip("/")
 
 
-def _ui_trace_id(trace_id: str) -> str:
-    """The id form the MLflow UI's trace route accepts.
+def _has_trace(trace_id: str) -> bool:
+    """Whether ``trace_id`` names an actual trace rather than just a location.
 
-    Classic experiment ids (``tr-<hex>``) pass through untouched. Unity
-    Catalog ids carry their table location, which has to come off — see
-    ``_UC_TRACE_PREFIX``. Returns "" when nothing usable is left, so the caller
-    can fall back rather than build a link to a trailing slash.
+    A UC id truncated to its location (nothing after the final slash) is not
+    something the UI can select, so the caller falls back to the tab.
     """
     if not trace_id.startswith(_UC_TRACE_PREFIX):
-        return trace_id
-    return trace_id.rsplit("/", 1)[-1].strip()
+        return bool(trace_id.strip())
+    return bool(trace_id.rsplit("/", 1)[-1].strip())
 
 
 def trace_url(trace_id: str | None) -> str | None:
@@ -90,10 +100,15 @@ def trace_url(trace_id: str | None) -> str | None:
     experiment_id = _clean("MLFLOW_EXPERIMENT_ID")
     if not host or not experiment_id:
         return None
-    ui_id = _ui_trace_id(trace_id)
-    if not ui_id:
+    if not _has_trace(trace_id):
         return _TRACES_TAB.format(host=host, experiment_id=experiment_id)
-    return _TRACE_PATH.format(host=host, experiment_id=experiment_id, trace_id=ui_id)
+    if trace_id.startswith(_UC_TRACE_PREFIX):
+        return _SELECTED_TRACE.format(
+            host=host,
+            experiment_id=experiment_id,
+            trace_id=quote(trace_id, safe=""),
+        )
+    return _TRACE_PATH.format(host=host, experiment_id=experiment_id, trace_id=trace_id.strip())
 
 
 def current_trace_url() -> str | None:

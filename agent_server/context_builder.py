@@ -2,14 +2,14 @@
 
 The bundle returned by `build_context()` is a flat dict with these keys:
     scenario           one-row dict from `scenario_index` for the shift
-    current_kpi        latest row from `line_kpi` (cases, OEE, A/P/Q, …)
+    current_kpi        latest row from `gold_history_line_kpi` (cases, OEE, A/P/Q, …)
     line_topology      static ordered list of machine IDs (line position)
-    line_state         latest row per machine from `machine_state_enriched`
-    active_events      last 50 events from `event_log`
+    line_state         latest row per machine from `gold_history_machine_state`
+    active_events      last 50 events from `gold_history_event_log`
     production_plan    one row from `production_schedule`
     constraints        full `line_constraints` table (small, static)
     inventory_snapshot rows from `inventory_status`
-    quality_checks     last 50 rows from `quality_checks`
+    quality_checks     last 50 rows from `quality_checks_bronze`
     recommendations    full `kpi_recommendations` table
     scenario_moments   rows from `scenario_moments` <= current time
     cip_schedule       rows from `cip_schedule`
@@ -25,6 +25,13 @@ inventory_snapshot) with the live ``ai_serving.*`` Lakebase snapshot (the same
 source the dashboard SSE stream reads). Reference data (constraints, crew,
 schedules, recommendations) is always served from UC because the producer
 doesn't model it.
+
+The UC queries here read the `gold_history_*` tables, which are the quality-gated
+output of the bronze landing tables. The unsuffixed names (`machine_state`,
+`line_kpi`, `event_log`, `telemetry`) still exist in the schema but have never
+been written to — they are DDL left behind by an earlier layering. Querying one
+returns zero rows rather than an error, which is why they cost us a release of
+confidently empty answers before anyone noticed.
 
 ENV VARS:
     DATABRICKS_WAREHOUSE_ID   SQL warehouse for all queries (required in prod)
@@ -48,33 +55,8 @@ from agent_server.validation import validate_timestamp as _validate_timestamp
 
 logger = logging.getLogger(__name__)
 
-# Env suffixes appended to the live shift_id for dev/prod data isolation
-# (SIM_SHIFT_ID = ``shift_1_dev`` in dev, ``shift_1`` in prod). See
-# ``_reference_shift_id`` for why the framing lookups must strip these.
-_ENV_SHIFT_SUFFIXES = ("_dev", "_prod")
-
-
-def _reference_shift_id(shift_id: str) -> str:
-    """Map an env-partitioned live shift_id to its base id for reference tables.
-
-    Live/telemetry tables (``machine_state_enriched``, ``event_log``,
-    ``line_kpi``, ``quality_checks``, ``inventory_status``) are written by the
-    producer keyed by the env-suffixed ``SIM_SHIFT_ID`` — ``shift_1_dev`` in
-    dev, ``shift_1`` in prod — so dev rows never leak into prod's cursor.
-
-    Reference/framing tables (``scenario_index``, ``production_schedule``,
-    ``shift_crew``, ``cip_schedule``, ``maintenance_schedule``,
-    ``scenario_moments``) are bootstrap-seeded once with the *base* id
-    (``shift_1``) and shared across envs. Querying them with the suffixed id
-    returns zero rows — which is why the dev app showed an empty shift window
-    (``scenario`` came back ``{}``, so ``shift_end`` fell back to the request
-    timestamp and ``remaining_minutes`` collapsed to 0). Strip the env suffix
-    so the framing resolves identically in dev and prod.
-    """
-    for suffix in _ENV_SHIFT_SUFFIXES:
-        if shift_id.endswith(suffix):
-            return shift_id[: -len(suffix)]
-    return shift_id
+from agent_server.shift_ids import ENV_SHIFT_SUFFIXES as _ENV_SHIFT_SUFFIXES  # noqa: F401
+from agent_server.shift_ids import reference_shift_id as _reference_shift_id
 
 # 12 secondary queries fan out per context build; 6 workers gives ~2 round-trips
 # per build on a cold pool while staying under the warehouse concurrency cap.
@@ -343,19 +325,19 @@ def _build_context_uncached(
         "machine_state": (
             "WITH ranked AS ("
             "  SELECT *, ROW_NUMBER() OVER (PARTITION BY machine_id ORDER BY ts DESC) AS rn"
-            "  FROM machine_state_enriched"
+            "  FROM gold_history_machine_state"
             "  WHERE shift_id = %(sid)s AND ts <= %(ts)s"
             ") SELECT * FROM ranked WHERE rn = 1",
             p,
-            "machine_state_enriched",
+            "gold_history_machine_state",
         ),
         # Recent events — 50 is enough for the active_events panel without
         # blowing the context-bundle token budget.
         "event_log": (
-            "SELECT * FROM event_log WHERE shift_id = %(sid)s "
+            "SELECT * FROM gold_history_event_log WHERE shift_id = %(sid)s "
             "AND timestamp_start <= %(ts)s ORDER BY timestamp_start DESC LIMIT 50",
             p,
-            "event_log",
+            "gold_history_event_log",
         ),
         # `production_schedule` usually has 1 row per shift, but shift splits
         # can produce 2; we take the larger planned_cases so the agent reasons
@@ -379,10 +361,10 @@ def _build_context_uncached(
             "inventory_status",
         ),
         "quality_checks": (
-            "SELECT * FROM quality_checks WHERE shift_id = %(sid)s "
+            "SELECT * FROM quality_checks_bronze WHERE shift_id = %(sid)s "
             "AND timestamp <= %(ts)s ORDER BY timestamp DESC LIMIT 50",
             p,
-            "quality_checks",
+            "quality_checks_bronze",
         ),
         # Static recommendations keyed off KPI thresholds — pulled in full and
         # filtered by specialists according to current_kpi.
@@ -418,10 +400,10 @@ def _build_context_uncached(
             "maintenance_schedule",
         ),
         "line_kpi": (
-            "SELECT * FROM line_kpi WHERE shift_id = %(sid)s "
+            "SELECT * FROM gold_history_line_kpi WHERE shift_id = %(sid)s "
             "AND ts <= %(ts)s ORDER BY ts DESC LIMIT 1",
             p,
-            "line_kpi",
+            "gold_history_line_kpi",
         ),
     }
 

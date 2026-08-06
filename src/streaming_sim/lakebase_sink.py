@@ -108,6 +108,22 @@ def _us_to_dt(ts_us: int | float) -> datetime:
     return datetime.fromtimestamp(float(ts_us) / 1_000_000.0, tz=timezone.utc)
 
 
+def _throughput(row: dict[str, Any]) -> float:
+    """Read a machine row's rate, whatever the producer called it.
+
+    ``snapshot_to_dicts`` emits ``throughput_per_min``; the cascade's own
+    ``MachineState`` field is ``throughput``. This sink read only the latter,
+    so every row it wrote carried 0.0 while the same tick reached bronze at
+    ~300/min. Nothing failed — the column simply defaulted — so the UI showed
+    a healthy line where all nineteen machines produced nothing, and every
+    specialist reading the serving layer saw the same. Accept both names.
+    """
+    for key in ("throughput_per_min", "throughput"):
+        if row.get(key) is not None:
+            return float(row[key])
+    return 0.0
+
+
 class LakebaseSink:
     """Direct producer → ai_serving.*_history writer.
 
@@ -277,9 +293,8 @@ class LakebaseSink:
         """Insert per-machine state rows for one tick.
 
         Expected keys per row (from snapshot_to_dicts): shift_id, machine_id,
-        ts (microseconds since epoch), status, throughput, speed_pct,
-        alarm_count. We rename throughput → throughput_per_min and convert
-        ts to datetime to match the _history schema.
+        ts (microseconds since epoch), status, throughput_per_min, speed_pct,
+        alarm_count. We convert ts to datetime to match the _history schema.
         """
         if not rows:
             return 0
@@ -289,7 +304,7 @@ class LakebaseSink:
                 "machine_id": r["machine_id"],
                 "ts": _us_to_dt(r["ts"]),
                 "status": r.get("status"),
-                "throughput_per_min": float(r.get("throughput", 0.0) or 0.0),
+                "throughput_per_min": _throughput(r),
                 "speed_pct": float(r.get("speed_pct", 0.0) or 0.0),
                 "alarm_count": int(r.get("alarm_count", 0) or 0),
             }
@@ -378,7 +393,7 @@ class LakebaseSink:
                         "machine_id": r["machine_id"],
                         "ts": _us_to_dt(r["ts"]),
                         "status": r.get("status"),
-                        "throughput_per_min": float(r.get("throughput", 0.0) or 0.0),
+                        "throughput_per_min": _throughput(r),
                         "speed_pct": float(r.get("speed_pct", 0.0) or 0.0),
                         "alarm_count": int(r.get("alarm_count", 0) or 0),
                     }

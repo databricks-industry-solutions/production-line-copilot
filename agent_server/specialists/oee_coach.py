@@ -15,7 +15,7 @@ from langchain_core.messages import SystemMessage
 from agent_server.model_roster import resolve
 from agent_server.optimizers.oee_loss_prioritizer import oee_loss_analysis
 from agent_server.optimizers.production_forecaster import production_forecast
-from agent_server.prompts.oee_coach import OEE_COACH_SYSTEM
+from agent_server.prompts.loader import prompt_text
 from agent_server.tools.calculator import calculator
 from agent_server.tools.genie_query import genie_query
 from agent_server.tools.governed_domain_query import (
@@ -28,7 +28,7 @@ from agent_server.tools.sql_query import sql_query
 
 def create_oee_coach():
     """Build the ReAct agent registered as 'oee_coach'."""
-    llm = ChatDatabricks(endpoint=resolve("oee_coach"), max_tokens=2048)
+    llm = ChatDatabricks(endpoint=resolve("oee_coach"))
     tools = [
         sql_query, genie_query, calculator, load_plan_and_constraints,
         oee_loss_analysis, production_forecast,
@@ -39,6 +39,6 @@ def create_oee_coach():
         model=llm,
         tools=tools,
         system_prompt=SystemMessage(
-            content=OEE_COACH_SYSTEM + governed_domain_prompt("production"),
+            content=prompt_text("oee_coach_system") + governed_domain_prompt("production"),
         ),
     )

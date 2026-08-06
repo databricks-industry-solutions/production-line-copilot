@@ -136,7 +136,7 @@ High-level flow inside `deploy.sh`:
 7. **Refresh** `OPS_*` IDs into app env (`refresh_app_yaml_ids.py`)
 8. **Re-deploy bundle** only if SP or IDs changed on the first pass
 9. **`databricks apps deploy`**
-10. **Grant + publish** Data Quality dashboard (`grant_app_jobs_view.sh`)
+10. **Grant + publish** Data Quality dashboard: folder-chain grants for the app SP (`grant_app_jobs_view.sh`), then `ensure_dashboard_embed.py`, which publishes it with embedded credentials, grants `CAN_READ` to the app SP and to human viewers, and verifies the result. This step **fails the deploy** if the dashboard would not embed — set `DASHBOARD_VIEWER_GROUPS="team-a,team-b"` to grant a group, or `SKIP_DASHBOARD_EMBED=1` to deploy without the tab.
 11. **Fresh-env auto-provision**: if the schema is empty, run the setup job **and** create the curated Genie space (app SP granted `CAN_RUN`, id written back), then rewire + redeploy the app
 
 Optional: `RUN_PREFLIGHT=1 ./scripts/deploy.sh dev` runs preflight first; `RUN_EVAL_GATE=1` runs the MLflow eval gate.
@@ -233,6 +233,51 @@ That message means something is querying **Synced Table mirrors** in Postgres (`
 ### Fix C: No rows on the live ribbon
 
 If **`ai_serving.*_history`** is empty but bronze is fresh, check that **`line-manager-streaming-quality-sync`** and the **producer** job are both **RUNNING** (restart them from the Jobs UI if stopped).
+
+---
+
+## Troubleshooting: MLflow traces are empty
+
+The symptom is an experiment that looks alive but holds no spans: the MLflow UI
+shows **"Failed to load chart data"** and offers to **"Enable UC trace storage"**.
+Run the diagnostic, which names the cause and what to do about it:
+
+```bash
+python3 scripts/diagnose_trace_storage.py prod    # or dev
+```
+
+Two things make this failure easy to miss. Trace export is asynchronous and
+non-fatal, so nothing in the app surfaces it; and `deploy.sh` treats trace
+provisioning as non-fatal on purpose — a failure costs observability, not a
+working app — so the deploy still prints **Deploy complete**. It now also prints
+a warning at the end when the step did not succeed.
+
+The usual causes, in order:
+
+- **The spans are there and nothing is reading them.** Check this one first,
+  because it is the only cause where the deploy did everything right. Traces
+  written to Unity Catalog are served by a SQL warehouse rather than by the
+  tracking server, and neither the UI nor the SDK will choose one for you, so a
+  full experiment reads as empty until you do — pick a warehouse in the **Traces**
+  tab, and export `MLFLOW_TRACING_SQL_WAREHOUSE_ID=<id>` before calling
+  `mlflow.search_traces`, which raises rather than returning an empty list. The
+  diagnostic above counts the stored spans and tells you if this is your case.
+- **The app is on the bundle's experiment.** `MLFLOW_EXPERIMENT_ID` still holds
+  the template's `valueFrom: experiment`, which resolves to the classic
+  experiment created by the bundle. Its spans upload to
+  `<region>.storage.cloud.databricks.com`, a host the Apps runtime gets
+  *Connection refused* from. This is what you are looking at if the experiment
+  in the UI has **no `-traces` suffix**. Traces live in the separate
+  `<mlflow_experiment_path>-traces` experiment.
+- **Config still says `SET_ME`.** `provision_trace_storage.py` needs
+  `uc_catalog`, `uc_schema`, `sql_warehouse_id` and `mlflow_experiment_path` in
+  `config/project-settings.local.yaml`. Any of them unset and the step exits
+  before linking anything.
+- **The experiment linked without a telemetry destination.** It accepts traces
+  and discards every span. A UC trace link is **permanent** — it cannot be
+  unset — so such an experiment is scrap. Delete it and re-run the deploy;
+  otherwise the script falls through to the `-2` name and the workspace
+  accumulates a dead experiment per attempt.
 
 ---
 

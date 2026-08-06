@@ -121,75 +121,23 @@ _TABLES: dict[str, str] = {
           ts                        TIMESTAMP
         ) USING DELTA {_CDF}
     """,
-    # ── Live tables (producer → Synced Tables → Lakebase → UI) ──────────
-    "machine_state": f"""
-        CREATE TABLE IF NOT EXISTS {{fqn}}.machine_state (
-          shift_id           STRING,
-          machine_id         STRING,
-          ts   TIMESTAMP,
-          status             STRING,
-          throughput_per_min  DOUBLE,
-          speed_pct          DOUBLE,
-          alarm_count        BIGINT
-        ) USING DELTA {_CDF}
-    """,
-    "event_log": f"""
-        CREATE TABLE IF NOT EXISTS {{fqn}}.event_log (
-          event_id            STRING,
-          shift_id            STRING,
-          machine_id          STRING,
-          event_type          STRING,
-          severity            STRING,
-          timestamp_start     TIMESTAMP,
-          timestamp_end       TIMESTAMP,
-          duration_minutes    DOUBLE,
-          root_cause          STRING,
-          description         STRING,
-          corrective_action   STRING,
-          resolution_minutes  DOUBLE,
-          outcome_oee_impact  DOUBLE,
-          outcome_description STRING
-        ) USING DELTA {_CDF}
-    """,
-    "quality_checks": f"""
-        CREATE TABLE IF NOT EXISTS {{fqn}}.quality_checks (
-          check_id   STRING,
-          shift_id   STRING,
-          machine_id STRING,
-          timestamp  TIMESTAMP,
-          parameter  STRING,
-          value      DOUBLE,
-          spec_min   DOUBLE,
-          spec_max   DOUBLE,
-          result     STRING
-        ) USING DELTA {_CDF}
-    """,
-    "telemetry": f"""
-        CREATE TABLE IF NOT EXISTS {{fqn}}.telemetry (
-          shift_id    STRING,
-          timestamp   TIMESTAMP,
-          machine_id  STRING,
-          sensor_name STRING,
-          value       DOUBLE
-        ) USING DELTA {_CDF}
-    """,
-    "line_kpi": f"""
-        CREATE TABLE IF NOT EXISTS {{fqn}}.line_kpi (
-          shift_id             STRING,
-          ts                   TIMESTAMP,
-          machines_running     INT,
-          machines_stopped      INT,
-          machines_degraded     INT,
-          machines_starved      INT,
-          total_throughput      DOUBLE,
-          avg_speed_pct         DOUBLE,
-          availability_to_now   DOUBLE,
-          performance_to_now    DOUBLE,
-          quality_to_now        DOUBLE,
-          oee_to_now            DOUBLE,
-          cumulative_cases      DOUBLE
-        ) USING DELTA {_CDF}
-    """,
+    # ── Deliberately absent: machine_state, line_kpi, event_log, telemetry,
+    #    quality_checks ────────────────────────────────────────────────────
+    #
+    # These five used to be created here as empty shells, left over from when
+    # the producer wrote them directly. The pipeline now writes `*_bronze` and
+    # the quality gate publishes `gold_history_*`; nothing has written the
+    # unsuffixed names in a long time, and nothing reads their Lakebase mirrors
+    # either (see realtime_store.py).
+    #
+    # They are not merely useless, they are actively harmful. Their names are
+    # the ones an LLM guesses first, and a query against an empty table returns
+    # zero rows instead of an error — so a specialist writes a confident answer
+    # over nothing and no one sees a failure. Deleting the DDL converts that
+    # silent wrong answer into TABLE_OR_VIEW_NOT_FOUND, which the model reports
+    # and a human can act on. tests/agent_server/test_no_dead_tables.py keeps
+    # them from creeping back into queries, prompts or the Genie config.
+    #
     # ── Command channel (UI → producer, bidirectional lifecycle) ─────────
     "scenario_commands": f"""
         CREATE TABLE IF NOT EXISTS {{fqn}}.scenario_commands (

@@ -134,12 +134,19 @@ resources:
       warehouse_id: ${var.sql_warehouse_id}
       # Publish with the deploy identity's credentials so the app's embedded
       # iframe renders widgets for viewers (otherwise every widget shows
-      # "Unable to render visualization."). This makes a plain
-      # `databricks bundle deploy` self-sufficient for the embed — no
-      # post-deploy publish step required. The App SP CAN_READ grant it needs
-      # to *resolve* the dashboard (/ops/dashboard-info) is added per-target in
-      # config/bundle-targets.yaml once the App SP client id is known (see
-      # scripts/sync_project_settings.py :: _data_quality_dashboard_permissions_block).
+      # "Unable to render visualization."). Whether `bundle deploy` also
+      # *publishes* depends on the CLI version, and this comment used to claim
+      # it made the embed self-sufficient — it did not, in at least one
+      # workspace, where the tab showed "The resource is not available".
+      # scripts/ensure_dashboard_embed.py now verifies publish state after the
+      # deploy and repairs it, so this field sets the credential mode and
+      # nothing depends on it having published anything.
+      #
+      # The App SP CAN_READ grant needed to *resolve* the dashboard
+      # (/ops/dashboard-info) is added per-target in config/bundle-targets.yaml
+      # once the App SP client id is known (see scripts/sync_project_settings.py
+      # :: _data_quality_dashboard_permissions_block). Human viewers are granted
+      # by ensure_dashboard_embed.py — the bundle grants no one but the SP.
       embed_credentials: true
 
   apps:

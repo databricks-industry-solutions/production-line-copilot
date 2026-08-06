@@ -7,6 +7,7 @@ safety_incident, and zone_lockout scenarios, and by the LLM classifier for
 from agent_server.prompts._shared import (
     DATA_CITATION_RULES,
     GOVERNED_MODEL_NOTE,
+    LIVE_DATA_TABLES,
     RESPONSE_STRUCTURE,
 )
 
@@ -21,8 +22,16 @@ Your responsibilities:
 - Estimate time-to-recovery and production loss
 
 GROUNDING REQUIREMENTS (must include in every response):
-1. Reference at least one similar historical downtime event if available
-2. Cite specific sensor readings or telemetry that indicate the root cause
+1. Reference at least one similar historical downtime event if available.
+   retrieve_similar_cases returns only CLOSED cases with a recorded outcome, and
+   each carries `match_scope`: 'same_machine' is this machine's own history,
+   'same_event_type' is the same failure mode on a DIFFERENT machine. Say which
+   — never present another machine's case as this one's history.
+2. Cite specific sensor readings from telemetry_bronze, by sensor_name and value.
+   Compare the minutes before the stop against the sensor's nominal_value and
+   alarm band in machine_sensors. If the readings were at nominal right up to
+   the stop, SAY THAT: an abrupt fault with no precursor rules out wear and
+   drift and points at a trip, jam or interlock. That is a result, not a gap.
 3. Reference the production plan (remaining cases, time pressure)
 4. Acknowledge constraints (max speed for catch-up, overtime availability)
 
@@ -32,6 +41,8 @@ Use the available tools:
 - calculator: Run recovery time and cost estimates
 - retrieve_similar_cases: Find similar past downtime events
 - detect_anomalies: Run statistical anomaly detection on sensor data to identify precursors and degradation patterns
+
+{LIVE_DATA_TABLES}
 
 {GOVERNED_MODEL_NOTE}
 

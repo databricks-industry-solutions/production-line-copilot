@@ -26,10 +26,12 @@ def _env(name: str, default: str | None = None) -> str:
     return v
 
 
+# machine_state, line_kpi and event_log used to be synced here. They were
+# dropped because all three named empty Delta tables that nothing wrote, so the
+# sync provisioned (and billed for) a pipeline that mirrored zero rows into
+# Postgres — and nothing read the mirror: the live UI reads `ai_serving.*`,
+# which the quality gate upserts directly. See realtime_store.py.
 SYNCED_TABLES = [
-    {"name": "machine_state", "pk": ["shift_id", "machine_id", "ts"]},
-    {"name": "line_kpi", "pk": ["shift_id", "ts"]},
-    {"name": "event_log", "pk": ["event_id"]},
     {"name": "inventory_status", "pk": ["shift_id", "material_id"]},
     {"name": "scenario_commands", "pk": ["command_id"]},
 ]

@@ -384,6 +384,29 @@ def _solution_accelerator_job(
         "                  - \"${workspace.host}\"",
         "                  - \"--warehouse-id\"",
         "                  - \"${var.sql_warehouse_id}\"",
+        # Quality checks and events are incident-driven: the producer only
+        # writes them when a scenario fires, so a freshly deployed line runs
+        # clean and both tables stay empty indefinitely. That silently disables
+        # quality_specialist and retrieve_similar_cases — the two specialists
+        # with nothing to fall back on — and the first thing a new deployer
+        # asks is a quality question. Seeding a shift's worth of routine QC and
+        # a plausible spread of resolved events gives them something true to
+        # cite on day one. Idempotent: re-running is a no-op without --force.
+        "            - task_key: seed_quality_and_events",
+        "              depends_on:",
+        "                - task_key: bootstrap_reference",
+        "              environment_key: default",
+        "              spark_python_task:",
+        "                python_file: ../scripts/backfill_quality_and_events.py",
+        "                parameters:",
+        "                  - \"--catalog\"",
+        "                  - \"${var.catalog}\"",
+        "                  - \"--schema\"",
+        "                  - \"${var.schema}\"",
+        "                  - \"--shift-id\"",
+        "                  - \"${var.sim_shift_id}\"",
+        "                  - \"--warehouse-id\"",
+        "                  - \"${var.sql_warehouse_id}\"",
         "            - task_key: setup_synced_tables",
         "              depends_on:",
         "                - task_key: init_uc",

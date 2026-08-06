@@ -124,9 +124,20 @@ env:
   # /serving/stream loop) so a hiccup never strands the cursor permanently.
   - name: SSE_BUFFER_SECONDS
     value: '2'
-  # Vector Search endpoint hourly billing toggle. The endpoint stays online
-  # whether queries hit it or not, so we charge hourly in the cost panel even
-  # at 0 queries. Set to 'false' for environments with NO vector search index
-  # provisioned (the cost line will then read "$0.00 — endpoint not configured").
+  # Vector Search endpoint for retrieve_similar_cases. DERIVED — set
+  # `vector_search_endpoint` in config/project-settings(.local).yaml and
+  # render_app_yaml.py writes both this and the billing flag below into the
+  # gitignored app.<env>.local.yaml that actually ships. Editing it here works
+  # for a one-off, but the next deploy overwrites it.
+  #
+  # Empty means the tool uses keyword retrieval instead of paying a failed
+  # round-trip to an index that is not there. Enabling it costs 15-40 minutes on
+  # the deploy that first creates the endpoint; see the settings file.
+  - name: VS_ENDPOINT
+    value: ''
+  # Vector Search endpoint hourly billing toggle. A live endpoint bills hourly
+  # whether queries hit it or not, so the cost panel must charge for it even at
+  # 0 queries. Keep this 'false' while VS_ENDPOINT above is empty — otherwise
+  # the panel invents roughly $58/month for infrastructure nobody provisioned.
   - name: OPS_VS_ENDPOINT_ALWAYS_ON
-    value: 'true'
+    value: 'false'

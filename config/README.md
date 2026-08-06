@@ -78,3 +78,5 @@ When `lakebase_catalog` is empty, sync emits `__SKIP__` for that job parameter s
 ## AppKit SQL (`config/queries/*.sql`)
 
 Queries use the template prefix `main.line_manager_ai_kit.`. At runtime the Express server rewrites that to **`${UC_CATALOG}.${UC_SCHEMA}.`** (`server/sqlRewrite.ts`). Override locally with `SQL_TEMPLATE_CATALOG` / `SQL_TEMPLATE_SCHEMA` if needed.
+
+These are AppKit scaffolding: the live UI reads Lakebase over SSE, and nothing in the app currently calls `executeAnalytics2Query`. Because nothing executed them, nothing caught that several had drifted onto tables and columns that no longer exist. `scripts/validate_sql_against_uc.py` now EXPLAINs each one against the real catalog, so they stay true whether or not anything runs them — treat a failure there as a real bug, not as noise from unused code.

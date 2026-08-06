@@ -12,17 +12,17 @@
 
 ## What It Does
 
-ProdLine CoPilot simulates a 19-machine bottling/packaging line in real time. An in-process cascade engine models how faults propagate through buffers: when a filler stops, downstream machines gradually starve as buffers drain, and upstream machines block as buffers fill. A GenAI assistant analyzes live telemetry and recommends recovery actions.
+ProdLine CoPilot simulates a 19-machine bottling/packaging line in real time. A cascade engine models how faults propagate through buffers: when a filler stops, downstream machines gradually starve as buffers drain, and upstream machines block as buffers fill. It runs in a producer job on the platform, not inside the app — state reaches the UI as Producer → Zerobus → bronze → streaming sync → Lakebase, so what you see is read from tables rather than from a simulation held in web-server memory. A GenAI assistant analyzes live telemetry and recommends recovery actions.
 
 **The demo story:** You're a line manager. The line is running normally at ~82 % OEE. You trigger an incident (e.g. filler breakdown). Watch the cascade ripple across the line in real time. Ask the AI assistant what happened, get root-cause analysis and action items, then resolve.
 
 ## System Map
 
-One app, two branches. The **Control Tower** is what the line is doing right now — streamed and deterministic, with no model in the path. The **Specialist Copilot** is where you ask a question and a router hands it to the one specialist that owns the problem. Each specialist reaches its own governed Genie space, because narrow scope is what keeps Genie accurate.
+One app, two branches. The **Control Tower** is what the line is doing right now — streamed and deterministic, with no model in the path. The **Specialist Copilot** is where you ask a question and a router hands it to the one specialist that owns the problem. Each governed Genie space covers one domain of the manufacturing model, because narrow scope is what keeps Genie accurate; a specialist reaches the domain it works in. Some domains serve several specialists — `production` answers for the OEE coach, the schedule optimizer and the strategic advisor — and the shift briefing has no governed space at all, since it reads the live shift rather than the enterprise model. The spaces are opt-in per domain (`GENIE_SPACE_*`); a specialist whose domain is unprovisioned simply has one fewer tool and falls back to direct SQL.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/media/system_map_dark.png">
-  <img alt="System Map: ProdLine CoPilot splits into a Control Tower branch of four streamed operational tabs, and a Specialist Copilot branch where an orchestrator routes to eight specialist agents, each labelled with its governed Genie domain, its optimizers and its model." src="docs/media/system_map.png">
+  <img alt="System Map: ProdLine CoPilot splits into a Control Tower branch of four streamed operational tabs, and a Specialist Copilot branch where an orchestrator routes to eight specialist agents, each labelled with the governed Genie domain it works in (where it has one), its optimizers and its model." src="docs/media/system_map.png">
 </picture>
 
 Five Genie spaces in all: four over the governed manufacturing model — `asset`, `quality`, `inventory`, `production` — each curated and permissioned separately, plus **line ops** over the live streaming tables where `line_kpi` lands roughly a row per second. The two specialists that reason across a whole shift read line ops as well, and all eight read the live tables with direct SQL, because Genie is a round trip and a shift is not.
@@ -52,7 +52,7 @@ Each downtime minute, OEE point, and MTTR reduction carries a line-specific doll
 - **Incident Management:** trigger faults per scenario, watch cascading effects, resolve with one click.
 - **Data Source Labels:** every panel shows where data originates (SCADA, MES, SAP, LIMS, CMMS, WMS).
 - **GenAI Assistant:** 8 specialist agents analyze live simulation state and recommend actions.
-- **Human-in-the-Loop:** each specialist response comes with contextual action chips (a static lookup keyed on specialist name, not LLM-generated) that the operator can approve and act on.
+- **Human-in-the-Loop:** each specialist response comes with contextual action chips (a static lookup keyed on specialist name, not LLM-generated). They are proposals — one click copies a ready-to-paste handoff for the system that owns the change. Nothing here writes to a CMMS, SAP or a scheduler; [docs/design/write-back-and-human-approval.md](docs/design/write-back-and-human-approval.md) specifies what that would take and is explicitly unimplemented.
 - **Inventory Tracking:** real-time material depletion with time-left estimates and automatic reorder, lead-time, and delivery replenishment (stock recovers on a realistic sawtooth instead of draining to zero).
 
 ## Getting Started
@@ -133,6 +133,7 @@ pytest tests -q
 - [`docs/solution-accelerator/DEPLOY.md`](docs/solution-accelerator/DEPLOY.md): full deployment runbook (prerequisites, config fields, troubleshooting).
 - [`docs/solution-accelerator/GETTING_STARTED.md`](docs/solution-accelerator/GETTING_STARTED.md): deeper getting-started guide.
 - [`config/README.md`](config/README.md): configuration reference.
+- [`docs/design/write-back-and-human-approval.md`](docs/design/write-back-and-human-approval.md): how the agent would write back to MES/SCADA/CMMS — the proposal-as-artifact pattern, the outbound-polling relay, and why the human stays the actuator.
 
 ## Maintainers
 

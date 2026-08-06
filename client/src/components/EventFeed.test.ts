@@ -1,5 +1,14 @@
 import { describe, it, expect } from 'vitest';
-import { isEventActive, buildResolvedTsByMachine, type EventFeedEvent } from './EventFeed';
+// Imported from lib rather than through EventFeed.tsx, which re-exports these
+// but also drags in the AppKit chart components. Those resolve a nested copy of
+// echarts-for-react that is not installed, so the whole file failed to load and
+// every assertion in it silently stopped running.
+import {
+  buildResolvedTsByMachine,
+  isEventActive,
+  STALE_AFTER_MS,
+} from '../lib/eventFeedUtils';
+import type { EventFeedEvent } from './EventFeed';
 
 // Producer is Zerobus-append-only, so a resolved incident is represented
 // by TWO rows in event_log_history:
@@ -83,6 +92,44 @@ describe('isEventActive', () => {
     // start at 07:00, "resolve" at 06:00 → unrelated older event, ignore.
     const resolvedMap = new Map<string, number>([['FILLER', Date.UTC(2026, 4, 11, 6, 0, 0)]]);
     expect(isEventActive(mkEvent(), now, resolvedMap)).toBe(true);
+  });
+});
+
+describe('an open event whose resolve marker never arrives', () => {
+  // The backfill seeds one deliberately open event as shift carryover, and
+  // nothing ever resolves it: no producer command sits behind a seeded row, so
+  // Recover reports nothing to clear. Without a bound the operator keeps a red
+  // incident from a previous day that no control in the UI can clear — seen in
+  // prod as a FILLER minor_stop from the day before, still listed as active.
+  const start = '2026-05-11T07:00:00Z';
+  const startMs = Date.UTC(2026, 4, 11, 7, 0, 0);
+
+  it('is still active inside the shift it belongs to', () => {
+    expect(isEventActive(mkEvent({ timestamp_start: start }), startMs + STALE_AFTER_MS - 1000)).toBe(
+      true
+    );
+  });
+
+  it('ages out once it is older than a shift', () => {
+    expect(isEventActive(mkEvent({ timestamp_start: start }), startMs + STALE_AFTER_MS + 1000)).toBe(
+      false
+    );
+  });
+
+  it('ages out the day-old carryover the seed leaves behind', () => {
+    const dayLater = startMs + 24 * 60 * 60 * 1000;
+    expect(isEventActive(mkEvent({ timestamp_start: start }), dayLater, new Map())).toBe(false);
+  });
+
+  it('does not age out an event that carries its own future end', () => {
+    // An explicit timestamp_end is authoritative; the bound must not override it.
+    const e = mkEvent({ timestamp_start: start, timestamp_end: '2026-05-13T09:00:00Z' });
+    expect(isEventActive(e, startMs + 25 * 60 * 60 * 1000)).toBe(true);
+  });
+
+  it('leaves an unparseable start alone rather than hiding it', () => {
+    // isoToEpoch yields 0 for junk; ageing that out would hide live rows.
+    expect(isEventActive(mkEvent({ timestamp_start: 'not-a-date' }), Date.now())).toBe(true);
   });
 });
 

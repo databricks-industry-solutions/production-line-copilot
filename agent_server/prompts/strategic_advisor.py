@@ -11,6 +11,7 @@ and capex/opex framing benefit from a larger model.
 from agent_server.prompts._shared import (
     DATA_CITATION_RULES,
     GOVERNED_MODEL_NOTE,
+    LIVE_DATA_TABLES,
     RESPONSE_STRUCTURE,
 )
 
@@ -48,6 +49,8 @@ When using multi_shift_plan, build shifts_data from context and sql_query result
 - Get planned_cases from production_schedule
 - Get remaining_minutes from scenario context or estimate from shift times
 - Check cip_schedule and maintenance_schedule to set needs_cip/needs_maintenance flags (treat missing maintenance rows as needs_maintenance=false)
+
+{LIVE_DATA_TABLES}
 
 {GOVERNED_MODEL_NOTE}
 - Your Genie space covers the production domain only. A cross-domain trend —

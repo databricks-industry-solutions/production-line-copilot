@@ -11,7 +11,7 @@ from langchain.agents import create_agent
 from langchain_core.messages import SystemMessage
 
 from agent_server.model_roster import resolve
-from agent_server.prompts.downtime_analyst import DOWNTIME_ANALYST_SYSTEM
+from agent_server.prompts.loader import prompt_text
 from agent_server.tools.anomaly_detector import detect_anomalies
 from agent_server.tools.calculator import calculator
 from agent_server.tools.governed_domain_query import (
@@ -29,7 +29,7 @@ def create_downtime_analyst():
     Resolves its endpoint at construction time; set ``MODEL_DOWNTIME_ANALYST``
     to A/B a different model without touching code.
     """
-    llm = ChatDatabricks(endpoint=resolve("downtime_analyst"), max_tokens=2048)
+    llm = ChatDatabricks(endpoint=resolve("downtime_analyst"))
     tools = [
         sql_query, load_plan_and_constraints, calculator,
         retrieve_similar_cases, detect_anomalies,
@@ -40,6 +40,6 @@ def create_downtime_analyst():
         model=llm,
         tools=tools,
         system_prompt=SystemMessage(
-            content=DOWNTIME_ANALYST_SYSTEM + governed_domain_prompt("asset"),
+            content=prompt_text("downtime_analyst_system") + governed_domain_prompt("asset"),
         ),
     )

@@ -11,6 +11,11 @@ from __future__ import annotations
 
 import pytest
 
+from agent_server.agent import (
+    INCIDENT_TO_SPECIALIST,
+    VALID_SPECIALISTS,
+    _route_by_active_incident,
+)
 from agent_server.validation import validate_machine_id, validate_shift_id, validate_timestamp
 from evaluations.scenarios import GOLDEN_RESPONSES, INTENT_SCENARIOS
 
@@ -19,14 +24,32 @@ class TestIntentClassification:
     """Validate that intent classification maps queries to the correct specialists."""
 
     @pytest.mark.parametrize("scenario", INTENT_SCENARIOS, ids=[s["query"][:40] for s in INTENT_SCENARIOS])
-    def test_intent_mapping(self, scenario):
-        expected = scenario["expected_specialist"]
-        valid_specialists = {
-            "downtime_analyst", "quality_specialist", "supply_chain_advisor",
-            "oee_coach", "schedule_optimizer", "maintenance_predictor",
-            "strategic_advisor", "shift_briefing", "general",
-        }
-        assert expected in valid_specialists
+    def test_expected_specialist_is_one_the_router_can_return(self, scenario):
+        """Guards the scenario corpus against naming a specialist that cannot win.
+
+        This used to compare against a set copied into the test file, so it
+        asserted the fixture agreed with itself. Importing the router's own
+        VALID_SPECIALISTS means renaming a specialist in one place now fails
+        here instead of quietly routing 99 scenarios to "general".
+        """
+        assert scenario["expected_specialist"] in VALID_SPECIALISTS
+
+    @pytest.mark.parametrize("scenario_id,expected", sorted(INCIDENT_TO_SPECIALIST.items()))
+    def test_an_active_incident_routes_deterministically(self, scenario_id, expected):
+        """The no-LLM routing path, actually executed rather than described."""
+        routed = _route_by_active_incident({"active_incidents": [{"scenario_id": scenario_id}]})
+        assert routed == expected
+
+    def test_an_unknown_incident_defers_to_the_classifier(self):
+        assert _route_by_active_incident({"active_incidents": [{"scenario_id": "nonsense"}]}) is None
+
+    def test_no_incident_defers_to_the_classifier(self):
+        assert _route_by_active_incident({"active_incidents": []}) is None
+
+    def test_every_incident_routes_to_a_specialist_that_exists(self):
+        """A typo in INCIDENT_TO_SPECIALIST would route into the general fallback."""
+        unroutable = {v for v in INCIDENT_TO_SPECIALIST.values() if v not in VALID_SPECIALISTS}
+        assert not unroutable, f"incident map points at unknown specialists: {sorted(unroutable)}"
 
 
 # ── Input validation tests ───────────────────────────────────────────
@@ -77,12 +100,27 @@ class TestResponseQuality:
     """Validate response content quality using keyword checks."""
 
     @pytest.mark.parametrize("golden", GOLDEN_RESPONSES, ids=[g["scenario"] for g in GOLDEN_RESPONSES])
-    def test_response_contains_keywords(self, golden):
-        sample_response = f"Analysis of {golden['query']} for shift {golden['shift_id']}: " + \
-            " ".join(golden["must_contain_keywords"])
-        for kw in golden["must_contain_keywords"]:
-            assert kw.lower() in sample_response.lower(), \
-                f"Response should mention '{kw}'"
+    def test_the_golden_record_is_usable_as_a_check(self, golden):
+        """Validates the fixture, which is all a unit test can do here.
+
+        What stood here before built a fake response by concatenating
+        `must_contain_keywords` and then asserted those keywords appeared in
+        it — true by construction, for any keywords, forever. Real answer
+        quality needs a live model and is scored by evaluations/run_eval.py;
+        the useful job at this level is making sure the golden records
+        themselves could ever fail something.
+        """
+        keywords = golden["must_contain_keywords"]
+        assert keywords, f"{golden['scenario']} has no keywords, so it asserts nothing"
+        assert all(k.strip() for k in keywords), "a blank keyword matches everything"
+        # Topic words lifted from the question are free to satisfy. At least
+        # one keyword has to demand something the question does not already
+        # contain, or a model that paraphrases the prompt scores full marks.
+        beyond_echo = [k for k in keywords if k.lower() not in golden["query"].lower()]
+        assert beyond_echo, (
+            f"{golden['scenario']}: every keyword {keywords} already appears in "
+            "the question, so restating it would pass this record in full"
+        )
 
 
 # ── Query length validation ──────────────────────────────────────────
@@ -100,12 +138,7 @@ class TestQueryLengthValidation:
         set in sync with `_get_specialists()` in agent.py."""
         pytest.importorskip("mlflow")
         from agent_server.agent import MODEL_MAP
-        expected_specialists = {
-            "downtime_analyst", "quality_specialist", "supply_chain_advisor",
-            "oee_coach", "schedule_optimizer", "maintenance_predictor",
-            "strategic_advisor", "shift_briefing", "general",
-        }
-        assert set(MODEL_MAP.keys()) == expected_specialists
+        assert set(MODEL_MAP.keys()) == set(VALID_SPECIALISTS)
 
 
 # ── Specialist timeout configuration ─────────────────────────────────
@@ -117,5 +150,30 @@ class TestSpecialistConfig:
         assert SPECIALIST_TIMEOUT_SECONDS > 0
 
     def test_recursion_limit_set(self):
-        """Verify all specialist factories produce agents with recursion_limit."""
-        pass
+        """The ReAct loop needs a ceiling, or a confused specialist bills forever.
+
+        The body of this test was `pass` — it named a real risk and checked
+        nothing for as long as it has existed.
+        """
+        pytest.importorskip("mlflow")
+        from agent_server.agent import SPECIALIST_RECURSION_LIMIT
+        assert SPECIALIST_RECURSION_LIMIT > 0
+        # Each step is a model call: high enough for a multi-tool answer, low
+        # enough that a loop is capped rather than merely discouraged.
+        assert 4 <= SPECIALIST_RECURSION_LIMIT <= 40
+
+    def test_every_specialist_is_invoked_with_the_recursion_limit(self):
+        """A factory that forgets to pass it inherits LangGraph's default of 25."""
+        import re
+        from pathlib import Path
+
+        missing = []
+        for path in sorted(Path("agent_server/specialists").glob("*.py")):
+            text = path.read_text()
+            if "create_react_agent" not in text:
+                continue
+            if not re.search(r"recursion_limit", text):
+                missing.append(path.name)
+        assert not missing, (
+            f"specialists build a ReAct agent without a recursion limit: {missing}"
+        )

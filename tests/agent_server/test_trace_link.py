@@ -11,6 +11,7 @@ hands one user a link to another user's trace.
 
 import os
 import threading
+from urllib.parse import parse_qs, unquote, urlparse
 
 import mlflow
 import pytest
@@ -60,32 +61,54 @@ class TestUnityCatalogTraceIds:
     """UC-backed traces are identified by location, and the route is not.
 
     Switching the app to a UC trace location changed the id from ``tr-<hex>``
-    to ``trace:/<catalog>.<schema>.<prefix>/<hex>``. Interpolated whole, its
-    slashes split one route segment into three and the UI renders a 404 —
-    while the server still answers 200, so nothing server-side reports it.
+    to ``trace:/<catalog>.<schema>.<prefix>/<hex>``. Interpolated whole into
+    the path, its slashes split one route segment into three and the UI
+    renders a 404 — while the server still answers 200, so nothing
+    server-side reports it.
+
+    Dropping the location and linking the bare hex fixed the 404 and replaced
+    it with something quieter: the workspace redirects /traces/<id> to the tab
+    with ?selectedEvaluationId=<id>, and that list is keyed on the full id —
+    ``search_traces`` returns ``trace:/<catalog>.<schema>.<prefix>/<hex>``
+    verbatim. A bare hex matches no row, so the link opened the unfiltered
+    overview and the user had to find their own trace in it. A query parameter
+    can carry the slashes a path segment cannot, once percent-encoded.
     """
 
     UC_ID = "trace:/main.mlflow_traces.prodline_traces/927f9737d4fcfdc18bdaed09cce01dae"
 
-    def test_only_the_trailing_hex_reaches_the_url(self, configured):
+    def test_the_whole_id_reaches_the_url(self, configured):
         assert trace_url(self.UC_ID) == (
-            "https://example.cloud.databricks.com/ml/experiments/1234567890"
-            "/traces/927f9737d4fcfdc18bdaed09cce01dae"
+            "https://example.cloud.databricks.com/ml/experiments/1234567890/traces"
+            "?selectedEvaluationId=trace%3A%2Fmain.mlflow_traces.prodline_traces"
+            "%2F927f9737d4fcfdc18bdaed09cce01dae"
         )
 
-    def test_the_location_does_not_leak_into_the_path(self, configured):
-        """The bug precisely: extra segments below the trace route."""
+    def test_the_selection_carries_the_id_the_trace_list_is_keyed_on(self, configured):
+        """A bare hex selects nothing and lands on the overview."""
         url = trace_url(self.UC_ID)
-        assert "trace:/" not in url
-        assert url.count("/traces/") == 1
-        assert url.rsplit("/traces/", 1)[1].count("/") == 0
+        selected = unquote(parse_qs(urlparse(url).query)["selectedEvaluationId"][0])
+        assert selected == self.UC_ID
+
+    def test_the_location_does_not_leak_into_the_path(self, configured):
+        """The original bug: extra segments below the trace route."""
+        path = urlparse(trace_url(self.UC_ID)).path
+        assert "trace:" not in path
+        assert path.endswith("/traces")
+
+    def test_the_raw_slashes_are_encoded(self, configured):
+        """Unencoded, they would split the query value across path segments."""
+        query = urlparse(trace_url(self.UC_ID)).query
+        assert "%2F" in query
+        assert "trace:/" not in query
 
     def test_classic_ids_are_untouched(self, configured):
-        """Prod still uses a classic experiment, so both forms must work."""
+        """A classic experiment resolves on the path route, so both forms work."""
         assert trace_url("tr-abc123").endswith("/traces/tr-abc123")
+        assert "selectedEvaluationId" not in trace_url("tr-abc123")
 
     def test_an_id_with_nothing_after_the_location_falls_back_to_the_tab(self, configured):
-        """Better a valid list page than a link ending in a bare slash."""
+        """Better a valid list page than a link that selects a nonexistent trace."""
         assert trace_url("trace:/main.schema.prefix/") == (
             "https://example.cloud.databricks.com/ml/experiments/1234567890/traces"
         )

@@ -60,14 +60,28 @@ class ConversationStore:
         _in_memory_conversations[conversation_id].append(msg)
 
     def load_history(self, conversation_id: str, limit: int = 50) -> list[dict]:
+        """Return the most recent ``limit`` messages, oldest first.
+
+        The ordering matters more than it looks. Callers ask for a small window
+        (six) to prime the model with what was just said, and this used to be
+        ``ORDER BY created_at LIMIT %s`` — the *oldest* six. For the first three
+        turns that is the same set, which is exactly long enough to look
+        correct; from the fourth turn on the window froze on the opening
+        exchange and the model was primed with progressively staler context
+        while newer turns were never shown to it.
+
+        Selecting DESC and reversing keeps the returned list chronological,
+        which callers rely on: they treat the final element as the message just
+        saved for this turn and drop it.
+        """
         try:
             rows = query(
                 "SELECT role, content, metadata, created_at FROM ai_chatbot.messages "
-                "WHERE conversation_id = %s ORDER BY created_at LIMIT %s",
+                "WHERE conversation_id = %s ORDER BY created_at DESC LIMIT %s",
                 (conversation_id, limit),
             )
             if rows is not None:
-                return rows
+                return list(reversed(rows))
         except Exception:
             # ``query`` has already rolled the shared connection back; the old
             # code did not, so a bad history read poisoned every later caller.

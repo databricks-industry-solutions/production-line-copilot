@@ -24,17 +24,23 @@ HALLUCINATED = ("defect_type", "reject_count", "total_checked", "reject_rate")
 
 
 def _ddl_columns() -> list[str]:
-    """Column names from the CREATE TABLE for the streaming quality_checks table."""
+    """Column names from the CREATE TABLE for the quality checks table.
+
+    Reads ``quality_checks_bronze``, not ``quality_checks``. The unsuffixed
+    table was an empty shell nothing ever wrote, and it is no longer created at
+    all — bronze is where the producer and the backfill land rows, so bronze is
+    the schema the prompt has to be true about.
+    """
     source = DDL_SOURCE.read_text()
     # The DDL sits in an f-string, so the file text carries doubled braces.
     match = re.search(
-        r"CREATE TABLE IF NOT EXISTS \{+fqn\}+\.quality_checks \((.*?)\)\s*USING DELTA",
+        r"CREATE TABLE IF NOT EXISTS \{+fqn\}+\.quality_checks_bronze \((.*?)\)\s*USING DELTA",
         source,
         re.DOTALL,
     )
     assert match, (
-        f"could not find the quality_checks DDL in {DDL_SOURCE.name}. If the "
-        "table moved, this guard is no longer checking anything."
+        f"could not find the quality_checks_bronze DDL in {DDL_SOURCE.name}. If "
+        "the table moved, this guard is no longer checking anything."
     )
     columns = []
     for line in match.group(1).strip().splitlines():

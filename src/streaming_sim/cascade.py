@@ -16,7 +16,10 @@ import random
 from dataclasses import dataclass, field
 from typing import Any
 
-from src.streaming_sim.line_kpi_derived import compute_tier1_line_kpi_row
+from src.streaming_sim.line_kpi_derived import (
+    ShiftKpiAccumulator,
+    compute_tier1_line_kpi_row,
+)
 
 # ---------------------------------------------------------------------------
 # Data types
@@ -28,6 +31,14 @@ class MachineSpec:
     id: str
     line_position: int
     nominal_capacity: float  # items/min at 100 % speed
+    # Conveyors carry product rather than process it, so they are given a
+    # sentinel capacity to keep them from ever bottlenecking the line. That
+    # sentinel then leaked into ``speed_pct`` as flow/9999, and a healthy belt
+    # reported 2 %. The line average already excluded conveyors as meaningless,
+    # but the tile and every specialist reading machine_state still saw it and
+    # would reasonably call a running conveyor nearly stopped. A belt runs at
+    # its set speed or it does not run, so we leave its speed to fault state.
+    pass_through: bool = False
 
     def __hash__(self) -> int:
         return hash(self.id)
@@ -69,12 +80,22 @@ def build_line(specs: list[MachineSpec], buffer_seconds: float = 5.0) -> LineSta
     Each buffer holds ``buffer_seconds`` worth of the faster neighbour's capacity,
     starting at 80 % full — comfortably above the drain threshold so every machine
     boots at 100 % speed.
+
+    A pass-through neighbour is skipped when sizing. Conveyors carry a sentinel
+    capacity so they never bottleneck, and taking the max included that
+    sentinel: a buffer beside a conveyor came out at 833 units where its
+    neighbours justify about 25. Faults then took roughly twenty-four times
+    longer to cross a conveyor than any other pair, so a stop upstream of one
+    looked contained for minutes after the line had really begun to starve.
     """
     specs_sorted = sorted(specs, key=lambda s: s.line_position)
     machines = {s.id: MachineState(throughput=s.nominal_capacity) for s in specs_sorted}
     buffers: dict[tuple[str, str], BufferState] = {}
     for a, b in zip(specs_sorted, specs_sorted[1:]):
-        cap = max(a.nominal_capacity, b.nominal_capacity) * buffer_seconds / 60.0
+        rated = [s.nominal_capacity for s in (a, b) if not s.pass_through]
+        if not rated:  # conveyor to conveyor: neither has a real rate to size on
+            rated = [a.nominal_capacity, b.nominal_capacity]
+        cap = max(rated) * buffer_seconds / 60.0
         cap = max(cap, 10.0)
         buffers[(a.id, b.id)] = BufferState(capacity=cap, level=cap * 0.8)
     return LineState(machines=machines, buffers=buffers)
@@ -111,6 +132,7 @@ def cascade_tick(
     ordered = sorted(specs, key=lambda s: s.line_position)
     ids = [s.id for s in ordered]
     cap_map = {s.id: s.nominal_capacity for s in ordered}
+    pass_through = {s.id: s.pass_through for s in ordered}
     tick_min = tick_seconds / 60.0
 
     # 1. Reset derived statuses — faulted (stopped/degraded) are preserved.
@@ -190,7 +212,7 @@ def cascade_tick(
         if ms.status == "degraded":
             continue
 
-        if cap_map[mid] > 0:
+        if cap_map[mid] > 0 and not pass_through.get(mid, False):
             ms.speed_pct = max(0.0, min(100.0, flow[mid] / cap_map[mid] * 100.0))
 
         # Starved: input buffer critically low and upstream not producing
@@ -280,6 +302,20 @@ def snapshot_to_dicts(
     return rows
 
 
+def _last_station(state: LineState) -> str | None:
+    """The machine at the end of the line — the one nothing is fed from.
+
+    Derived from the buffer adjacency rather than dict order, so it stays
+    correct if a caller builds a LineState by hand. Falls back to insertion
+    order, which ``build_line`` sorts by line position.
+    """
+    upstream = {a for a, _ in state.buffers}
+    tail = [mid for mid in state.machines if mid not in upstream]
+    if len(tail) == 1:
+        return tail[0]
+    return next(reversed(state.machines), None) if state.machines else None
+
+
 def compute_line_kpi(
     state: LineState,
     shift_id: str,
@@ -288,6 +324,7 @@ def compute_line_kpi(
     exclude_from_speed: set[str] | None = None,
     cumulative_cases: float = 0.0,
     machine_rows: list[dict[str, Any]] | None = None,
+    accumulator: ShiftKpiAccumulator | None = None,
 ) -> dict[str, Any]:
     """Aggregate machine states into a single line-KPI row.
 
@@ -295,6 +332,9 @@ def compute_line_kpi(
     (e.g. conveyors whose throughput/capacity ratio is meaningless).
     ``cumulative_cases`` – the producer's running tally of cases produced
     since shift start; passed through to the gold row.
+    ``accumulator`` – the caller's shift-to-date A/P tally. Supply it and the
+    ``*_to_now`` fields mean what they say; omit it and they carry this tick's
+    values, which is all a stateless caller can honestly report.
     ``machine_rows`` – optional list of jittered snapshot dicts (from
     ``snapshot_to_dicts(..., rng=...)``); when provided, throughput and
     speed are summed/averaged from these jittered values so the line KPI
@@ -302,15 +342,26 @@ def compute_line_kpi(
     deterministic cascade state (matches the legacy / test contract).
     """
     running = stopped = degraded = starved = 0
-    total_tput = 0.0
     speed_sum = 0.0
     speed_count = 0
     _excl = exclude_from_speed or set()
 
+    # Line output is what leaves the last station, not the sum of all of them.
+    # This is a series line: every bottle passes through all nineteen machines,
+    # so adding their rates counts the same bottle nineteen times. The tile read
+    # 5,680/min on a line whose real rate is ~300 — and the column is documented
+    # to Genie as "cases per minute", which it was out by a factor of 450.
+    tput_by_id = (
+        {r.get("machine_id"): float(r.get("throughput_per_min") or 0.0) for r in machine_rows}
+        if machine_rows is not None
+        else {mid: ms.throughput for mid, ms in state.machines.items()}
+    )
+    last = _last_station(state)
+    total_tput = tput_by_id.get(last, 0.0)
+
     if machine_rows is not None:
         for r in machine_rows:
             mid = r.get("machine_id")
-            total_tput += float(r.get("throughput_per_min") or 0.0)
             if mid not in _excl:
                 speed_sum += float(r.get("speed_pct") or 0.0)
                 speed_count += 1
@@ -325,7 +376,6 @@ def compute_line_kpi(
                 starved += 1
     else:
         for mid, ms in state.machines.items():
-            total_tput += ms.throughput
             if mid not in _excl:
                 speed_sum += ms.speed_pct
                 speed_count += 1
@@ -350,4 +400,5 @@ def compute_line_kpi(
         total_throughput=round(total_tput, 2),
         avg_speed_pct=avg_sp,
         cumulative_cases=float(cumulative_cases),
+        accumulator=accumulator,
     )

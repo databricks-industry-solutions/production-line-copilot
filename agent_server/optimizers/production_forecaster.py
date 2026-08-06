@@ -9,6 +9,8 @@ import random
 
 from langchain_core.tools import tool
 
+from agent_server.optimizers._units import as_fraction, cases_from_bpm
+
 logger = logging.getLogger(__name__)
 
 N_SIMULATIONS = 1000
@@ -38,6 +40,8 @@ class ProductionForecaster:
                 "remaining_minutes": 0,
             }
 
+        current_oee = as_fraction(current_oee)
+
         rng = random.Random(RANDOM_SEED)
         results = []
 
@@ -56,7 +60,7 @@ class ProductionForecaster:
             micro_stop_loss = rng.uniform(0.95, 1.0)
 
             effective_rate = ideal_rate_bpm * sim_oee * micro_stop_loss
-            sim_cases = current_cases + int(effective_rate * sim_remaining / 60)
+            sim_cases = current_cases + int(cases_from_bpm(effective_rate, sim_remaining))
             results.append(sim_cases)
 
         results.sort()

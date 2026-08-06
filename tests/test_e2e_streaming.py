@@ -135,7 +135,18 @@ class TestE2EIncidentCascade:
         kpi_after = compute_line_kpi(state, shift_id="s", timestamp=_now())
 
         assert kpi_after["machines_stopped"] + kpi_after["machines_starved"] > 0
-        assert kpi_after["total_throughput"] < kpi_before["total_throughput"]
+
+        # The line is built with ten seconds of buffer, so ten ticks after a
+        # mid-line stop the end of the line is still fed and output holds.
+        # That delay is the point of the buffers, and total_throughput now
+        # measures what leaves the line rather than summing every station —
+        # a sum falls the instant any machine stops, which is not what the
+        # line actually made.
+        assert kpi_after["total_throughput"] == kpi_before["total_throughput"]
+
+        _tick(specs, state, 120)
+        drained = compute_line_kpi(state, shift_id="s", timestamp=_now())
+        assert drained["total_throughput"] < kpi_before["total_throughput"]
 
 
 # ── Step 3: Resolve and recovery ──────────────────────────────────────────

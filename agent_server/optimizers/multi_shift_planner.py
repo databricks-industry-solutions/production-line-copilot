@@ -1,12 +1,18 @@
-"""Multi-shift production planner using sequential optimization.
+"""Multi-shift production planner.
 
-Coordinates production across shifts by calling schedule_recovery per shift
-with CIP/maintenance placement enumeration. Applies inter-shift speed
-continuity constraints. Uses a greedy coordinator when OR-Tools is available.
+Solves one MILP across all shifts: per-shift speed and overtime, where the
+single CIP and maintenance stops go, and the resulting shortfall, subject to
+inter-shift speed continuity. Speed is discretised so that cases produced
+(speed x time, both decisions) linearises exactly.
+
+Falls back to sequential per-shift planning when OR-Tools is unavailable or
+the model proves infeasible.
 """
 import logging
 
 from langchain_core.tools import tool
+
+from agent_server.optimizers._units import BOTTLES_PER_CASE
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +27,21 @@ SPEED_PENALTY_PER_BPM = 0.1
 CIP_DURATION_MIN = 45.0
 MAINTENANCE_DURATION_MIN = 30.0
 SHORTFALL_PENALTY = 10.0
+
+# How finely speed is discretised. Speed x time is bilinear in the raw
+# formulation; fixing speed to a finite set of levels makes the product
+# exactly linearisable. Eleven levels put them 25 bpm apart over a typical
+# 200-450 range, which is finer than an operator would set a line by hand and
+# small enough that the model still solves in well under the time limit.
+SPEED_LEVELS = 11
+
+
+def _speed_levels(min_bpm: float, max_bpm: float) -> list[float]:
+    """Evenly spaced speed choices spanning the allowed range, endpoints included."""
+    if max_bpm <= min_bpm:
+        return [min_bpm]
+    step = (max_bpm - min_bpm) / (SPEED_LEVELS - 1)
+    return [min_bpm + step * k for k in range(SPEED_LEVELS)]
 
 
 class MultiShiftPlanner:
@@ -46,13 +67,22 @@ class MultiShiftPlanner:
         if not _HAS_ORTOOLS:
             return self._sequential_fallback(shifts)
 
-        # The master problem below is bilinear: the shortfall constraint multiplies
-        # ``speed[i]`` by ``effective`` (which itself depends on the overtime var),
-        # a product of decision variables that the linear-solver API cannot
-        # express. Until it is reformulated as a proper MILP, guard the entire
-        # solver path and fall back to the (correct, unit-tested) sequential
-        # planner on any construction/solve error so the tool always returns a
-        # usable plan instead of raising.
+        # Cases produced are speed x time, and both are decisions, so the
+        # constraint is bilinear and pywraplp's linear API rejects it outright.
+        # The whole block used to be written that way behind the try/except
+        # below, which meant construction always raised and every caller
+        # silently got _sequential_fallback: the "benders_master" result, the
+        # inter-shift speed continuity and the joint CIP/maintenance placement
+        # were unreachable code advertising an optimization that never ran.
+        #
+        # Discretising speed into a fixed set of levels makes it exact rather
+        # than approximate. With one binary per level, speed x time becomes a
+        # sum of (binary x continuous) terms, and each of those linearises
+        # exactly with the standard big-M pair. A McCormick relaxation of the
+        # continuous product would have been easier and wrong in the dangerous
+        # direction: it bounds production from above, so the solver could claim
+        # cases the line cannot make and report a shortfall smaller than
+        # reality. The fallback stays for solver-absent and infeasible cases.
         try:
             solver = pywraplp.Solver.CreateSolver("SCIP")
             if not solver:
@@ -66,13 +96,28 @@ class MultiShiftPlanner:
             do_maint = []
             shortfall = []
 
+            level_choice = []   # binary per speed level, per shift
+            level_speed = []    # the bpm each of those levels stands for
+            produced = []       # cases the shift makes, linear in the above
+
             for i, s in enumerate(shifts):
-                mn = s.get("min_speed_bpm", 200)
-                mx = s.get("max_speed_bpm", 450)
-                speed.append(solver.NumVar(mn, mx, f"speed_{i}"))
+                mn = float(s.get("min_speed_bpm", 200))
+                mx = float(s.get("max_speed_bpm", 450))
+                if mx < mn:
+                    mn, mx = mx, mn
+                levels = _speed_levels(mn, mx)
+                level_speed.append(levels)
+
+                y = [solver.BoolVar(f"lvl_{i}_{k}") for k in range(len(levels))]
+                solver.Add(sum(y) == 1)
+                level_choice.append(y)
+
+                sp = solver.NumVar(mn, mx, f"speed_{i}")
+                solver.Add(sp == sum(levels[k] * y[k] for k in range(len(levels))))
+                speed.append(sp)
 
                 allow_ot = s.get("allow_overtime", False)
-                max_ot = s.get("max_overtime_min", 60) if allow_ot else 0
+                max_ot = float(s.get("max_overtime_min", 60)) if allow_ot else 0.0
                 ot.append(solver.NumVar(0, max_ot, f"ot_{i}"))
 
                 do_cip.append(solver.BoolVar(f"cip_{i}"))
@@ -93,10 +138,32 @@ class MultiShiftPlanner:
                 solver.Add(do_cip[i] + do_maint[i] <= 1)
 
             for i, s in enumerate(shifts):
-                avail = s.get("remaining_minutes", 480)
-                effective = avail - CIP_DURATION_MIN * do_cip[i] - MAINTENANCE_DURATION_MIN * do_maint[i] + ot[i]
+                avail = float(s.get("remaining_minutes", 480))
+                allow_ot = s.get("allow_overtime", False)
+                max_ot = float(s.get("max_overtime_min", 60)) if allow_ot else 0.0
+
+                eff = solver.NumVar(0, avail + max_ot, f"eff_{i}")
+                solver.Add(eff == avail
+                           - CIP_DURATION_MIN * do_cip[i]
+                           - MAINTENANCE_DURATION_MIN * do_maint[i]
+                           + ot[i])
+
+                # z[k] carries eff when level k is chosen and 0 otherwise, so
+                # sum_k level_bpm[k] * z[k] is exactly speed x time.
+                big_m = avail + max_ot
+                levels, y = level_speed[i], level_choice[i]
+                z = [solver.NumVar(0, big_m, f"z_{i}_{k}") for k in range(len(levels))]
+                for k in range(len(levels)):
+                    solver.Add(z[k] <= big_m * y[k])
+                    solver.Add(z[k] <= eff)
+                    solver.Add(z[k] >= eff - big_m * (1 - y[k]))
+
+                made = solver.NumVar(0, solver.infinity(), f"made_{i}")
+                solver.Add(made == sum(levels[k] * z[k] for k in range(len(levels))) / BOTTLES_PER_CASE)
+                produced.append(made)
+
                 needed = s.get("planned_cases", 0)
-                solver.Add(shortfall[i] >= needed - speed[i] * effective / 60.0)
+                solver.Add(shortfall[i] >= needed - made)
 
             for i in range(N - 1):
                 solver.Add(speed[i + 1] - speed[i] <= 50)
@@ -123,7 +190,9 @@ class MultiShiftPlanner:
                 cip_time = CIP_DURATION_MIN if do_cip[i].solution_value() > 0.5 else 0
                 maint_time = MAINTENANCE_DURATION_MIN if do_maint[i].solution_value() > 0.5 else 0
                 effective = avail - cip_time - maint_time + ot[i].solution_value()
-                projected = int(speed[i].solution_value() * effective / 60)
+                # Read the solver's own production variable rather than
+                # recomputing it, so the plan reported is the plan optimised.
+                projected = int(produced[i].solution_value())
                 sf = shortfall[i].solution_value()
                 total_cases += projected
                 total_shortfall += sf

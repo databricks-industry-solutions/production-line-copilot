@@ -119,6 +119,64 @@ def test_widget_field_references_match_dataset_aliases() -> None:
                         )
 
 
+_REPO = Path(__file__).resolve().parents[2]
+
+# Tables the deploy creates from a variable/f-string rather than a literal
+# ``CREATE TABLE <name>``, so the scan below cannot see them. Keep this list
+# short and justified — every entry is a hole in the check.
+_CREATED_DYNAMICALLY = {
+    # Written by the generated streaming_quality_sync RTM job
+    # (see scripts/sync_project_settings.py), whose DDL is built from the
+    # target schema at render time.
+    "quality_rejects",
+}
+
+
+def _tables_the_repo_creates() -> set[str]:
+    names: set[str] = set(_CREATED_DYNAMICALLY)
+    pattern = re.compile(
+        r"CREATE\s+(?:OR\s+REPLACE\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?"
+        r"[^\s(]*?([a-z][a-z0-9_]*)\s*[(\n]",
+        flags=re.I,
+    )
+    for sub in ("scripts", "src", "agent_server"):
+        for path in (_REPO / sub).rglob("*"):
+            if path.suffix not in (".py", ".sql") or not path.is_file():
+                continue
+            names.update(m.lower() for m in pattern.findall(path.read_text(encoding="utf-8")))
+    return names
+
+
+def test_every_table_the_dashboard_queries_is_one_the_deploy_creates() -> None:
+    """The QC failures tile shipped querying ``quality_checks``; the table the
+    producer writes is ``quality_checks_bronze``. Nothing failed at build or
+    deploy time — the tile just rendered "Unable to render visualization" in
+    every workspace, because dashboard SQL was never checked against the
+    schema the deploy actually creates.
+    """
+    created = _tables_the_repo_creates()
+    referenced = set(
+        re.findall(r"\{\{UC_CATALOG\}\}\.\{\{UC_SCHEMA\}\}\.([a-z_][a-z0-9_]*)", _DASHBOARD.read_text())
+    )
+    assert referenced, "dashboard references no UC tables — the regex or the file changed"
+    unknown = sorted(referenced - created)
+    assert not unknown, (
+        f"dashboard queries table(s) the deploy never creates: {unknown}. "
+        f"Known tables: {sorted(created)}"
+    )
+
+
+def test_result_comparisons_match_the_values_the_producer_writes() -> None:
+    """``quality_checks_bronze.result`` holds lowercase 'pass'/'fail'. A
+    ``result = 'FAIL'`` predicate parses, runs, and returns zero rows forever —
+    the silent half of the same bug."""
+    text = _DASHBOARD.read_text()
+    assert "'FAIL'" not in text and "'PASS'" not in text, (
+        "dashboard compares `result` against uppercase literals; the producer "
+        "writes lowercase 'pass'/'fail'. Use lower(result) = 'fail'."
+    )
+
+
 def test_source_uses_uc_placeholders_not_hardcoded_catalog() -> None:
     """The committed dashboard must reference UC tables via the
     ``{{UC_CATALOG}}`` / ``{{UC_SCHEMA}}`` placeholders so the same file

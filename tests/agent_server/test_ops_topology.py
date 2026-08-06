@@ -101,7 +101,23 @@ def test_entities_are_bare_table_names(client):
 
 def test_streaming_space_is_reported_separately(client, monkeypatch):
     """The live space serves a different audience from the governed domains."""
+    from agent_server.tools import genie_query
+
+    monkeypatch.setattr(genie_query, "space_resolves", lambda *_a, **_k: True)
     monkeypatch.delenv("GENIE_SPACE_ID", raising=False)
     assert client.get("/ops/topology").json()["streaming_space"] is False
     monkeypatch.setenv("GENIE_SPACE_ID", "streaming-space")
     assert client.get("/ops/topology").json()["streaming_space"] is True
+
+
+def test_a_deleted_streaming_space_is_not_reported_as_present(client, monkeypatch):
+    """Set is not the same as live.
+
+    dev's space was trashed by a teardown and the System Map went on drawing
+    the connection, because the only check was that the variable was non-empty.
+    """
+    from agent_server.tools import genie_query
+
+    monkeypatch.setenv("GENIE_SPACE_ID", "trashed-space")
+    monkeypatch.setattr(genie_query, "space_resolves", lambda *_a, **_k: False)
+    assert client.get("/ops/topology").json()["streaming_space"] is False

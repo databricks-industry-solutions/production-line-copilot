@@ -8,6 +8,8 @@ import logging
 
 from langchain_core.tools import tool
 
+from agent_server.optimizers._units import BOTTLES_PER_CASE, bpm_for_cases, cases_from_bpm
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -132,7 +134,7 @@ class ScheduleRecoveryOptimizer:
             if avail_k <= 0:
                 solver.Add(y[k] == 0)
                 continue
-            production_terms.append(speed[k] * (avail_k / 60.0))
+            production_terms.append(speed[k] * (avail_k / BOTTLES_PER_CASE))
 
         if production_terms:
             solver.Add(sum(production_terms) >= remaining_cases)
@@ -168,7 +170,7 @@ class ScheduleRecoveryOptimizer:
             chosen_speed = speed[chosen_k].solution_value()
             chosen_ot = ot_slots[chosen_k]
             avail = effective_base + chosen_ot
-            projected = int(chosen_speed * avail / 60)
+            projected = int(cases_from_bpm(chosen_speed, avail))
 
             return {
                 "feasible": True,
@@ -219,14 +221,14 @@ class ScheduleRecoveryOptimizer:
         suggestions = []
         max_avail = effective_base + (max_ot if allow_ot else 0)
         if max_avail > 0:
-            needed = remaining_cases * 60.0 / max_avail
+            needed = bpm_for_cases(remaining_cases, max_avail)
             if needed > max_speed:
                 gap = needed - max_speed
-                suggestions.append(f"Increase max speed by {gap:.0f} BPM or reduce target by {int(gap * max_avail / 60)} cases")
+                suggestions.append(f"Increase max speed by {gap:.0f} BPM or reduce target by {int(cases_from_bpm(gap, max_avail))} cases")
         if not allow_ot:
-            at_max_speed = max_speed * effective_base / 60
+            at_max_speed = cases_from_bpm(max_speed, effective_base)
             if at_max_speed < remaining_cases:
-                needed_ot = (remaining_cases - at_max_speed) * 60 / max_speed
+                needed_ot = (remaining_cases - at_max_speed) * BOTTLES_PER_CASE / max_speed
                 suggestions.append(f"Enable overtime (~{needed_ot:.0f} min at max speed)")
         if not suggestions:
             suggestions.append("Consider splitting the recovery across multiple shifts")
@@ -253,7 +255,7 @@ class ScheduleRecoveryOptimizer:
             avail_time = effective_base + ot_min
             if avail_time <= 0:
                 continue
-            needed_speed = remaining_cases * 60 / avail_time
+            needed_speed = bpm_for_cases(remaining_cases, avail_time)
             if needed_speed < min_speed_bpm:
                 needed_speed = min_speed_bpm
             if needed_speed > max_speed_bpm:
@@ -263,7 +265,7 @@ class ScheduleRecoveryOptimizer:
                 test_speed = needed_speed + s_offset
                 if test_speed > max_speed_bpm:
                     break
-                projected = int(test_speed * avail_time / 60)
+                projected = int(cases_from_bpm(test_speed, avail_time))
                 speed_delta = abs(test_speed - current_speed_bpm)
                 quality_pen = max(0, test_speed - QUALITY_RISK_SPEED_THRESHOLD)
                 energy_pen = max(0, test_speed - ENERGY_BASE_SPEED)

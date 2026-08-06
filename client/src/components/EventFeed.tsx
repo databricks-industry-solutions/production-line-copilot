@@ -43,7 +43,7 @@ export interface EventFeedProps {
    *  active rows render a Recover button next to "Ask AI". Returns when
    *  the API call completes — the row stays visible until the next SSE
    *  payload reflects the resolved state (~30 s through producer/quality-gate). */
-  onRecoverMachine?: (machineId: string) => Promise<unknown>;
+  onRecoverMachine?: (machineId: string) => Promise<{ count: number } | void>;
 }
 
 type SeverityFilter = 'all' | 'critical' | 'major' | 'minor' | 'history';
@@ -311,14 +311,23 @@ function EventRow({
   event: EventFeedEvent;
   onAskAbout?: (query: string, contextTimestamp?: string) => void;
   onJumpToTime?: (epochMs: number) => void;
-  onRecoverMachine?: (machineId: string) => Promise<unknown>;
+  onRecoverMachine?: (machineId: string) => Promise<{ count: number } | void>;
   active?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const [recovering, setRecovering] = useState(false);
+  const [recoverNote, setRecoverNote] = useState<string | null>(null);
 
   // The producer emits a synthetic "resolved" event when an incident clears;
   // those rows aren't actionable so we hide the Recover button on them.
+  //
+  // The button used to be gated on the machine having a live scenario_command,
+  // because Recover could only resolve a command and events without one — the
+  // seeded carryover row, or an incident orphaned by a producer restart — were
+  // left with a button that reported its own no-op. The endpoint now appends
+  // the resolve marker itself when no command is behind the event, so every
+  // active event is genuinely clearable and the gate would only hide a button
+  // that works.
   const canRecover =
     active &&
     !!onRecoverMachine &&
@@ -326,14 +335,26 @@ function EventRow({
     event.event_type !== 'resolved' &&
     (event.severity?.toLowerCase() ?? '') !== 'info';
 
+  // Recover clears a *live* fault by resolving the scenario_command behind it.
+  // An event with no such command — a seeded one, or a fault the producer has
+  // already cleared — resolves nothing, and the endpoint says so with
+  // `count: 0`. That result used to be discarded on the assumption that a state
+  // refresh would explain it, but nothing changes when nothing was resolved, so
+  // the button just returned to "Recover" and the row stayed open. Reporting it
+  // is the whole fix: the operator needs to know this is a historical record,
+  // not a fault that refused to clear.
   const handleRecover = async (e: React.MouseEvent) => {
     e.stopPropagation();
     if (!onRecoverMachine || recovering) return;
     setRecovering(true);
+    setRecoverNote(null);
     try {
-      await onRecoverMachine(event.machine_id);
+      const result = await onRecoverMachine(event.machine_id);
+      if (!result || result.count === 0) {
+        setRecoverNote('No active fault on this machine — this is a past event.');
+      }
     } catch {
-      // surface remains unchanged; backend/state refresh will clarify final status
+      setRecoverNote('Recover failed — check the app logs.');
     } finally {
       setRecovering(false);
     }
@@ -416,6 +437,11 @@ function EventRow({
             )}
           </span>
         </div>
+        {recoverNote && (
+          <p className="text-[11px] text-muted-foreground pl-1 pt-0.5" role="status">
+            {recoverNote}
+          </p>
+        )}
       </div>
       {open && (
         <div className="px-3 pb-2 text-[11px] space-y-0.5 text-muted-foreground ml-4">

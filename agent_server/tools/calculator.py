@@ -13,6 +13,8 @@ import os
 
 from langchain_core.tools import tool
 
+from agent_server.optimizers._units import as_fraction, cases_from_bpm
+
 SKU_COST_EUR: dict[str, float] = {
     "LAGER_330ML": float(os.environ.get("COST_LAGER_330ML", "2.50")),
     "WHEAT_500ML": float(os.environ.get("COST_WHEAT_500ML", "3.20")),
@@ -49,6 +51,11 @@ def calculator(operation: str, params: dict) -> dict:
             q = float(params.get("quality", 0))
         except (ValueError, TypeError):
             return {"error": "availability, performance, and quality must be numbers"}
+        # The context and the specialist prompts carry these as 0-100
+        # percentages, so `oee(85, 90, 98)` is the natural call and used to
+        # return an oee_pct of 74,970,000 — from the one tool whose whole
+        # purpose is to stop bad arithmetic reaching the operator.
+        a, p, q = (as_fraction(v, field=n) for v, n in ((a, "availability"), (p, "performance"), (q, "quality")))
         oee = a * p * q
         return {"oee": round(oee, 4), "oee_pct": round(oee * 100, 2)}
 
@@ -63,7 +70,7 @@ def calculator(operation: str, params: dict) -> dict:
         if speed <= 0 or minutes <= 0:
             return {"feasible": False, "reason": "Invalid speed or time"}
         effective_minutes = max(0, minutes - ramp_up)
-        projected = int(speed * effective_minutes / 60)
+        projected = int(cases_from_bpm(speed, effective_minutes))
         return {
             "feasible": projected >= remaining,
             "projected_cases": projected,
@@ -78,12 +85,25 @@ def calculator(operation: str, params: dict) -> dict:
         try:
             qty = float(params.get("current_qty", 0))
             rate = float(params.get("consumption_rate_per_hour", 0))
-            hours = float(params.get("remaining_hours", 0))
+            raw_horizon = params.get("remaining_hours")
+            hours = None if raw_horizon in (None, "") else float(raw_horizon)
         except (ValueError, TypeError):
             return {"error": "current_qty, consumption_rate_per_hour, and remaining_hours must be numbers"}
         if rate <= 0:
             return {"hours_until_empty": float("inf"), "will_deplete": False}
         hours_until = qty / rate
+        # No horizon means the question "will it run out before the end?"
+        # has not been asked, not that the answer is no. This defaulted to 0,
+        # so an omitted argument made every positive stock read as safe —
+        # a material two hours from empty reported will_deplete False on an
+        # eight-hour shift. The caller here is an LLM and remaining_hours
+        # looks optional, so say we do not know instead of guessing wrong.
+        if hours is None or hours <= 0:
+            return {
+                "hours_until_empty": round(hours_until, 2),
+                "will_deplete": None,
+                "note": "remaining_hours not supplied, so depletion within the shift could not be determined",
+            }
         return {
             "hours_until_empty": round(hours_until, 2),
             "will_deplete": hours_until < hours,

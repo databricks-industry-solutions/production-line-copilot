@@ -75,7 +75,12 @@ from src.streaming_sim.cascade import (
     compute_line_kpi,
     snapshot_to_dicts,
 )
-from src.streaming_sim.incidents import apply_incident, resolve_incident
+from src.streaming_sim.incidents import (
+    apply_incident,
+    incident_target_machines,
+    resolve_incident,
+)
+from src.streaming_sim.line_kpi_derived import ShiftKpiAccumulator
 
 logger = logging.getLogger(__name__)
 
@@ -283,7 +288,12 @@ def _machine_specs() -> list[MachineSpec]:
             cap = m.nominal_speed * 16.8  # ≈ bottles per linear metre
         else:
             cap = float(m.nominal_speed)
-        specs.append(MachineSpec(id=m.id, line_position=m.line_position, nominal_capacity=cap))
+        specs.append(MachineSpec(
+            id=m.id,
+            line_position=m.line_position,
+            nominal_capacity=cap,
+            pass_through=m.type == "conveyor",
+        ))
     return specs
 
 
@@ -304,6 +314,62 @@ class ActiveIncident:
     scenario_id: str
     target_machines: list[str]
     severity: str
+
+
+def incident_for_resolve(
+    cmd: dict[str, Any],
+    active_incidents: dict[str, ActiveIncident],
+    state: LineState,
+) -> ActiveIncident | None:
+    """The incident a resolve request refers to, popped or rebuilt.
+
+    Normally the incident is still in ``active_incidents`` and this is a pop.
+    It is absent whenever the producer restarted after the incident started —
+    routine, since every deploy cycles the job — and rehydration does not cover
+    it, because ``fetch_unresolved`` reloads only 'active' and 'resolving'.
+
+    Before the rebuild, that gap sent the command straight to its terminal
+    UPDATE with no resolve marker emitted. The dashboard reads those markers to
+    pair an event closed, so the event stayed active forever while its command
+    was terminal, and Recover — which only offers itself for machines with a
+    live command — had nothing left to clear. The operator was left with a red
+    incident no button could remove. Rebuilding from the command row makes
+    recovery idempotent across restarts.
+
+    Returns None only when the row names no machine on this line, in which case
+    the caller marks it resolved without an event and the original event stays
+    open. That is a real failure, so the caller logs it.
+    """
+    incident = active_incidents.pop(str(cmd["command_id"]), None)
+    if incident is not None:
+        return incident
+
+    scenario_id = str(cmd.get("scenario_id") or "")
+    named = incident_target_machines(
+        scenario_id,
+        str(cmd["target_machine_id"]) if cmd.get("target_machine_id") else None,
+    )
+    targets = [mid for mid in named if mid in state.machines]
+    if not targets:
+        logger.warning(
+            "Resolve request for command %s (scenario=%r, names %r) matches no "
+            "machine on this line; marking it resolved without an event, which "
+            "leaves the original event open in the dashboard",
+            cmd.get("command_id"), scenario_id, named,
+        )
+        return None
+
+    logger.info(
+        "Rebuilt incident %s on %s from its command row — not in memory, so "
+        "this producer restarted since it started",
+        scenario_id, targets,
+    )
+    return ActiveIncident(
+        command_id=str(cmd["command_id"]),
+        scenario_id=scenario_id,
+        target_machines=targets,
+        severity=str(cmd.get("severity") or "medium"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -343,7 +409,17 @@ class CommandStore:
         warehouse_id: str | None = None,
         catalog: str | None = None,
         schema: str | None = None,
+        shift_id: str | None = None,
     ) -> None:
+        # Every environment shares one Lakebase database, so dev and prod poll
+        # the same ai_serving.scenario_commands table. Unfiltered, whichever
+        # producer polls first claims the row: it applies the fault to its own
+        # line state, emits the event into its own bronze schema, and flips the
+        # shared row to 'active' — after which the environment the operator was
+        # actually looking at never sees it as pending. That is why a trigger
+        # sometimes did nothing at all, and why it was intermittent: it was a
+        # race between two producers. Scope the inbox to this producer's shift.
+        self._shift_id = shift_id
         self._pg_host = _env("PGHOST")
         self._pg_user = _env("PGUSER")
         self._pg_database = os.environ.get("PGDATABASE", "databricks_postgres")
@@ -441,15 +517,23 @@ class CommandStore:
     def _select_by_status(self, status: str) -> list[dict[str, Any]]:
         try:
             conn = self._ensure_connection()
+            columns = (
+                "SELECT command_id, shift_id, scenario_id, target_machine_id, "
+                "       severity, status, created_at, created_by, params, "
+                "       resolved_at, resolved_by "
+                f"FROM {self._fqn} WHERE status = %s"
+            )
             with conn.cursor() as cur:
-                cur.execute(
-                    f"SELECT command_id, shift_id, scenario_id, target_machine_id, "
-                    f"       severity, status, created_at, created_by, params, "
-                    f"       resolved_at, resolved_by "
-                    f"FROM {self._fqn} "
-                    f"WHERE status = %s ORDER BY created_at LIMIT 50",
-                    (status,),
-                )
+                if self._shift_id:
+                    cur.execute(
+                        f"{columns} AND shift_id = %s ORDER BY created_at LIMIT 50",
+                        (status, self._shift_id),
+                    )
+                else:
+                    cur.execute(
+                        f"{columns} ORDER BY created_at LIMIT 50",
+                        (status,),
+                    )
                 cols = [c[0] for c in cur.description]
                 return [dict(zip(cols, r)) for r in cur.fetchall()]
         except Exception as e:  # noqa: BLE001
@@ -462,6 +546,15 @@ class CommandStore:
 
     def fetch_resolve_requested(self) -> list[dict[str, Any]]:
         return self._select_by_status("resolve_requested")
+
+    def fetch_unresolved(self) -> list[dict[str, Any]]:
+        """Commands still in flight, for rehydration after a restart.
+
+        The producer holds active incidents in memory, so a restart loses them:
+        the machine returns to running while the row stays 'active' forever and
+        a later resolve finds nothing to clear.
+        """
+        return self._select_by_status("active") + self._select_by_status("resolving")
 
     def set_status(self, command_id: str, status: str) -> None:
         """Flip ``status`` and stamp ``resolved_at`` on terminal transitions.
@@ -850,11 +943,11 @@ def main() -> None:
     pg_user = os.environ.get("PGUSER")
     if pg_host and pg_user:
         try:
-            commands = CommandStore()
+            commands = CommandStore(shift_id=shift_id)
             logger.info(
-                "CommandStore (Lakebase) configured (PGHOST=%s PGUSER=%s); "
+                "CommandStore (Lakebase) configured (PGHOST=%s PGUSER=%s shift_id=%s); "
                 "first SELECT will open the connection",
-                pg_host, pg_user,
+                pg_host, pg_user, shift_id,
             )
         except Exception as e:
             # Constructor only reads env vars, so this is unexpected; surface
@@ -916,15 +1009,16 @@ def main() -> None:
     # cycling the producer, so this query would normally return zero rows
     # anyway, but skipping is defence-in-depth against a races where an
     # admin re-fires an incident between abort and restart.
+    #
+    # This block used to reach for ``commands._cur`` — an attribute CommandStore
+    # has never had — against ``{_fqn}.scenario_commands``, where ``_fqn`` is
+    # already the fully-qualified table. Both raise, the bare except logs at
+    # warning, and rehydration has therefore never once run: the symptom is an
+    # incident whose command sits at 'active' while the machine it named runs
+    # normally. It goes through the same shift-scoped SELECT as every other read.
     if commands is not None and not start_fresh:
         try:
-            commands._cur.execute(
-                f"SELECT command_id, scenario_id, target_machine_id, severity "
-                f"FROM {commands._fqn}.scenario_commands "
-                f"WHERE status IN ('active', 'resolving') ORDER BY created_at LIMIT 200"
-            )
-            cols = [c[0] for c in commands._cur.description]
-            existing = [dict(zip(cols, r)) for r in commands._cur.fetchall()]
+            existing = commands.fetch_unresolved()
             for row in existing:
                 cid = str(row["command_id"])
                 sid = str(row.get("scenario_id") or "")
@@ -939,8 +1033,10 @@ def main() -> None:
                         severity=severity,
                     )
             if existing:
-                logger.info("Rehydrated %d active/resolving incidents from UC after restart",
-                            len(active_incidents))
+                logger.info(
+                    "Rehydrated %d of %d active/resolving incidents after restart",
+                    len(active_incidents), len(existing),
+                )
         except Exception as e:  # noqa: BLE001
             logger.warning("Rehydration of active incidents failed: %s", str(e)[:200])
     # ----------------------------------------------------------------------
@@ -1062,6 +1158,11 @@ def main() -> None:
     logger.info("Sensor synthesizer ready: %d sensor definitions across all machines",
                 sensors_synth.sensor_count)
 
+    # Shift-to-date availability/performance. The producer is the only caller
+    # that sees every tick of a shift, so it is the only one that can report
+    # what ``*_to_now`` claims; see line_kpi_derived.ShiftKpiAccumulator.
+    kpi_accumulator = ShiftKpiAccumulator(shift_id=shift_id)
+
     logger.info("Producer starting: catalog=%s.%s shift=%s tick=%ss machines=%d start_fresh=%s",
                 catalog, schema, shift_id, tick_s, len(specs), start_fresh)
 
@@ -1088,6 +1189,9 @@ def main() -> None:
                     cumulative_cases,
                 )
                 cumulative_cases = 0.0
+                # Same boundary, same reason: shift-to-date OEE must not carry
+                # the previous shift's downtime into this one.
+                kpi_accumulator.reset()
                 current_window_start = win_start
 
             # ── Poll for new incidents ────────────────────────────────
@@ -1111,6 +1215,17 @@ def main() -> None:
                         commands.set_status(cid, "active")
                         logger.info("Incident started: %s on %s", sid, affected)
                     else:
+                        # apply_incident matched no machine: an unknown
+                        # scenario_id, or a target that is not on this line.
+                        # The row goes terminal either way, but silently doing
+                        # so is how "I clicked Trigger and nothing happened"
+                        # became unattributable — say which input was wrong.
+                        logger.warning(
+                            "Command %s applied to nothing (scenario=%r target=%r): "
+                            "unknown scenario or a machine not on this line; "
+                            "marking resolved",
+                            cid, sid, target,
+                        )
                         commands.set_status(cid, "resolved")
 
             # ── Poll for resolve requests ─────────────────────────────
@@ -1118,7 +1233,7 @@ def main() -> None:
                 for cmd in commands.fetch_resolve_requested():
                     cid = str(cmd["command_id"])
                     commands.set_status(cid, "resolving")
-                    incident = active_incidents.pop(cid, None)
+                    incident = incident_for_resolve(cmd, active_incidents, state)
                     if incident:
                         resolve_incident(state, incident.target_machines)
                         if incident.scenario_id == "material_shortage":
@@ -1161,6 +1276,7 @@ def main() -> None:
                 state, shift_id, now_us,
                 exclude_from_speed=conveyor_ids,
                 cumulative_cases=cumulative_cases,
+                accumulator=kpi_accumulator,
                 machine_rows=rows,
             )
             _ingest(streams, kpi, label="line_kpi")

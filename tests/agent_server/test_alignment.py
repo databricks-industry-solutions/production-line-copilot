@@ -75,6 +75,7 @@ class TestResolveScorers:
 
     def test_fallback_when_no_aligned_judge(self, monkeypatch):
         import mlflow.genai.scorers as scorers_mod
+
         from evaluations.run_eval import resolve_scorers
 
         def _boom(*a, **k):

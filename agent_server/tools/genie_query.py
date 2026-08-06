@@ -75,6 +75,48 @@ def _make_headers() -> tuple[dict, str]:
     raise RuntimeError("Cannot authenticate to Databricks for Genie API")
 
 
+_SPACE_RESOLVES_CACHE: dict[str, tuple[bool, float]] = {}
+_SPACE_RESOLVES_TTL = 300.0
+
+
+def space_resolves(space_id: str | None = None) -> bool:
+    """Whether the configured Genie space actually exists and is reachable.
+
+    A configured id is not the same as a live space. Dev's space was trashed by
+    a teardown and the app went on advertising itself as Genie-enabled, because
+    the only check was that the env var was non-empty — so every ``genie_query``
+    failed while the System Map showed the streaming space as present. This is
+    the difference between "someone set a variable" and "the thing is there".
+
+    Cached for five minutes: the System Map polls, and a GET per poll would put
+    a network round-trip on a panel that only needs to know whether the wiring
+    is intact.
+    """
+    space = (space_id or _SPACE_ID or "").strip()
+    if not space:
+        return False
+    cached = _SPACE_RESOLVES_CACHE.get(space)
+    if cached and time.time() - cached[1] < _SPACE_RESOLVES_TTL:
+        return cached[0]
+    try:
+        headers, host = _make_headers()
+        resp = requests.get(f"{host}/api/2.0/genie/spaces/{space}", headers=headers, timeout=10)
+        ok = resp.status_code == 200
+        if not ok:
+            logger.warning(
+                "Genie space %s does not resolve (HTTP %s) — genie_query will fail "
+                "until GENIE_SPACE_ID points at a live space",
+                space, resp.status_code,
+            )
+    except Exception:  # noqa: BLE001
+        logger.warning("Could not verify Genie space %s", space, exc_info=True)
+        # Unreachable is not the same as absent, and reporting a transient
+        # network fault as "not configured" would be its own false alarm.
+        return True
+    _SPACE_RESOLVES_CACHE[space] = (ok, time.time())
+    return ok
+
+
 def _poll_message(headers: dict, host: str, space_id: str, conv_id: str, msg_id: str) -> dict:
     """Poll until the Genie message reaches a terminal state."""
     url = f"{host}/api/2.0/genie/spaces/{space_id}/conversations/{conv_id}/messages/{msg_id}"

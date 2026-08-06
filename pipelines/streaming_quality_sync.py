@@ -102,6 +102,7 @@ import os
 import pathlib
 import sys
 import time
+from typing import Any
 
 
 def _ensure_repo_on_path() -> None:
@@ -708,7 +709,9 @@ def _mvm_merge(source_df: DataFrame, mvm_key: str, batch_id: int) -> None:
         return
     try:
         from agent_server.serving.silver_mapper import (
-            MAPPINGS, build_merge, introspect_sql,
+            MAPPINGS,
+            build_merge,
+            introspect_sql,
         )
     except Exception:
         logger.exception("[mvm:%s] silver_mapper import failed (non-fatal)", mvm_key)
@@ -983,16 +986,26 @@ def _start_stream(
     # caught and the first offset is committed; once a checkpoint offset exists the
     # option would be ignored anyway, so high-volume streams (line_kpi/inventory)
     # that already have committed offsets are unaffected (no history replay).
-    # ``ignoreDeletes`` so a delete-only commit on the bronze source (GDPR
-    # erasure, retention pruning, OPTIMIZE/VACUUM rewrites, or an operator
-    # cleaning out synthetic rows) is skipped instead of failing the whole
-    # continuous stream with "Detected deleted data ... not supported". We only
-    # ever append to bronze in normal operation, so this changes nothing at
-    # steady state; it just keeps the stream alive across incidental deletes.
+    # ``ignoreChanges`` so a commit that rewrites files on the bronze source
+    # (GDPR erasure, retention pruning, OPTIMIZE/VACUUM, or an operator closing
+    # a stuck event by setting timestamp_end) does not fail the stream. We only
+    # ever append in normal operation, so this changes nothing at steady state.
+    #
+    # It replaces ``ignoreDeletes``, which covered only delete-only commits. An
+    # UPDATE raised DELTA_SOURCE_TABLE_IGNORE_CHANGES instead, and that killed
+    # the stream permanently: one repair to a single row of event_log_bronze in
+    # dev stopped the live event feed for six hours while the job went on
+    # reporting the stream as drained every cycle. The operator saw an event
+    # board frozen at the moment of the repair with nothing anywhere saying why.
+    #
+    # ignoreChanges rather than skipChangeCommits, because re-emitting a
+    # rewritten file is not just harmless here but correct: every sink upserts
+    # on its primary key, so the repair propagates to the serving table instead
+    # of being silently dropped on the floor.
     reader = (
         spark.readStream.format("delta")
              .option("maxFilesPerTrigger", 50)
-             .option("ignoreDeletes", "true")
+             .option("ignoreChanges", "true")
              .table(bronze_table)
     )
     if transform is not None:
@@ -1187,6 +1200,13 @@ def main() -> None:
             ("quality_checks_bronze", quality_sink, "quality_checks", None)
         )
 
+    # Handles to the queries this cycle started, by stream name. Awaiting via
+    # ``spark.streams.active`` instead loses every query that has already
+    # failed — it is gone from the active list by the time the loop runs — so a
+    # stream dying on every single cycle produced no log line at all, while the
+    # cycle summary went on naming it as drained.
+    started_queries: dict[str, Any] = {}
+
     def _drain_once() -> tuple[list[str], list[str]]:
         """Start every available stream once, await all to terminate.
 
@@ -1206,7 +1226,7 @@ def main() -> None:
                                name, bronze_fq)
                 continue
             try:
-                _start_stream(
+                query = _start_stream(
                     spark, bronze_fq, sink,
                     name=name,
                     trigger_millis=TRIGGER_MILLIS,
@@ -1214,6 +1234,7 @@ def main() -> None:
                     transform=transform,
                 )
                 started_local.append(name)
+                started_queries[name] = query
             except Exception:
                 logger.exception("[%s] failed to start stream", name)
         return started_local, skipped_local
@@ -1236,6 +1257,7 @@ def main() -> None:
         while True:
             cycle += 1
             cycle_started_at = time.time()
+            started_queries.clear()
             started, skipped = _drain_once()
             if not started:
                 logger.warning(
@@ -1244,20 +1266,35 @@ def main() -> None:
                     cycle, skipped, cycle_sleep_s,
                 )
             else:
-                logger.info(
-                    "Cycle %d: drained streams=%s skipped=%s",
-                    cycle, started, skipped,
-                )
                 # Wait for ALL streams to drain and terminate (each
-                # availableNow query is single-shot).
-                for q in spark.streams.active:
+                # availableNow query is single-shot), then report what actually
+                # happened. Starting is not draining: the summary used to be
+                # logged off the started list before a single query had run, so
+                # a stream that failed every cycle was reported as drained every
+                # cycle.
+                drained: list[str] = []
+                failed: list[str] = []
+                for name, q in started_queries.items():
                     try:
                         q.awaitTermination()
+                        drained.append(name)
                     except Exception:
+                        failed.append(name)
                         logger.exception(
-                            "Cycle %d: stream %s terminated with error",
-                            cycle, q.name,
+                            "Cycle %d: stream %s terminated with error — its "
+                            "serving table is now stale and stays stale until "
+                            "this is fixed", cycle, name,
                         )
+                if failed:
+                    logger.error(
+                        "Cycle %d: drained=%s FAILED=%s skipped=%s",
+                        cycle, drained, failed, skipped,
+                    )
+                else:
+                    logger.info(
+                        "Cycle %d: drained streams=%s skipped=%s",
+                        cycle, drained, skipped,
+                    )
             elapsed = time.time() - cycle_started_at
             sleep_for = max(1.0, cycle_sleep_s - elapsed)
             logger.info(

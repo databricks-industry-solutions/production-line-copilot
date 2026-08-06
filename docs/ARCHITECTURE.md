@@ -79,7 +79,7 @@ The tick loop is **deterministic**: no randomness in `cascade_tick`. Sensor-leve
 
 ## GenAI Specialist Agents
 
-The orchestrator (`agent_server/agent.py`) routes each query to one of eight LangGraph ReAct agents. When an incident is active, routing is deterministic (via `INCIDENT_TO_SPECIALIST`). Otherwise an LLM classification call with `max_tokens=50` picks the specialist. All agents use `langgraph.prebuilt.create_react_agent` with a `recursion_limit` of 10.
+The orchestrator (`agent_server/agent.py`) routes each query to one of eight LangGraph ReAct agents. When an incident is active, routing is deterministic (via `INCIDENT_TO_SPECIALIST`). Otherwise an LLM classification call with `max_tokens=50` picks the specialist. All eight are built with `langchain.agents.create_agent` and run with a `recursion_limit` of 16 (`SPECIALIST_RECURSION_LIMIT`, env-overridable). LangGraph counts super-steps and one ReAct round costs two, so 16 allows seven rounds — enough for a specialist to recover from a query that names a column which does not exist, which the previous value of 10 was not.
 
 Each role runs on the model that suits its work rather than on one shared endpoint. All of them are Databricks Foundation Model APIs, so six vendors sit behind one API, one set of Unity Catalog permissions and one bill — swapping a vendor is a config line, not an integration. `agent_server/model_roster.py` holds the assignments and the reasoning; the About tab renders what is actually resolved in your workspace.
 
@@ -161,6 +161,50 @@ It would have been easier to show the model's own reasoning instead — some mod
 
 Row counts are reported honestly. Both tools truncate — Genie keeps 20 rows, `sql_query` appends `LIMIT 500` when the model omits one — so a count landing exactly on the cap renders as `20+` rather than being presented as the size of the result set.
 
+### What streams, and what is only a draft
+
+`/invocations/stream` emits five kinds of frame: a `snapshot` within about a
+second so the user sees something immediately, a `status` naming the specialist
+once routing decides, `tool_update` per tool call, `token` fragments as the
+model writes, and finally a single `answer` carrying the authoritative text
+plus the tool trace, reasoning steps and trace URL.
+
+For a long time only the middle of that list was true. The specialist's output
+was accumulated in the worker thread and released whole, so what streamed was
+the tool trace: chips animated, then a finished answer appeared in one jump.
+The ReAct loop is now consumed in both `updates` and `messages` mode — the
+first builds the tool trace, the second carries tokens — which adds no latency,
+because those tokens were already crossing the wire and were simply being held.
+
+Three details are easy to get wrong and each was verified against a live
+endpoint rather than assumed:
+
+- **The tools node emits on the same stream.** Forwarding everything types raw
+  tool JSON into the user's answer.
+- **Tool-call arguments arrive as fragments**, on chunks with empty content and
+  a populated `tool_call_chunks`. They are not prose.
+- **A preamble before a tool call is not the answer.** ReAct models think aloud,
+  call a tool, then write. That preamble is superseded server-side, so the
+  stream sends a `token_reset` when a tool result lands and the client drops
+  the draft; otherwise the visible text would be the model's thinking with the
+  real answer glued on the end.
+
+The streamed text stays a **draft** on the client, rendered as plain text in the
+thinking indicator and discarded when `answer` arrives. It has to be: a later
+reasoning round can replace it outright, and the synthesis pass rewrites short
+specialist answers into the sectioned format the message bubble parses. Parsing
+a half-written document would show sections appearing and rearranging as tokens
+land.
+
+A silent run gets a keep-alive. A question that calls no tools produces no
+frames at all between `status` and `answer` — one model call, potentially the
+full 90-second specialist timeout — and the app sits behind a proxy entitled to
+drop an idle connection, which surfaces to the user as a spinner that never
+resolves. The drain loop already woke once a second, so it now emits an SSE
+comment on each idle tick. Comments are skipped by the client's reader and are
+excluded from the token accounting, along with `token` frames, whose text
+arrives a second time in `answer`.
+
 ### The integration layer, and what it costs
 
 Swapping vendors is a config line because every role is built the same way — `ChatDatabricks(endpoint=..., max_tokens=...)` into `create_agent`, with no vendor branching anywhere in the app. Two defects in `databricks-langchain` leak through that interface, and both are worked around here rather than in the specialists:
@@ -204,11 +248,37 @@ python3 scripts/register_prompts.py --catalog <cat> --schema <schema> [--dry-run
 
 Three things about it are worth knowing before you trust what you see in the registry:
 
-- **The registry is a record, not a control surface.** The app does not read prompts back; the constants in `agent_server/prompts/` are the runtime source of truth. Editing a version in the UI changes nothing that runs. Registry-first loading is a deliberate follow-up — see the Backlog in `docs/ROADMAP.md`.
-- **A registered specialist prompt is not always the whole system prompt.** Specialists that own a governed domain get `governed_domain_prompt(<domain>)` appended at agent-construction time, and that text is empty when the domain has no Genie space provisioned, so it differs per deployment and cannot be pinned to a version. Those versions carry `governed_domain` and `runtime_suffix` tags saying so, so a reader comparing a trace against the registry doesn't mistake the difference for a stale registry.
-- **Brace syntax differs on each side.** The registry renders with Jinja (`{{var}}`) and the app formats with `str.format` (`{var}`). `agent_server/prompts/catalog.py` converts, but only for variables a prompt declares — a blanket regex would promote the literal `{"shift_id": ...}` JSON examples inside three system prompts into variables no call site fills.
+- **Whether the registry controls anything is a switch.** Every call site reads `prompt_text(slug)` from `agent_server/prompts/loader.py`, but the loader only consults the registry when `PROMPTS_FROM_REGISTRY` is set; otherwise it returns the constant in `agent_server/prompts/`. Turning it on changes what the model receives, so it belongs on dev first. Resolution happens once at startup — a registry blip cannot change behaviour mid-shift, and a prompt change needs a restart to take effect.
+- **A loaded prompt has to earn its place.** The loader falls back to the constant, per prompt, when the registry is unreachable, the version is blank, or the text no longer contains a variable its call site fills. That last check is the important one: the registry stores Jinja `{{var}}` and the app formats with `{var}`, and `str.format` renders an unconverted `{{var}}` as the literal text `{var}` instead of raising — a prompt that is quietly wrong rather than loudly broken.
+- **A registered specialist prompt is not the whole system prompt.** Specialists that own a governed domain get `governed_domain_prompt(<domain>)` appended at agent-construction time — 734–792 characters, about 15% of what the model receives — and it is empty when the domain has no Genie space provisioned. The suffix is registered on its own as `prompt_governed_domain_suffix`, and each governed specialist's version carries `governed_domain` and `runtime_suffix` tags, so the full prompt can be reassembled from the registry rather than appearing to be missing from it.
+- **Brace syntax differs on each side.** `agent_server/prompts/catalog.py` converts in both directions, but only for variables a prompt declares — a blanket regex would promote the literal `{"shift_id": ...}` JSON examples inside three system prompts into variables no call site fills.
 
-The catalogue is also the guard: a prompt constant that isn't in it would never be registered, and `tests/agent_server/test_prompt_catalog.py` fails when one appears.
+The catalogue is the guard against prompts going unversioned, in two directions. A prompt constant absent from it would never be registered, and a system prompt built from string literals anywhere outside `agent_server/prompts/` is a prompt no registry can see; `tests/agent_server/test_prompt_catalog.py` fails on either.
+
+### Similar-case retrieval runs on Vector Search, optionally
+
+`retrieve_similar_cases` answers "have we seen this before" by embedding the description an operator gave and searching past resolved events. It is wired into six of the eight specialists, and it is the one tool whose infrastructure is opt-in:
+
+```bash
+python3 scripts/provision_vector_search.py --catalog <cat> --schema <schema> \
+    --warehouse-id <id> --wait [--dry-run]
+```
+
+You do not normally run it by hand. Set `vector_search_endpoint` in `config/project-settings(.local).yaml` and `scripts/deploy.sh` provisions the endpoint and index, then re-syncs the case library on every later deploy. It is off by default for two reasons, and the second one surprises people: an endpoint bills by the hour whether or not anything queries it, and **the deploy that first creates one takes 15–40 minutes** — it is a one-time cost per environment, but it is long enough that the deploy looks hung, so the script now says which kind of run it is before it starts waiting. Clear the setting and the tool falls back to keyword matching over the same corpus, which is a real answer rather than an error.
+
+Everything above describes infrastructure. Whether the app can *use* it is a separate question, and for a long time the answer was no, invisibly. Two independent defects had to be fixed before a single semantic query ran in the deployed app:
+
+- **The client could not authenticate.** `VectorSearchClient()` with no arguments resolves credentials through MLflow, which wants `DATABRICKS_TOKEN` — a personal access token. A Databricks App is never issued one; it gets OAuth client credentials. Every call raised, and the `except` turned it into a keyword fallback. The app now passes its service principal explicitly, the same identity every other client here uses.
+- **The response parser read a key that does not exist.** Column names arrive under `manifest.columns`; `result` carries only `row_count` and `data_array`. Reading them from `result` raised `KeyError` on every response — again caught, again silently downgraded to keyword search. The unit test had encoded the invented shape, so the suite reported the semantic path as covered and passing.
+
+Both failures were survivable-looking by construction: the fallback returns sensible, well-formed results, so nothing downstream looked wrong while the endpoint sat online and billed. That is the argument for the `retrieval` field on every returned row — `vector_search` or `keyword` — and for the warning the fallback now logs.
+
+The shape follows current Databricks AI Search guidance (Vector Search was renamed in June 2026). A **standard** endpoint is correct here — the guidance points to storage-optimized only at 10M+ vectors, where 250–500ms query latency is an acceptable trade; a standard endpoint answers in 20–50ms and this corpus is 27 rows. A **Delta Sync index with managed embeddings** is the recommended option whenever the corpus already lives in a Delta table, which is why the fallback to a Direct Access index does not apply: Direct Access cannot use managed embeddings at all and would put embedding on us at both write and query time. Queries run as `query_type="HYBRID"` rather than pure ANN, because the guidance calls for hybrid "where domain-specific keywords are important" and an operator typing "capper misfeed" is exactly that case. Only the columns the tool reads are synced, and sync is triggered rather than continuous.
+
+Two details make the index buildable at all:
+
+- **It indexes a purpose-made table, not the event log.** The tool's whole value is `resolution_minutes`, `outcome_oee_impact` and `outcome_description` — what fixed it, how long it took, what it cost. Those are written to `event_log_bronze` and dropped by the quality gate before they reach `gold_history_event_log`, so an index over gold, the obvious source, fails on the column list. `event_case_library` joins the gated event back to its outcome fields, is written by `MERGE` so Change Data Feed stays coherent, and carries a `case_text` column concatenating description, root cause and corrective action — a Delta Sync index embeds exactly one column, and relevance lives across all three.
+- **The column list is a contract split across two files.** Vector Search fails a query outright if you request a column the index does not carry; there is no partial result. `tests/scripts/test_provision_vector_search.py` asserts the tool's list is a subset of what the provisioner syncs.
 
 ## Incident Scenarios
 
@@ -255,7 +325,7 @@ The following scenario IDs are recognised by the routing layer (`INCIDENT_TO_SPE
 │       ├── components/       # UI panels with data source badges
 │       └── lib/              # useSSELiveData, useIncidentApi hooks
 ├── server/                  # Express proxy (server.ts)
-├── config/queries/          # SQL queries for AppKit analytics
+├── config/queries/          # AppKit parameterised SQL (see note below)
 ├── scripts/                 # Deploy, bootstrap, init scripts
 │   └── deploy.sh                 # ./scripts/deploy.sh dev|prod
 ├── tests/                   # Unit + integration tests

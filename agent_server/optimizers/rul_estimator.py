@@ -63,7 +63,10 @@ class RULEstimator:
     ) -> dict:
         """Estimate RUL from a time-series of sensor readings.
 
-        Each reading: {"timestamp_minute": float (minutes from shift start), "value": float}
+        Each reading: {"timestamp_minute": float, "value": float}. The time
+        origin does not matter — the slope, and therefore the extrapolation, is
+        invariant to it — so minutes from the first reading are as good as
+        minutes from shift start.
         """
         if not sensor_readings or len(sensor_readings) < 3:
             return {
@@ -74,14 +77,64 @@ class RULEstimator:
                 "message": f"Need at least 3 readings, got {len(sensor_readings or [])}",
             }
 
-        thresholds = custom_thresholds or DEFAULT_ALARM_THRESHOLDS.get(
-            sensor_type, {"warning": 0, "critical": 0}
-        )
-        warning_threshold = thresholds.get("warning", 0)
-        critical_threshold = thresholds.get("critical", 0)
+        # An unknown sensor used to fall back to {"warning": 0, "critical": 0},
+        # and `current_value >= critical_threshold` is true for any positive
+        # reading against a threshold of zero — so every unrecognised sensor
+        # came back CRITICAL, "immediate maintenance required", stated with
+        # full confidence. The prompt makes this the normal case, not the edge:
+        # it tells the model to pick a real channel from `machine_sensors`,
+        # whose names are machine-specific and will not be one of the five
+        # below. Refusing is the only honest answer without a threshold.
+        thresholds = custom_thresholds or DEFAULT_ALARM_THRESHOLDS.get(sensor_type)
+        if not thresholds:
+            return {
+                "machine_id": machine_id,
+                "sensor_type": sensor_type,
+                "rul_minutes": None,
+                "confidence": "unknown_sensor_type",
+                "message": (
+                    f"No alarm thresholds known for sensor_type '{sensor_type}'. "
+                    "Pass custom_thresholds={'warning': <alarm_low>, 'critical': "
+                    "<alarm_high>} from the machine_sensors row for this sensor, "
+                    f"or use one of: {', '.join(sorted(DEFAULT_ALARM_THRESHOLDS))}."
+                ),
+            }
+        # Defaulting a missing threshold to 0 made every positive reading "past
+        # critical", which reads as a confident emergency rather than as the
+        # missing input it is. A half-specified threshold is not usable.
+        try:
+            warning_threshold = float(thresholds["warning"])
+            critical_threshold = float(thresholds["critical"])
+        except (KeyError, TypeError, ValueError):
+            return {
+                "machine_id": machine_id,
+                "sensor_type": sensor_type,
+                "rul_minutes": None,
+                "confidence": "incomplete_thresholds",
+                "message": (
+                    "custom_thresholds needs both 'warning' and 'critical' as "
+                    f"numbers; got {thresholds!r}. Take them from the "
+                    "machine_sensors row (alarm_low and alarm_high) for this sensor."
+                ),
+            }
 
-        times = [float(r["timestamp_minute"]) for r in sensor_readings]
-        values = [float(r["value"]) for r in sensor_readings]
+        try:
+            # `ts` is accepted because the maintenance_predictor prompt asked for
+            # it for months while this read `timestamp_minute` as a bare
+            # subscript, so every correctly-formed call raised KeyError.
+            times = [float(r.get("timestamp_minute", r.get("ts"))) for r in sensor_readings]
+            values = [float(r["value"]) for r in sensor_readings]
+        except (KeyError, TypeError, ValueError):
+            return {
+                "machine_id": machine_id,
+                "sensor_type": sensor_type,
+                "rul_minutes": None,
+                "confidence": "bad_input",
+                "message": (
+                    "Each reading needs a numeric 'timestamp_minute' (minutes, "
+                    "any origin) and a numeric 'value'."
+                ),
+            }
 
         slope, intercept, r_squared = _linear_regression(times, values)
 
@@ -174,24 +227,48 @@ class RULEstimator:
 
         failure_prob_at_half = 0.15
         failure_prob_at_full = 0.70
+        planned_cost = PLANNED_MAINTENANCE_COST_PER_MIN * PLANNED_MAINTENANCE_DURATION_MIN
+        unplanned_cost = UNPLANNED_DOWNTIME_COST_PER_MIN * 60
 
-        best_time = 0
-        best_cost = float("inf")
-
-        for frac in [i / 10 for i in range(1, 11)]:
+        # Cost per minute of service life, not cost per intervention.
+        #
+        # Comparing expected costs alone has no opposing term: the expected
+        # cost is planned_cost + p.(unplanned_cost - planned_cost), strictly
+        # increasing in p whenever an unplanned stop costs more than a planned
+        # one, and p never falls as you wait. The minimum was therefore always
+        # the first candidate, so the loop returned 10% of critical RUL for
+        # every input and the advertised trade-off was not modelled at all.
+        #
+        # What waiting actually buys is service life: maintain at 10% of RUL
+        # and you throw away the other 90% of the component. Dividing by the
+        # life obtained gives the standard age-replacement objective, where
+        # waiting lowers the denominator faster than risk raises the numerator
+        # until the failure curve turns over. The optimum is now interior and
+        # it moves with the economics — make planned maintenance dearer than
+        # an unplanned stop and it correctly says run to the end.
+        best = None
+        for step in range(1, 21):  # 5% steps, finer than the old decile grid
+            frac = step / 20
             wait_min = frac * rul_critical_min
-            p_fail = failure_prob_at_half + (failure_prob_at_full - failure_prob_at_half) * max(0, (frac - 0.5) / 0.5)
-            planned_cost = PLANNED_MAINTENANCE_COST_PER_MIN * PLANNED_MAINTENANCE_DURATION_MIN
-            unplanned_cost = p_fail * UNPLANNED_DOWNTIME_COST_PER_MIN * 60
-            expected_cost = (1 - p_fail) * planned_cost + unplanned_cost
-            if expected_cost < best_cost:
-                best_cost = expected_cost
-                best_time = wait_min
+            if frac <= 0.5:
+                p_fail = failure_prob_at_half * (frac / 0.5)
+            else:
+                p_fail = failure_prob_at_half + (failure_prob_at_full - failure_prob_at_half) * (frac - 0.5) / 0.5
+            expected_cost = (1 - p_fail) * planned_cost + p_fail * unplanned_cost
+            cost_rate = expected_cost / wait_min
+            if best is None or cost_rate < best[0]:
+                best = (cost_rate, wait_min, expected_cost, p_fail)
 
+        _rate, best_time, best_cost, best_p = best
         return {
             "recommended_in_minutes": round(best_time, 0),
-            "reasoning": f"Balances planned maintenance cost vs {UNPLANNED_DOWNTIME_COST_PER_MIN}€/min unplanned downtime risk",
+            "reasoning": (
+                f"Minimises cost per minute of service life: waiting longer spreads the "
+                f"{planned_cost:.0f}€ planned stop over more runtime, until the failure risk "
+                f"({best_p:.0%} here) outweighs it at {UNPLANNED_DOWNTIME_COST_PER_MIN}€/min"
+            ),
             "expected_cost_eur": round(best_cost, 0),
+            "failure_probability": round(best_p, 3),
         }
 
 
@@ -203,17 +280,28 @@ def estimate_rul(
     machine_id: str,
     sensor_readings: list[dict],
     sensor_type: str = "vibration",
+    custom_thresholds: dict | None = None,
 ) -> dict:
     """Estimate Remaining Useful Life (RUL) for a machine based on sensor trend data.
 
     Input sensor_readings: list of {timestamp_minute: float, value: float}.
-    sensor_type: one of 'vibration', 'temperature', 'motor_current', 'speed_drift', 'pressure'.
+    sensor_type: one of 'vibration', 'temperature', 'motor_current', 'speed_drift',
+    'pressure' — or any sensor name, if you also pass custom_thresholds.
+
+    custom_thresholds: {"warning": <alarm_low>, "critical": <alarm_high>} taken
+    from the machine_sensors row for the sensor. Required for any sensor outside
+    the five built-in types; both keys must be present.
 
     Returns RUL estimate in minutes (to warning and critical thresholds),
     risk level, degradation trend, and optimal maintenance timing recommendation
     with cost analysis."""
+    # This parameter was missing from the signature while the prompt instructed
+    # the model to pass it. LangChain drops arguments a tool does not declare,
+    # so every machine-specific sensor came back "unknown_sensor_type" — and the
+    # message told the model to do the very thing it had just done.
     return _estimator.estimate(
         machine_id=machine_id,
         sensor_readings=sensor_readings,
         sensor_type=sensor_type,
+        custom_thresholds=custom_thresholds,
     )

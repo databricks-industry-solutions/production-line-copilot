@@ -1,6 +1,6 @@
 [project]
 name = "productionline-copilot-agent-server"
-version = "0.3.5"
+version = "0.3.6"
 description = "LangGraph agent server for ProdLine CoPilot — multi-specialist GenAI system for production line operations"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.11"
@@ -60,6 +60,12 @@ ignore = ["E501"]
 "src/streaming_sim/*" = ["E402"]
 # Tests import modules after env/patch setup.
 "tests/*" = ["E402"]
+# A hand-written SQL splitter: a character-at-a-time state machine whose
+# `advance; continue` pairs read better on one line than spread over three.
+"scripts/install_industry_data_model.py" = ["E702"]
+# The shift-id helpers are imported below the logger on purpose, to keep the
+# import cycle with agent_server.shift_ids one-directional.
+"agent_server/context_builder.py" = ["E402"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

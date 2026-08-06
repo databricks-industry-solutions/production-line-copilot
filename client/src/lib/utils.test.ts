@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { toNumber, formatPercent, formatPct, formatTimestamp, isoToEpoch, epochToIso } from './utils';
+import { toNumber, formatPercent, formatPct, formatTimestamp, isoToEpoch } from './utils';
 
 describe('toNumber', () => {
   it('returns number for number input', () => {
@@ -51,24 +51,19 @@ describe('formatPct', () => {
   });
 });
 
-describe('isoToEpoch / epochToIso', () => {
-  it('round-trips local-time ISO strings', () => {
-    const iso = '2025-01-01T14:00:00';
-    const epoch = isoToEpoch(iso);
-    expect(typeof epoch).toBe('number');
-    expect(epoch).toBeGreaterThan(0);
-
-    const back = epochToIso(epoch);
-    // epochToIso returns local-time ISO without Z suffix
-    expect(back).toBe('2025-01-01T14:00:00');
+describe('isoToEpoch', () => {
+  it('reads a zone-qualified backend timestamp', () => {
+    // The exact shape the serving layer sends.
+    expect(isoToEpoch('2026-08-06 13:57:24.899302+00:00'))
+      .toBe(Date.UTC(2026, 7, 6, 13, 57, 24, 899));
   });
 
-  it('returns format without Z or milliseconds', () => {
-    const epoch = isoToEpoch('2025-06-15T10:30:00');
-    const iso = epochToIso(epoch);
-    expect(iso).not.toContain('Z');
-    expect(iso).not.toContain('.');
-    expect(iso).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/);
+  it('agrees with shiftWindow, which does its arithmetic in UTC', () => {
+    expect(isoToEpoch('2026-08-06T06:00:00Z')).toBe(Date.UTC(2026, 7, 6, 6, 0, 0));
+  });
+
+  it('yields NaN for junk rather than a plausible wrong instant', () => {
+    expect(Number.isNaN(isoToEpoch('not a date'))).toBe(true);
   });
 });
 

@@ -128,12 +128,12 @@ def test_build_context_assembles_bundle(monkeypatch):
             }
         ],
         # deliberately out of physical order + an error sentinel to filter
-        "machine_state_enriched": [
+        "gold_history_machine_state": [
             {"machine_id": "FILLER", "ts": "2026-01-01T09:00:00"},
             {"machine_id": "DEPALLETIZER", "ts": "2026-01-01T09:00:00"},
             {"error": "transient"},
         ],
-        "line_kpi": [
+        "gold_history_line_kpi": [
             {
                 "oee_to_now": 0.75,
                 "availability_to_now": 0.9,
@@ -147,7 +147,7 @@ def test_build_context_assembles_bundle(monkeypatch):
         ],
         "production_schedule": [{"planned_cases": 5000}],
         "line_constraints": [{"name": "max_speed"}],
-        "event_log": [{"event_id": "e1"}],
+        "gold_history_event_log": [{"event_id": "e1"}],
     }
 
     def fake_pq(sql, params, label=""):
@@ -256,7 +256,7 @@ def test_build_context_dev_shift_resolves_reference_tables(monkeypatch):
         assert seen[ref_label] == "shift_1", ref_label
     # … while producer-written live tables keep the suffixed id
     for live_label in (
-        "machine_state_enriched", "event_log", "line_kpi",
-        "quality_checks", "inventory_status",
+        "gold_history_machine_state", "gold_history_event_log",
+        "gold_history_line_kpi", "quality_checks_bronze", "inventory_status",
     ):
         assert seen[live_label] == "shift_1_dev", live_label

@@ -81,6 +81,67 @@ class TestSerialisedBlockLists:
         assert message_text(_Msg(content)) == content
 
 
+class TestTheStreamedAnthropicShape:
+    """A complete JSON array with the answer concatenated onto the end of it.
+
+    Streaming accumulates ``AIMessageChunk`` content by string concatenation. On
+    Anthropic the first chunk carries the reasoning block already serialised, so
+    every prose chunk after it is appended *outside* the closing bracket. The
+    result parses as "JSON followed by extra data", which ``json.loads`` refuses
+    outright — so the guard returned None and the whole thing, base64 signature
+    and all, was rendered into the chat window as the answer.
+
+    Captured from a live prod stream: a 7,420-character payload of which 6,643
+    were an opaque reasoning signature.
+    """
+
+    def _payload(self, answer: str) -> str:
+        blocks = json.dumps(
+            [{
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": ""}],
+                "signature": "EqsmCnIIEBABGAIqQES6iRyL54PAPVIk0ze8qv1wQtXhXECS2AKg",
+            }]
+        )
+        return blocks + answer
+
+    def test_the_trailing_answer_is_recovered(self):
+        answer = "## Root Cause\n- **BFEV0024 (FILLER)**: ongoing `minor_stop`."
+        assert message_text(_Msg(self._payload(answer))) == answer
+
+    def test_the_reasoning_signature_does_not_reach_the_user(self):
+        out = message_text(_Msg(self._payload("## Root Cause\n- Starved infeed.")))
+        assert "signature" not in out
+        assert "EqsmCnIIEBABGAIqQES6iRyL54PAPVIk0ze8qv1wQtXhXECS2AKg" not in out
+        assert not out.lstrip().startswith("[{")
+
+    def test_a_text_block_and_a_trailing_tail_are_both_kept(self):
+        """Where the array itself carries prose, neither half may be dropped."""
+        content = json.dumps(
+            [
+                {"type": "reasoning", "summary": []},
+                {"type": "text", "text": "## Root Cause"},
+            ]
+        ) + "\n- Starved infeed."
+        assert message_text(_Msg(content)) == "## Root Cause\n- Starved infeed."
+
+    def test_a_pure_block_list_is_unaffected(self):
+        """raw_decode must not change the behaviour it already had."""
+        content = json.dumps(
+            [
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "x"}]},
+                {"type": "text", "text": "FILLER lost 13,104 cases."},
+            ]
+        )
+        assert message_text(_Msg(content)) == "FILLER lost 13,104 cases."
+
+    def test_prose_after_a_non_block_array_is_still_left_alone(self):
+        # The array parses, but carries no `type` key, so it is not a block list
+        # and the whole string must survive untouched.
+        prose = '[{"machine": "FILLER"}] is the row the query returned.'
+        assert message_text(_Msg(prose)) == prose
+
+
 class TestNativeBlockLists:
     """Some integrations hand back a real list rather than a serialised one."""
 
@@ -106,3 +167,47 @@ class TestTheRouterCrashThisPrevents:
         # and every question silently routed to "general".
         content = [{"type": "text", "text": " Downtime Analyst "}]
         assert message_text(_Msg(content)).strip().lower().replace(" ", "_") == "downtime_analyst"
+
+
+class TestTheNestedBoldTheChatWindowShowed:
+    """Two prompt rules collide: bullets lead with a bolded key value, and every
+    metric is bolded inline. Models apply the second inside the first and emit
+    ``**OEE **74.2%****``. Markdown has no nested bold, so the line manager sees
+    the asterisks. Captured verbatim from a production answer.
+    """
+
+    def test_the_lead_in_collapses_to_one_bold_span(self):
+        assert message_text(_Msg("- **OEE **74.2%****: below target.")) == (
+            "- **OEE 74.2%**: below target."
+        )
+
+    def test_no_stray_asterisk_runs_survive(self):
+        out = message_text(_Msg("- **Open stop on **FILLER****: event **BFEV0024** open."))
+        assert "****" not in out
+        assert out == "- **Open stop on FILLER**: event **BFEV0024** open."
+
+    def test_adjacent_bold_on_one_line_is_not_merged(self):
+        # The repair must not reach across two legitimately separate spans.
+        line = "- **Availability**: **36.1** min CIP, **28.9** min hold."
+        assert message_text(_Msg(line)) == line
+
+    def test_well_formed_bold_is_untouched(self):
+        line = "- **Performance loss**: lowest component at **85.6%**."
+        assert message_text(_Msg(line)) == line
+
+    def test_more_than_one_nested_span_per_answer(self):
+        out = message_text(_Msg("- **A **1****: x\n- **B **2****: y"))
+        assert out == "- **A 1**: x\n- **B 2**: y"
+
+    def test_it_is_idempotent(self):
+        once = message_text(_Msg("- **Cases **5,855****: behind plan."))
+        assert message_text(_Msg(once)) == once
+
+    def test_italics_and_plain_text_are_left_alone(self):
+        assert message_text(_Msg("*emphasis* and plain")) == "*emphasis* and plain"
+
+    def test_it_applies_to_the_streamed_anthropic_shape(self):
+        # The block-list-plus-prose form has to be unwrapped before the repair
+        # can see the markdown at all.
+        raw = '[{"type": "thinking", "thinking": "private"}]- **OEE **74.2%****: low.'
+        assert message_text(_Msg(raw)) == "- **OEE 74.2%**: low."

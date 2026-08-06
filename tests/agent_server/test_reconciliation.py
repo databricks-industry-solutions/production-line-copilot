@@ -22,7 +22,6 @@ import pytest
 
 from agent_server.serving import reconciliation as rc
 
-
 NOW = datetime(2026, 7, 30, 20, 0, 0, tzinfo=timezone.utc)
 START, END = rc.window_bounds(15, 120, NOW)
 

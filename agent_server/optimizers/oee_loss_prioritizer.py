@@ -24,32 +24,56 @@ class OEELossPrioritizer:
         performance_loss = sum(100 - s.get("performance", 100) for s in shifts)
         quality_loss = sum(100 - s.get("quality", 100) for s in shifts)
 
+        # A share must be measured against the total of the things being
+        # shared. OEE is multiplicative, so its gap (100 - A.P.Q) is not the
+        # sum of the three component gaps and cannot serve as that total:
+        # dividing each component by it let the shares sum past 100. At
+        # A = P = Q = 90 each category claimed 36.9% and the Pareto cumulative
+        # finished at 110.7%, which is impossible on the face of it and made
+        # the ROI ranking built on the same figures wrong too.
+        #
+        # total_oee_gap is still reported from the multiplicative figure,
+        # because that is the real gap to close. Only the split is additive.
+        loss_total = availability_loss + performance_loss + quality_loss
+
+        def share(loss: float) -> float:
+            return round(loss / loss_total * 100, 1) if loss_total else 0
+
         categories = [
             {
                 "category": "Availability",
                 "total_loss_pct": round(availability_loss / n, 1),
-                "contribution_pct": round(availability_loss / total_gap * 100, 1) if total_gap else 0,
+                "contribution_pct": share(availability_loss),
                 "top_drivers": self._availability_drivers(shifts),
             },
             {
                 "category": "Performance",
                 "total_loss_pct": round(performance_loss / n, 1),
-                "contribution_pct": round(performance_loss / total_gap * 100, 1) if total_gap else 0,
+                "contribution_pct": share(performance_loss),
                 "top_drivers": self._performance_drivers(shifts),
             },
             {
                 "category": "Quality",
                 "total_loss_pct": round(quality_loss / n, 1),
-                "contribution_pct": round(quality_loss / total_gap * 100, 1) if total_gap else 0,
+                "contribution_pct": share(quality_loss),
                 "top_drivers": self._quality_drivers(shifts),
             },
         ]
         categories.sort(key=lambda c: c["contribution_pct"], reverse=True)
 
+        # Accumulate the unrounded shares. Summing the rounded ones lets the
+        # last row land on 99.9 or 100.1, and the last row of a Pareto is the
+        # one people check.
+        exact = {"Availability": availability_loss, "Performance": performance_loss,
+                 "Quality": quality_loss}
         cumulative = 0.0
-        for cat in categories:
-            cumulative += cat["contribution_pct"]
-            cat["cumulative_pct"] = round(cumulative, 1)
+        for i, cat in enumerate(categories):
+            cumulative += exact[cat["category"]]
+            cat["cumulative_pct"] = (
+                100.0 if i == len(categories) - 1 and loss_total
+                else round(cumulative / loss_total * 100, 1) if loss_total
+                else 0
+            )
             cat["roi_estimate"] = self._estimate_roi(cat)
 
         return {"total_oee_gap": round(total_gap / n, 1), "pareto": categories}

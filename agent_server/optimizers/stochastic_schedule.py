@@ -14,6 +14,8 @@ import random
 
 from langchain_core.tools import tool
 
+from agent_server.optimizers._units import BOTTLES_PER_CASE, as_fraction, cases_from_bpm
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -42,6 +44,8 @@ def _generate_scenarios(
 ) -> list[dict]:
     """Generate N scenarios of effective production minutes and OEE."""
     rng = random.Random()
+    current_oee = as_fraction(current_oee)
+
     scenarios = []
     for _ in range(n):
         sim_remaining = remaining_minutes
@@ -121,7 +125,7 @@ class StochasticScheduleOptimizer:
             for i, sc in enumerate(scenarios):
                 sf = solver2.NumVar(0, remaining_cases, f"sf_{i}")
                 rate_const = cand_speed * sc["oee"] * sc["micro_stop_factor"]
-                solver2.Add(sf >= remaining_cases - rate_const * (sc["effective_minutes"] + ot) / 60.0)
+                solver2.Add(sf >= remaining_cases - rate_const * (sc["effective_minutes"] + ot) / BOTTLES_PER_CASE)
                 shortfall_vars.append(sf)
 
             expected_shortfall = sum(shortfall_vars) / S
@@ -151,7 +155,7 @@ class StochasticScheduleOptimizer:
                     for sc in scenarios:
                         avail = sc["effective_minutes"] + chosen_ot
                         eff_rate = cand_speed * sc["oee"] * sc["micro_stop_factor"]
-                        prod_estimates.append(int(eff_rate * avail / 60))
+                        prod_estimates.append(int(cases_from_bpm(eff_rate, avail)))
                     prod_estimates.sort()
 
                     best_result = {
@@ -189,7 +193,7 @@ class StochasticScheduleOptimizer:
                 for sc in scenarios:
                     avail = sc["effective_minutes"] + ot_min
                     eff_rate = s_bpm * sc["oee"] * sc["micro_stop_factor"]
-                    produced = int(eff_rate * avail / 60)
+                    produced = int(cases_from_bpm(eff_rate, avail))
                     prod_list.append(produced)
                     total_shortfall += max(0, remaining_cases - produced)
 

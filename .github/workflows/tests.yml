@@ -1,0 +1,82 @@
+name: Tests
+
+# The suite is large and genuinely behavioural, but until now nothing forced it
+# to pass: the only other workflows validate the bundle and publish docs, so a
+# pull request with failing tests, lint errors or type errors could merge on a
+# green tick. This is the gate.
+#
+# Deliberately hermetic. Every job here runs without a Databricks workspace, a
+# warehouse, or any secret, so it works identically on forks — the one existing
+# workspace-dependent check already skips itself when its variable is unset,
+# which is exactly the failure mode this workflow is meant to remove.
+#
+# Both jobs call scripts/check.sh, which is also what a developer runs locally.
+# That matters more than it usually would: some GitHub Enterprise organisations
+# disable hosted runners, and on such a repository these jobs cannot start at
+# all — they report failure with "hosted runners are disabled" without having
+# run a test. If that is your fork, the gate is `./scripts/check.sh`, and it is
+# the same gate; wire it to a pre-push hook or enable runners.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python — pytest + ruff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        # Not --frozen. What actually has to hold of the lockfile — that it
+        # records this project's version and resolves only against public
+        # PyPI — is asserted by tests/test_lockfile_is_publicly_resolvable.py
+        # and tests/scripts/test_lockfile_in_sync.py, which run below. Failing
+        # the install on a re-resolution instead would just be noise.
+        run: uv sync --all-extras --dev
+
+      # Same script a developer runs, so the two definitions of "passing"
+      # cannot drift into green-here-broken-there.
+      - name: Lint and test
+        run: ./scripts/check.sh python
+
+  client:
+    name: Client — vitest + eslint + tsc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        # The prepare/postinstall hooks call the appkit CLI, which reaches for
+        # workspace config we deliberately do not have here.
+        run: npm ci --ignore-scripts
+
+      - name: Typecheck, lint and test
+        run: ./scripts/check.sh client
+
+# Not gated here: the Playwright smoke run. Its webServer command is
+# `npm run dev`, which boots the real server against a warehouse and a Lakebase
+# instance, so on a secretless runner it fails for reasons that have nothing to
+# do with the change under review. A gate that is red by default is a gate
+# everyone learns to ignore. Run it locally with `npm run test:smoke`; making it
+# CI-worthy means giving the dev server a no-workspace mode first.

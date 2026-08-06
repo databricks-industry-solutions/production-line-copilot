@@ -126,7 +126,7 @@ Confirm continuous jobs are running (shipped **UNPAUSED**):
 
 `deploy.sh` runs `scripts/init_lakebase_role.py` for the **App SP** and **Producer SP** after bundle deploy. The app runtime resolves its Postgres user from injected **`DATABRICKS_CLIENT_ID`** (not a static `PGUSER` in config).
 
-For manual grants on `ai_serving` / `ai_chatbot`, run `scripts/grant_app_schemas_lakebase.sql` with the app's service principal UUID.
+That script now creates `ai_serving` and `ai_chatbot` before granting on them, and grants both. It used to grant only `ai_serving`, and it ran before the app had ever connected — so on a first deploy the grant failed against a schema that did not exist yet, and chat persistence needed `scripts/grant_app_schemas_lakebase.sql` run by hand. That file remains only for repairing a Lakebase deployed before this change.
 
 ### 3) Zerobus producer job
 

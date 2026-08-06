@@ -13,7 +13,7 @@ from langchain_core.messages import SystemMessage
 
 from agent_server.model_roster import resolve
 from agent_server.optimizers.rul_estimator import estimate_rul
-from agent_server.prompts.maintenance_predictor import MAINTENANCE_PREDICTOR_SYSTEM
+from agent_server.prompts.loader import prompt_text
 from agent_server.tools.anomaly_detector import detect_anomalies
 from agent_server.tools.calculator import calculator
 from agent_server.tools.governed_domain_query import (
@@ -27,7 +27,7 @@ from agent_server.tools.sql_query import sql_query
 
 def create_maintenance_predictor():
     """Build the ReAct agent registered as 'maintenance_predictor'."""
-    llm = ChatDatabricks(endpoint=resolve("maintenance_predictor"), max_tokens=2048)
+    llm = ChatDatabricks(endpoint=resolve("maintenance_predictor"))
     tools = [
         sql_query, load_plan_and_constraints, calculator,
         retrieve_similar_cases, detect_anomalies, estimate_rul,
@@ -38,6 +38,7 @@ def create_maintenance_predictor():
         model=llm,
         tools=tools,
         system_prompt=SystemMessage(
-            content=MAINTENANCE_PREDICTOR_SYSTEM + governed_domain_prompt("asset"),
+            content=prompt_text("maintenance_predictor_system")
+            + governed_domain_prompt("asset"),
         ),
     )

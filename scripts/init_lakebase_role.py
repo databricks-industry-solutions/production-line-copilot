@@ -38,6 +38,7 @@ import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 
 def _run(cmd: list[str]) -> str:
@@ -147,17 +148,101 @@ def _grant_pg_access(
     )
     conn.autocommit = True
     cur = conn.cursor()
+
+    # Fail fast instead of queueing behind a lock. This step runs ALTER TABLE
+    # against ai_serving.scenario_commands, which needs ACCESS EXCLUSIVE, while
+    # the app and both producers are reading the same table every second. A
+    # single reader left idle-in-transaction is enough to park the ALTER
+    # indefinitely — and because an exclusive request queues ahead of later
+    # readers, every producer poll then blocks behind *it*. Observed on a dev
+    # deploy: the ALTER waited 14 minutes and took both environments' incident
+    # handling down with it while it waited.
+    #
+    # With a timeout the DDL raises, the deploy reports it, and nothing else is
+    # held hostage. Retrying is cheap; the statements are all IF NOT EXISTS.
+    cur.execute("SET lock_timeout = '5s'")
+
+    # Create the schemas before granting on them. This step runs on the very
+    # first deploy, before the app has ever connected — and the app is what
+    # creates ai_serving and ai_chatbot. So `GRANT USAGE ON SCHEMA ai_serving`
+    # used to raise "schema does not exist", abort the rest of the loop, and
+    # leave the deploy printing a warning it then continued past. The app came
+    # up later, created the schemas itself, and never got its grants.
+    #
+    # ai_chatbot matters as much as ai_serving: it holds conversations and
+    # messages. It was missing from this list entirely, which is why chat
+    # persistence needed scripts/grant_app_schemas_lakebase.sql run by hand.
     stmts = [
-        f'GRANT USAGE ON SCHEMA ai_serving TO "{sp_client_id}"',
-        f'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA ai_serving TO "{sp_client_id}"',
-        f'ALTER DEFAULT PRIVILEGES IN SCHEMA ai_serving GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO "{sp_client_id}"',
-        f'GRANT USAGE, CREATE ON SCHEMA public TO "{sp_client_id}"',
+        "CREATE SCHEMA IF NOT EXISTS ai_serving",
+        "CREATE SCHEMA IF NOT EXISTS ai_chatbot",
     ]
+    for schema in ("ai_serving", "ai_chatbot"):
+        stmts += [
+            f'GRANT USAGE, CREATE ON SCHEMA {schema} TO "{sp_client_id}"',
+            f'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA {schema} '
+            f'TO "{sp_client_id}"',
+            f'ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} '
+            f'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO "{sp_client_id}"',
+        ]
+    stmts.append(f'GRANT USAGE, CREATE ON SCHEMA public TO "{sp_client_id}"')
+
+    failures = 0
     for s in stmts:
-        cur.execute(s)
-        print(f"  ok: {s[:70]}{'…' if len(s) > 70 else ''}")
+        # One bad grant should not cost the app every later one. Reported at
+        # the end so a partial failure is loud rather than buried mid-scroll.
+        try:
+            cur.execute(s)
+            print(f"  ok: {s[:70]}{'…' if len(s) > 70 else ''}")
+        except Exception as exc:  # noqa: BLE001 - reported below
+            failures += 1
+            print(f"  FAILED: {s[:70]} -> {str(exc)[:120]}")
+    if failures:
+        raise RuntimeError(
+            f"{failures} of {len(stmts)} Lakebase grants failed — the app will hit "
+            "'permission denied for schema' at runtime. Re-run this script once the "
+            "admin role can create/grant on ai_serving and ai_chatbot."
+        )
+
+    _create_app_tables(cur)
+
     cur.close()
     conn.close()
+
+
+def _create_app_tables(cur) -> None:
+    """Create the ai_serving / ai_chatbot tables, as the deployer.
+
+    These used to be created lazily by the app on its first Postgres
+    connection, which made them depend on someone opening the UI — and the
+    streaming quality-sync job dual-writes into ai_serving.* from its very
+    first micro-batch. On a fresh workspace the stream reliably lost that race
+    and died on `relation "ai_serving.event_log_recent" does not exist`,
+    which in turn meant no gold_history tables and a line UI showing zero
+    machines.
+
+    The app keeps its own lazy init as a fallback for anyone running against a
+    Lakebase this script never touched. pg_pool._INIT_SQL stays the single
+    definition of the schema; this just runs it earlier, as an identity that
+    can also CREATE SCHEMA.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from agent_server.memory.pg_pool import _INIT_SQL, iter_statements
+
+    print("Creating ai_serving + ai_chatbot tables")
+    created = failed = 0
+    for stmt in iter_statements(_INIT_SQL):
+        try:
+            cur.execute(stmt)
+            created += 1
+        except Exception as exc:  # noqa: BLE001 - reported in aggregate
+            failed += 1
+            print(f"  FAILED: {stmt.splitlines()[0][:70]} -> {str(exc).strip()[:140]}")
+    print(f"  {created} statement(s) applied, {failed} failed")
+    if failed:
+        raise RuntimeError(
+            f"{failed} Lakebase DDL statement(s) failed — the streaming job "
+            "dual-writes into ai_serving and will fail on its first batch."
+        )
 
 
 def main() -> None:

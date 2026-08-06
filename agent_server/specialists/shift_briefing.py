@@ -18,7 +18,7 @@ from langchain.agents import create_agent
 from langchain_core.messages import SystemMessage
 
 from agent_server.model_roster import resolve
-from agent_server.prompts.shift_briefing import SHIFT_BRIEFING_SYSTEM
+from agent_server.prompts.loader import prompt_text
 from agent_server.tools.calculator import calculator
 from agent_server.tools.genie_query import genie_query
 from agent_server.tools.plan_constraints_loader import load_plan_and_constraints
@@ -28,7 +28,7 @@ from agent_server.tools.sql_query import sql_query
 
 def create_shift_briefing():
     """Build the ReAct agent registered as 'shift_briefing'."""
-    llm = ChatDatabricks(endpoint=resolve("shift_briefing"), max_tokens=2048)
+    llm = ChatDatabricks(endpoint=resolve("shift_briefing"))
     tools = [
         sql_query,
         genie_query,
@@ -40,5 +40,5 @@ def create_shift_briefing():
     return create_agent(
         model=llm,
         tools=tools,
-        system_prompt=SystemMessage(content=SHIFT_BRIEFING_SYSTEM),
+        system_prompt=SystemMessage(content=prompt_text("shift_briefing_system")),
     )

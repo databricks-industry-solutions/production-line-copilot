@@ -31,6 +31,7 @@ import os
 
 from langchain_core.tools import BaseTool, StructuredTool
 
+from agent_server.prompts.loader import prompt_text
 from agent_server.tools.genie_query import run_genie_query
 
 logger = logging.getLogger(__name__)
@@ -173,16 +174,7 @@ def governed_domain_prompt(domain: str) -> str:
     """
     if not domain_space_id(domain):
         return ""
-    return (
-        f"\n\nYOUR GOVERNED DOMAIN SPACE (governed_{domain}_query):\n"
-        f"- You have a dedicated Genie space over the governed {domain} domain: "
-        f"{_entity_prose(domain)}.\n"
-        "- Prefer it for open-ended or exploratory questions about that domain, "
-        "and for governed/enterprise phrasing (equipment register, PM schedule, "
-        "NCR, stock balance, plan-vs-actual).\n"
-        "- Prefer sql_query for the live streaming tables, for anything "
-        "time-critical, and whenever you already know the exact query — it is "
-        "faster and deterministic. Genie is a round trip.\n"
-        "- The space covers ONLY your domain. Do not ask it about other domains; "
-        "use sql_query with fully qualified names for cross-domain questions."
+    return prompt_text("governed_domain_suffix").format(
+        domain=domain,
+        entities=_entity_prose(domain),
     )

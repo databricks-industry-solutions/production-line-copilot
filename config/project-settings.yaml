@@ -73,6 +73,21 @@ profiles:
     # MERGE-upserts each micro-batch into the MVM fact tables at seconds latency
     # (no separate 30-min batch refresh). Requires mvm_catalog set. Ships OFF.
     mvm_silver_enabled: false
+    # Semantic retrieval for retrieve_similar_cases (the downtime analyst's
+    # "what did we do last time this happened" tool). Ships OFF: empty means
+    # that tool ranks past events by keyword overlap, which works and costs
+    # nothing.
+    #
+    # Setting a name here — 'prodline-copilot-vs' is the conventional one — makes
+    # deploy.sh create the endpoint and a Delta Sync index over the event
+    # history, and points the app at them. Two things to know before you do:
+    #
+    #   * The FIRST deploy that creates the endpoint takes roughly 15-40 minutes,
+    #     most of it waiting on provisioning. Later deploys re-use it and add
+    #     seconds. Budget for it or run that first deploy ahead of a demo.
+    #   * A Vector Search endpoint bills by the hour once it is online, whether
+    #     or not anything queries it. Clear this value to turn it back off.
+    vector_search_endpoint: ''
     lakebase_catalog: ''
     lakebase_schema: 'public'
     genie_space_id: 'SET_ME'
@@ -180,6 +195,10 @@ profiles:
     # MERGE-upserts each micro-batch into the MVM fact tables at seconds latency
     # (no separate 30-min batch refresh). Requires mvm_catalog set. Ships OFF.
     mvm_silver_enabled: false
+    # Semantic retrieval for retrieve_similar_cases. See the dev profile above
+    # for what setting this costs you: ~15-40 min on the deploy that first
+    # creates the endpoint, and hourly billing for as long as it stays online.
+    vector_search_endpoint: ''
     lakebase_catalog: ''
     lakebase_schema: 'public'
     genie_space_id: ''

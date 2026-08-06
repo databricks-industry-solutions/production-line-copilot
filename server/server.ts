@@ -68,12 +68,34 @@ async function proxyToAgent(res: Response, targetPath: string, opts: ProxyOption
     }
 
     const response = await fetch(`http://localhost:${AGENT_PORT}${targetPath}`, fetchOpts);
-    const data: unknown = await response.json();
-    if (forwardStatus) {
-      res.status(response.status).json(data);
-    } else {
-      res.json(data);
+
+    // Read as text first and decide. Calling .json() unconditionally meant any
+    // non-JSON upstream body — a uvicorn HTML 502, a truncated response, a
+    // proxy error page — threw a parse error that the catch below turned into
+    // "502: Unexpected token < in JSON", discarding the real status and the
+    // real message. An operator debugging a 500 from /ops/control/action was
+    // shown a 502 about JSON syntax.
+    const text = await response.text();
+    const contentType = response.headers.get('content-type') ?? '';
+    const status = forwardStatus ? response.status : 200;
+
+    if (contentType.includes('application/json')) {
+      try {
+        res.status(status).json(JSON.parse(text) as unknown);
+        return;
+      } catch {
+        // Declared JSON, wasn't. Fall through and forward it verbatim.
+      }
     }
+
+    if (response.ok && !text) {
+      res.status(status).json({});
+      return;
+    }
+    // Forward the upstream status even when we cannot forward its shape, so
+    // the caller sees 500 vs 404 vs 502 rather than a blanket gateway error.
+    res.status(forwardStatus ? response.status : response.ok ? 200 : response.status)
+      .json({ error: text || errorMessage, upstream_status: response.status });
   } catch (error: unknown) {
     const err = error as Error;
     res.status(502).json({ error: err?.message || errorMessage });

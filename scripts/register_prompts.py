@@ -72,14 +72,46 @@ def _tags(spec: PromptSpec) -> dict[str, str]:
     return tags
 
 
+# Phrases that mark a failure as "we could not talk to the registry" rather
+# than "the registry answered, and the prompt is not there". Checked first
+# because MLflow's credential error *explains* the DATABRICKS_CONFIG_PROFILE
+# fallback with the words "does not exist", which an unguarded "does not
+# exist" match reads as a missing prompt — and then re-registers all eleven.
+_UNREADABLE_MARKERS = (
+    "CREDENTIAL",
+    "AUTHENTICATION",
+    "UNAUTHORIZED",
+    "INVALID TOKEN",
+    "PERMISSION DENIED",
+    "REGISTRY URI",
+)
+
+
+class _Unreadable:
+    """Sentinel for "the registry could not be read"."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "UNREADABLE"
+
+
+UNREADABLE = _Unreadable()
+
+
 def _is_missing(exc: Exception) -> bool:
     """Whether ``exc`` means "no such prompt" rather than a real failure.
 
     Matched on the message because the REST error code arrives inside a generic
     ``RestException``, and importing the Databricks-specific exception type
-    here would make this script depend on which backend it is talking to.
+    here would make this script depend on which backend it is talking to. That
+    makes the match a blunt instrument, so anything that looks like a transport
+    or credentials problem is excluded before the not-found phrases are
+    considered: those errors are wordy, and their prose overlaps.
     """
     text = str(exc).upper()
+    if any(marker in text for marker in _UNREADABLE_MARKERS):
+        return False
     return "NOT_FOUND" in text or "DOES NOT EXIST" in text
 
 
@@ -96,20 +128,22 @@ def _latest(client, name: str):
     Takes the maximum version rather than the first result, so the answer does
     not depend on the server's ordering.
 
-    A lookup failure degrades to "unknown", which re-registers. Publishing a
-    redundant version is a worse outcome than skipping, but a far better one
-    than aborting a deploy over a read.
+    Returns ``UNREADABLE`` when the lookup itself failed. Treating that as
+    "never registered" is what makes a misconfigured deploy mint a fresh
+    version of every prompt: the read fails, the guard sees None, and eleven
+    identical versions land. The caller skips instead, which leaves the
+    registry as it was — recoverable, unlike churn.
     """
     try:
         versions = list(client.search_prompt_versions(name) or [])
-    except Exception as exc:  # noqa: BLE001 - any lookup failure means "unknown"
+    except Exception as exc:  # noqa: BLE001 - classified, not swallowed
         # A prompt that has never been registered raises NOT_FOUND rather than
         # returning empty. That is the expected first run against a fresh
-        # schema, so it stays quiet; anything else is worth seeing in the
-        # deploy log even though both paths go on to register.
-        if not _is_missing(exc):
-            print(f"  ! could not read existing versions ({type(exc).__name__}: {exc})")
-        return None
+        # schema, so it stays quiet; anything else is a read we cannot trust.
+        if _is_missing(exc):
+            return None
+        print(f"  ! could not read existing versions ({type(exc).__name__}: {exc})")
+        return UNREADABLE
     if not versions:
         return None
     return max(versions, key=lambda v: int(v.version))
@@ -136,7 +170,14 @@ def register_all(
         template = spec.registry_template
         print(f"- {name}")
 
-        existing = None if dry_run else _latest(client, name)
+        # The dry run reads too. Reads are free of consequence, and a plan that
+        # skips them can only ever say "new", which is both useless as a drift
+        # check and actively misleading in a deploy log.
+        existing = _latest(client, name)
+        if existing is UNREADABLE:
+            print("  ! skipped — registry unreadable, leaving it untouched")
+            continue
+
         if existing is not None and existing.template == template:
             print(f"  unchanged, still v{existing.version}")
             if not dry_run:
@@ -144,7 +185,11 @@ def register_all(
             continue
 
         if dry_run:
-            state = "would register v1 (new)" if existing is None else "would register a new version"
+            state = (
+                "would register v1 (new)"
+                if existing is None
+                else f"would register a new version (drifted from v{existing.version})"
+            )
             print(f"  {state}; {len(template)} chars, variables={list(spec.variables)}")
             continue
 

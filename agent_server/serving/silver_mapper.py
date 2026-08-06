@@ -204,7 +204,11 @@ MAPPINGS: list[Mapping] = [
             "number_of_stations": (
                 "CAST((SELECT COUNT(*) FROM {src}.machine_registry) AS STRING)"
             ),
-            "throughput_unit_of_measure": "'cases_per_min'",
+            # The line is measured end to end in bottle-equivalents/min (~300
+            # healthy), not cases: a 420 BPM line is 17.5 cases/min. Labelling
+            # it cases_per_min told anyone reading the governed model the line
+            # ran 24x faster than it does.
+            "throughput_unit_of_measure": "'bottles_per_min'",
             "created_timestamp": "current_timestamp()",
         },
     ),

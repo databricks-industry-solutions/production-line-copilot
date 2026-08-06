@@ -42,8 +42,8 @@ class TestExtractTables:
 
 class TestGenieTablesProvenance:
     def test_happy_path_includes_tables(self, monkeypatch):
-        from tests.agent_server.test_agent_tools import _FakeRequests, _invoke  # reuse fakes
         from agent_server.tools.genie_query import genie_query
+        from tests.agent_server.test_agent_tools import _FakeRequests, _invoke  # reuse fakes
 
         monkeypatch.setattr(gq, "_SPACE_ID", "sp1")
         monkeypatch.setattr(gq, "_make_headers",

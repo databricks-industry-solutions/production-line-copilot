@@ -11,6 +11,6 @@ SELECT
   performance_to_now,
   quality_to_now,
   oee_to_now
-FROM main.line_manager_ai_kit.line_kpi
+FROM main.line_manager_ai_kit.gold_history_line_kpi
 WHERE shift_id = :shift_id
 ORDER BY ts;

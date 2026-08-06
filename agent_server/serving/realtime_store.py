@@ -137,6 +137,73 @@ def read_event_log_recent(shift_id: str, limit: int = 200) -> list[dict[str, Any
     ) or []
 
 
+def mark_machine_events_resolved(
+    shift_id: str,
+    machine_id: str,
+    resolved_by: str = "operator",
+) -> int:
+    """Append a resolve marker for a machine's open events. Returns how many it closes.
+
+    ``event_log_recent`` is append-only, mirroring the Zerobus bronze ingest it
+    shadows, so an event is closed by a later ``event_type='resolved'`` row for
+    the same machine rather than by updating the original. The feed pairs them
+    on the machine's most recent marker, so one row closes everything open on
+    that machine — which is exactly what the producer emits per target machine.
+
+    This exists because Recover could only ever clear faults a producer command
+    was holding open. Events with no command behind them — most visibly the
+    carryover event the backfill seeds deliberately — had no route to closure at
+    all: Recover reported nothing to clear and the row sat on the operator board
+    until an eight-hour age-out hid it. Appending the marker here gives the
+    operator the same authority over a seeded row as over a live fault.
+
+    Writes nothing when the machine has no open event, so a repeated click
+    cannot litter the feed with markers.
+    """
+    import uuid
+
+    with transaction() as cur:
+        if cur is None:
+            logger.warning(
+                "mark_machine_events_resolved skipped: Lakebase unavailable "
+                "(shift_id=%s machine_id=%s)", shift_id, machine_id,
+            )
+            return 0
+        cur.execute(
+            """
+            SELECT count(*) FROM ai_serving.event_log_recent
+            WHERE shift_id = %s AND machine_id = %s
+              AND timestamp_end IS NULL AND event_type <> 'resolved'
+            """,
+            (shift_id, machine_id),
+        )
+        open_events = int((cur.fetchone() or [0])[0])
+        if not open_events:
+            return 0
+        cur.execute(
+            """
+            INSERT INTO ai_serving.event_log_recent (
+                event_id, shift_id, machine_id, event_type, severity,
+                timestamp_start, timestamp_end, duration_minutes,
+                root_cause, description, corrective_action
+            ) VALUES (%s, %s, %s, 'resolved', 'info', now(), now(), 0,
+                      '', %s, %s)
+            """,
+            (
+                f"EVT-{uuid.uuid4().hex[:10].upper()}",
+                shift_id,
+                machine_id,
+                f"Incident cleared by {resolved_by}",
+                "Marked recovered from the operator dashboard",
+            ),
+        )
+    logger.info(
+        "Closed %d open event(s) on %s (shift_id=%s) at the request of %s",
+        open_events, machine_id, shift_id, resolved_by,
+    )
+    return open_events
+
+
 def read_inventory_latest(shift_id: str) -> list[dict[str, Any]]:
     """All current inventory materials for ``shift_id`` (one row per material)."""
     return query(
@@ -365,7 +432,14 @@ def clear_history_tables(shift_id: str) -> None:
         logger.warning("clear_history_tables failed: %s", str(e)[:300])
 
 
-# ── Lakebase Autoscaling — synced-table reads ───────────────────────────────
+# ── Lakebase Autoscaling — synced-table reads (EXPERIMENTAL, not executed) ──
+#
+# Nothing below runs in any current deployment. It is reached only when
+# ``SSE_SOURCE=lakebase_autoscale``, and both environments read layer 2
+# (``ai_serving.*_latest``) because the Database Catalog wiring these tables
+# need is not deployed. Treat it as a worked reference for the autoscale
+# variant rather than as a tested code path: it has no coverage against a real
+# synced table, so assume it needs debugging before it serves a request.
 #
 # These mirror the quality-gate-validated gold Delta tables via Continuous Synced Tables. Unlike
 # ``ai_serving.*_latest`` (which are pre-collapsed by the streaming sync job),

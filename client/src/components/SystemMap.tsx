@@ -408,14 +408,7 @@ export default function SystemMap(props: SystemMapProps = {}) {
           )}
 
           <SectionLabel>+ also in this branch</SectionLabel>
-          <div className="mt-2 grid gap-1.5 sm:grid-cols-2">
-            <Leaf
-              name="Ask the line"
-              desc="Free-form analytics straight to Genie, with the generated SQL shown"
-              accent="bg-teal-500"
-              chips={[{ label: 'line ops genie', cls: OPS_CHIP }]}
-              tag="DIRECT · NO ORCHESTRATOR"
-            />
+          <div className="mt-2 grid gap-1.5">
             <Leaf
               name={`${OPTIMIZER_TOOLS.size} deterministic optimizers`}
               desc={`Behind the optimizer chips above: ${optimizerMethodList()}`}

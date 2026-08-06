@@ -187,6 +187,31 @@ def _scale(severity: str) -> dict[str, Any]:
 
 # ── Apply / resolve ──────────────────────────────────────────────────────────
 
+def incident_target_machines(
+    scenario_id: str,
+    target_machine_id: str | None = None,
+) -> list[str]:
+    """The machines a command names, derived without touching line state.
+
+    ``apply_incident`` works this out too, but only as a side effect of
+    mutating state, so recovery could not reuse it. Recovery needs the list on
+    its own: when the producer restarts mid-incident it no longer holds the
+    ``ActiveIncident``, and without a way to recover the target list it marked
+    the command terminal while emitting no resolve marker — leaving an event
+    the dashboard showed as active forever with no live command left to
+    Recover.
+
+    ``target_machine_id`` is comma-joined when an incident cascades onto
+    several machines, matching what the UI parses out of the same column.
+    """
+    defn = INCIDENTS.get(scenario_id)
+    if defn is None:
+        return []
+    if target_machine_id:
+        return [mid.strip() for mid in str(target_machine_id).split(",") if mid.strip()]
+    return list(defn.default_targets)
+
+
 def apply_incident(
     state: LineState,
     scenario_id: str,

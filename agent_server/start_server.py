@@ -1867,6 +1867,26 @@ def _resolve_data_quality_dashboard() -> dict[str, Any]:
             "Deploy the bundle (databricks bundle deploy) or set OPS_DATA_QUALITY_DASHBOARD_ID."
         )
 
+    # /embed/dashboardsv3/<id> only resolves for a PUBLISHED dashboard. A bundle
+    # deploy creates the draft and stops there; publishing happens in
+    # scripts/grant_app_jobs_view.sh, which only runs under scripts/deploy.sh.
+    # Anyone who ran `databricks bundle deploy` directly therefore got a
+    # dashboard that exists, resolves by name, and renders Databricks' bare
+    # "The resource is not available" page inside the iframe — with nothing
+    # anywhere to say why. Checking here turns that into an instruction.
+    try:
+        w.lakeview.get_published(dashboard_id=dashboard_id)
+    except Exception as e:
+        raise RuntimeError(
+            f"The Data Quality dashboard ({dashboard_id}) exists but is not published, "
+            "so it cannot be embedded. Publish it with embed_credentials so its "
+            "queries run as the owner rather than as the iframe viewer:\n"
+            f"  databricks api post /api/2.0/lakeview/dashboards/{dashboard_id}/published "
+            '--json \'{"warehouse_id":"<sql-warehouse-id>","embed_credentials":true}\'\n'
+            "Or re-run ./scripts/deploy.sh, which publishes and grants as part of the "
+            f"deploy. ({type(e).__name__})"
+        )
+
     embed_url = f"{host}/embed/dashboardsv3/{dashboard_id}" if host else None
     info = {
         "id": dashboard_id,
@@ -1937,6 +1957,23 @@ _DOMAIN_LABELS: dict[str, str] = {
 }
 
 
+def _streaming_space_available() -> bool:
+    """Whether the streaming Genie space is configured AND still exists.
+
+    Kept tolerant: the System Map must never take the app down, so a failure to
+    import or check degrades to "configured", matching the old behaviour rather
+    than raising inside a panel.
+    """
+    if not os.environ.get("GENIE_SPACE_ID", "").strip():
+        return False
+    try:
+        from agent_server.tools.genie_query import space_resolves
+        return space_resolves()
+    except Exception:  # noqa: BLE001
+        logger.debug("Genie space resolution check failed", exc_info=True)
+        return True
+
+
 @app.get("/ops/topology")
 async def ops_topology():
     """How agents reach data: the governed domains and which are provisioned.
@@ -1973,7 +2010,9 @@ async def ops_topology():
             "total": len(domains),
             # The streaming space is the live, per-second surface — a different
             # audience from the governed domains, so it is reported separately.
-            "streaming_space": bool(os.environ.get("GENIE_SPACE_ID", "").strip()),
+            # Checking that the id resolves, not just that it is set: a trashed
+            # space kept this true while every genie_query against it failed.
+            "streaming_space": _streaming_space_available(),
             "mvm_silver_enabled": os.environ.get("MVM_SILVER_ENABLED", "") == "1",
         }
 
@@ -2316,7 +2355,18 @@ async def invocations_stream(body: InvocationBody):
                 conversation_id=body.conversation_id,
             ):
                 try:
-                    output_chars += len(chunk) if isinstance(chunk, str) else 0
+                    # Two things must not reach the token estimate. Keep-alive
+                    # comments are transport, not model output — counting them
+                    # billed roughly a token per second of thinking time. And
+                    # `token` frames are a preview of text that arrives again,
+                    # in full, on the `answer` frame; counting both bills every
+                    # streamed answer twice.
+                    if (
+                        isinstance(chunk, str)
+                        and not chunk.startswith(":")
+                        and '"type": "token' not in chunk
+                    ):
+                        output_chars += len(chunk)
                 except Exception:
                     pass
                 yield chunk
@@ -2884,8 +2934,11 @@ async def recover_machine_endpoint(body: RecoverMachineBody):
     ``event_type``, not the underlying ``command_id``). It marks matching
     Lakebase ``ai_serving.scenario_commands`` rows as ``resolve_requested`` so
     the external producer emits a resolved event and clears its sticky fault.
-    We deliberately do NOT filter by shift_id here — the operator's intent is
-    "clear this fault now", and the producer doesn't filter by shift_id either.
+
+    Scoped to this server's shift. Every environment shares one Lakebase
+    database, so an unscoped resolve reaches into another environment's
+    incidents: it would mark dev's command resolve_requested while the fault
+    the operator is looking at in prod stays exactly where it was.
     """
     target_mid = body.machine_id.strip()
     if not target_mid:
@@ -2912,9 +2965,11 @@ async def recover_machine_endpoint(body: RecoverMachineBody):
                     SELECT command_id, target_machine_id
                     FROM ai_serving.scenario_commands
                     WHERE status IN ('pending', 'active', 'resolving')
+                      AND shift_id = %s
                     ORDER BY created_at DESC
                     LIMIT 200
-                    """
+                    """,
+                    (_server_shift_id(None),),
                 )
                 uc_cmds = [
                     {"command_id": r["command_id"], "target_machine_id": r.get("target_machine_id")}
@@ -2938,11 +2993,40 @@ async def recover_machine_endpoint(body: RecoverMachineBody):
     # Look up non-terminal commands targeting this machine from Lakebase (the
     # sole source of truth) and mark them resolve_requested for the producer.
     all_resolved = list(dict.fromkeys(await asyncio.to_thread(_lookup_and_resolve)))
+    if all_resolved:
+        # The producer owns the resolve marker for its own incidents: it has to
+        # clear the sticky fault first, and emitting one here too would close
+        # the event before the machine actually recovered.
+        return JSONResponse({
+            "machine_id": target_mid,
+            "resolved_command_ids": all_resolved,
+            "count": len(all_resolved),
+            "status": "resolving",
+        })
+
+    # No command behind it. That is not the same as nothing to do: the backfill
+    # seeds one open event deliberately as shift carryover, and a producer that
+    # was restarted mid-incident can leave one behind too. Those rows had no
+    # route to closure at all — Recover reported nothing to clear and the event
+    # stayed on the board until an eight-hour age-out hid it. The app can append
+    # the marker itself, because there is no fault to clear first.
+    def _close_open_events() -> int:
+        from agent_server.serving.realtime_store import mark_machine_events_resolved
+        try:
+            return mark_machine_events_resolved(
+                _server_shift_id(None), target_mid, resolved_by=body.resolved_by or "operator",
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("recover_machine event close failed for %s: %s", target_mid, str(e)[:200])
+            return 0
+
+    closed = await asyncio.to_thread(_close_open_events)
     return JSONResponse({
         "machine_id": target_mid,
-        "resolved_command_ids": all_resolved,
-        "count": len(all_resolved),
-        "status": "resolving" if all_resolved else "no_active_incident",
+        "resolved_command_ids": [],
+        "count": closed,
+        "closed_events": closed,
+        "status": "resolved" if closed else "no_active_incident",
     })
 
 

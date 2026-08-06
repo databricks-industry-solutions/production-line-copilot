@@ -109,3 +109,53 @@ def test_resolve_raises_when_not_found(env: pytest.MonkeyPatch) -> None:
     with patch.object(ss, "_ops_workspace", return_value=w):
         with pytest.raises(RuntimeError, match="not found"):
             ss._resolve_data_quality_dashboard()
+
+
+class TestAnUnpublishedDashboardIsReportedNotEmbedded:
+    """/embed/dashboardsv3/<id> resolves only for a PUBLISHED dashboard.
+
+    A bundle deploy creates the draft; publishing happened only in a script
+    that ran under scripts/deploy.sh. Anyone deploying with plain
+    `databricks bundle deploy` got a dashboard that existed and resolved by
+    name, so the app happily handed the browser an embed URL that rendered
+    Databricks' bare "The resource is not available" page — with no error in
+    the app, the logs, or the UI to say what was wrong.
+    """
+
+    def test_it_raises_with_the_fix_when_the_dashboard_is_not_published(
+        self, env: pytest.MonkeyPatch
+    ) -> None:
+        from agent_server import start_server as ss
+
+        env.setenv("OPS_DATA_QUALITY_DASHBOARD_ID", "dash-1")
+        env.setenv("DATABRICKS_HOST", "example.cloud.databricks.com")
+
+        w = MagicMock()
+        w.lakeview.get.return_value = _mk_dashboard("App — Data Quality", "dash-1")
+        w.lakeview.get_published.side_effect = Exception("RESOURCE_DOES_NOT_EXIST")
+
+        with patch.object(ss, "_ops_workspace", return_value=w):
+            with pytest.raises(RuntimeError) as e:
+                ss._resolve_data_quality_dashboard()
+
+        message = str(e.value)
+        assert "not published" in message
+        # The message has to carry the remedy: this surfaces in the UI panel,
+        # where the reader has no access to this source file.
+        assert "embed_credentials" in message
+        assert "dash-1" in message
+
+    def test_a_published_dashboard_returns_the_embed_url(self, env: pytest.MonkeyPatch) -> None:
+        from agent_server import start_server as ss
+
+        env.setenv("OPS_DATA_QUALITY_DASHBOARD_ID", "dash-1")
+        env.setenv("DATABRICKS_HOST", "example.cloud.databricks.com")
+
+        w = MagicMock()
+        w.lakeview.get.return_value = _mk_dashboard("App — Data Quality", "dash-1")
+        w.lakeview.get_published.return_value = MagicMock(embed_credentials=True)
+
+        with patch.object(ss, "_ops_workspace", return_value=w):
+            info = ss._resolve_data_quality_dashboard()
+
+        assert info["embed_url"].endswith("/embed/dashboardsv3/dash-1")

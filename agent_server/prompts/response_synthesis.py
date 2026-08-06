@@ -54,7 +54,7 @@ FORMATTING RULES — strict:
     - `- **Crown caps**: 8,200 units, depletes in 42 min at current rate`
 - "Priority Actions" uses a numbered list `1. ... 2. ...` (still ≤5 items, ≤18 words each).
 - "Confidence" is exactly ONE line: `**HIGH** / **MEDIUM** / **LOW** — <≤12-word justification>`.
-- Bold every machine_id, item_id, numeric value, and timestamp inline.
+- Bold every machine_id, material_id, numeric value, and timestamp inline.
 - No markdown tables, no `###` sub-headings, no images.
 - Total response across all 5 sections: ≤ 250 words.
 

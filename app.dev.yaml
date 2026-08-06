@@ -115,5 +115,9 @@ env:
     value: '1.0'
   - name: SSE_BUFFER_SECONDS
     value: '2'
+  # DERIVED from `vector_search_endpoint` in project-settings; see app.yaml for
+  # why both default off and what enabling costs.
+  - name: VS_ENDPOINT
+    value: ''
   - name: OPS_VS_ENDPOINT_ALWAYS_ON
-    value: 'true'
+    value: 'false'

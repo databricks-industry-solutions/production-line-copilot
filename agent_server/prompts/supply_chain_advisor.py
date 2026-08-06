@@ -7,6 +7,7 @@ scenarios, and by the LLM classifier for "inventory", "running out",
 from agent_server.prompts._shared import (
     DATA_CITATION_RULES,
     GOVERNED_MODEL_NOTE,
+    LIVE_DATA_TABLES,
     RESPONSE_STRUCTURE,
 )
 
@@ -29,6 +30,8 @@ Use the available tools:
 - load_plan_and_constraints: Get shift plan and constraints
 - calculator: Run depletion/cost/recovery estimates
 - retrieve_similar_cases: Find similar past events
+
+{LIVE_DATA_TABLES}
 
 {GOVERNED_MODEL_NOTE}
 

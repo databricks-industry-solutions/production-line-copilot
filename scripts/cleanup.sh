@@ -12,13 +12,22 @@
 # deploy from scratch.
 #
 # Usage:
-#   ./scripts/cleanup.sh dev                # destroy bundle + Genie + config reset
-#   ./scripts/cleanup.sh dev --purge-data   # ... and DROP the UC schemas
+#   ./scripts/cleanup.sh dev                  # destroy bundle + Genie + config reset
+#   ./scripts/cleanup.sh dev --purge-data     # ... and DROP the UC schemas + Lakebase schemas
+#   ./scripts/cleanup.sh dev --purge-shared   # ... and resources shared with other targets
 #   ./scripts/cleanup.sh prod
 #
-# NOT removed (provisioned as prerequisites, shared, or holding data you may
-# want): the UC catalog itself, the Lakebase instance, secret scopes, the SQL
-# warehouse, and model serving endpoints.
+# --purge-shared is for tearing down EVERY environment, e.g. before re-testing
+# the deploy from scratch. Resources that several profiles point at — the
+# governed MVM schemas, the Lakebase ai_serving/ai_chatbot namespaces, the
+# Vector Search endpoint — are skipped by default precisely so that tearing
+# down dev cannot take prod's data with it. This flag says you mean it. It
+# implies --purge-data.
+#
+# NOT removed (provisioned as prerequisites, or holding data you may want): the
+# UC catalog itself, the Lakebase INSTANCE, secret scopes, the SQL warehouse,
+# and model serving endpoints. The secret scope in particular must survive —
+# it holds the Zerobus client secret, and we cannot put that value back.
 #
 # Auth: uses the DATABRICKS_PROFILE env var (default: DEFAULT), same as deploy.sh.
 
@@ -41,7 +50,14 @@ case "${1:-}" in
 esac
 
 PURGE_DATA=0
-[[ "${2:-}" == "--purge-data" ]] && PURGE_DATA=1
+PURGE_SHARED=0
+for arg in "${@:2}"; do
+  case "$arg" in
+    --purge-data)   PURGE_DATA=1 ;;
+    --purge-shared) PURGE_SHARED=1; PURGE_DATA=1 ;;
+    *) error "Unknown flag: $arg"; exit 1 ;;
+  esac
+done
 
 SETTINGS="$ROOT/config/project-settings.local.yaml"
 [[ -f "$SETTINGS" ]] || SETTINGS="$ROOT/config/project-settings.yaml"
@@ -136,21 +152,65 @@ print(",".join(
 PY
 )
 MVM_PURGE_CATALOG="$MVM_CATALOG"
-[[ -n "$MVM_SHARED_WITH" ]] && MVM_PURGE_CATALOG=""
+if [[ -n "$MVM_SHARED_WITH" && "$PURGE_SHARED" != "1" ]]; then
+  MVM_PURGE_CATALOG=""
+fi
 WAREHOUSE_ID=$(_field sql_warehouse_id)
 GENIE_ID=$(_field genie_space_id)
 MVM_GENIE_ID=$(_field mvm_genie_space_id)
+
+# The four per-domain governed spaces deploy.sh creates (step 7c). These were
+# missed entirely: a teardown deleted two of the six spaces and left their ids
+# in the settings file, so the next deploy "refreshed" spaces that no longer
+# existed and leaked four more on every cycle.
+DOMAIN_GENIE_IDS=()
+for _d in asset quality inventory production; do
+  DOMAIN_GENIE_IDS+=("$(_field "genie_space_${_d}")")
+done
+
+# Vector Search. The endpoint bills hourly and takes 15-40 minutes to rebuild,
+# so it is only removed under --purge-shared. Indexes live inside the schema
+# being dropped and go either way.
+VS_ENDPOINT=$(_field vector_search_endpoint)
+
+# Lakebase. The instance is a prerequisite and survives; its schemas are ours.
+# ai_serving is shared across environments by design (shift_id is what isolates
+# them), so dropping it needs --purge-shared.
+LAKEBASE_PG_HOST=$(_field lakebase_pg_host)
+LAKEBASE_PG_DB=$(_field lakebase_pg_database)
+LAKEBASE_ENDPOINT=$(_field lakebase_endpoint)
+APP_CLIENT_ID=$(_field app_client_id)
+# deploy.sh registers a Lakebase role for the producer SP as well as the app SP.
+# The producer SP itself is an operator-created prerequisite and survives, but
+# the role deploy.sh granted it does not.
+PRODUCER_CLIENT_ID=$(_field producer_client_id)
+
+# The UC-backed traces experiment provision_trace_storage.py creates. It lives
+# outside the bundle, so `bundle destroy` leaves it behind — and its trace
+# tables are inside the schema dropped below. Because a UC trace link is
+# permanent and the backend refuses to unset it, an experiment whose tables
+# were dropped is scrap: the next deploy either fails on it or silently falls
+# through to the "-2" fallback name, leaking one experiment per teardown cycle.
+MLFLOW_EXPERIMENT_PATH=$(_field mlflow_experiment_path)
 
 echo ""
 warn "This will permanently delete the deployed bundle resources for '$TARGET':"
 warn "   • Databricks App (production-line-copilot-$1) and its service principal"
 warn "   • Setup / streaming / quality-sync jobs"
 warn "   • Data Quality dashboard and MLflow experiment"
+[[ -n "$MLFLOW_EXPERIMENT_PATH" && "$MLFLOW_EXPERIMENT_PATH" != "SET_ME" ]] && \
+  warn "   • UC traces experiment ${MLFLOW_EXPERIMENT_PATH}-traces (and its -2..-7 fallbacks)"
 warn "   • Bundle workspace files"
-warn "   • Genie spaces created by deploy.sh"
+warn "   • Genie spaces created by deploy.sh (streaming, MVM, and the 4 governed domains)"
 warn "   • app_client_id / lakebase_pg_user / genie space ids reset to SET_ME"
 if [[ "$PURGE_DATA" == "1" ]]; then
   warn "   • UC SCHEMA ${UC_CATALOG}.${UC_SCHEMA} (CASCADE — tables AND checkpoints)"
+  if [[ "$PURGE_SHARED" == "1" ]]; then
+    warn "   • SHARED: Lakebase schemas ai_serving + ai_chatbot on ${LAKEBASE_PG_HOST:-?}"
+    [[ -n "$VS_ENDPOINT" ]] && warn "   • SHARED: Vector Search endpoint '${VS_ENDPOINT}' and its indexes (15-40 min to rebuild)"
+  else
+    info "   • Lakebase schemas and the Vector Search endpoint are KEPT (--purge-shared to drop)"
+  fi
   if [[ -n "$MVM_PURGE_CATALOG" ]]; then
     warn "   • Governed MVM schemas in ${MVM_PURGE_CATALOG} (asset/production/quality/inventory)"
   elif [[ -n "$MVM_SHARED_WITH" ]]; then
@@ -181,7 +241,7 @@ fi
 # must go BEFORE the config reset below: deploy.sh creates a new space whenever
 # the stored id is SET_ME, so resetting without deleting leaks a duplicate space
 # on every teardown/redeploy cycle.
-for space in "$GENIE_ID" "$MVM_GENIE_ID"; do
+for space in "$GENIE_ID" "$MVM_GENIE_ID" "${DOMAIN_GENIE_IDS[@]}"; do
   if [[ -n "$space" && "$space" != "SET_ME" ]]; then
     info "Deleting Genie space $space ..."
     databricks api delete "/api/2.0/genie/spaces/$space" --profile "$PROFILE" >/dev/null 2>&1 \
@@ -227,6 +287,161 @@ PY
       warn "UC purge failed — drop the schemas manually before redeploying."
     fi
   fi
+
+  # The traces experiment's storage tables were inside the schema just dropped.
+  # A UC trace link cannot be unset, so the experiment is now unusable; leaving
+  # it means the next deploy skips to the "-2" fallback name and the workspace
+  # accumulates a dead experiment per cycle. Delete the whole family.
+  if [[ -n "$MLFLOW_EXPERIMENT_PATH" && "$MLFLOW_EXPERIMENT_PATH" != "SET_ME" ]]; then
+    info "Deleting UC traces experiment(s) for ${MLFLOW_EXPERIMENT_PATH}-traces ..."
+    DATABRICKS_CONFIG_PROFILE="$PROFILE" "${SDK_PY[@]}" - "$MLFLOW_EXPERIMENT_PATH" <<'PY' || \
+      warn "Could not delete the traces experiment — remove it by hand before redeploying."
+import sys
+
+from databricks.sdk import WorkspaceClient
+
+base = f"{sys.argv[1]}-traces"
+# provision_trace_storage.py falls back to -2..-7 when a name is already scrap.
+names = [base] + [f"{base}-{n}" for n in range(2, 8)]
+
+w = WorkspaceClient()
+for name in names:
+    try:
+        exp = w.experiments.get_by_name(name).experiment
+    except Exception:
+        continue
+    if exp is None:
+        continue
+    try:
+        w.experiments.delete_experiment(exp.experiment_id)
+        print(f"  deleted {name} ({exp.experiment_id})")
+    except Exception as exc:  # noqa: BLE001 - report and keep going
+        print(f"  WARN: {name}: {exc}")
+PY
+  fi
+fi
+
+# ── Vector Search (opt-in, shared) ───────────────────────────────────────────
+# Indexes are UC objects inside the schema, but DROP SCHEMA CASCADE leaves the
+# serving side of a Delta Sync index behind, so delete them through the API
+# first. The endpoint is the expensive part to rebuild — 15-40 minutes — and is
+# shared with any other profile naming it, hence --purge-shared.
+if [[ "$PURGE_SHARED" == "1" && -n "$VS_ENDPOINT" ]]; then
+  info "Deleting Vector Search indexes on '$VS_ENDPOINT' ..."
+  VS_INDEXES=$(databricks vector-search-indexes list-indexes "$VS_ENDPOINT" --profile "$PROFILE" --output json 2>/dev/null \
+    | python3 -c "
+import json,sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for i in (d if isinstance(d, list) else d.get('vector_indexes', [])):
+    print(i.get('name',''))
+" 2>/dev/null || echo "")
+  while IFS= read -r idx; do
+    [[ -z "$idx" ]] && continue
+    databricks vector-search-indexes delete-index "$idx" --profile "$PROFILE" >/dev/null 2>&1 \
+      && success "  index $idx deleted." \
+      || warn "  could not delete index $idx — check manually."
+  done <<< "$VS_INDEXES"
+
+  info "Deleting Vector Search endpoint '$VS_ENDPOINT' ..."
+  databricks vector-search-endpoints delete-endpoint "$VS_ENDPOINT" --profile "$PROFILE" >/dev/null 2>&1 \
+    && success "Vector Search endpoint deleted." \
+    || warn "Could not delete endpoint '$VS_ENDPOINT' (already gone?) — check manually."
+fi
+
+# ── Lakebase schemas + app SP role (shared) ──────────────────────────────────
+# The instance and the database survive — they are prerequisites. What we own
+# inside them is the ai_serving namespace (live SSE tables), ai_chatbot
+# (conversation memory), and the Postgres role registered for the app SP. The
+# role has to go via the Postgres API rather than DROP ROLE: it was created
+# through w.postgres.create_role with LAKEBASE_OAUTH_V1, and a SQL-level drop
+# leaves the managed-identity registry pointing at nothing.
+if [[ "$PURGE_SHARED" == "1" && -n "$LAKEBASE_PG_HOST" ]]; then
+  info "Dropping Lakebase schemas ai_serving + ai_chatbot on $LAKEBASE_PG_HOST ..."
+  if DATABRICKS_CONFIG_PROFILE="$PROFILE" "${SDK_PY[@]}" - \
+       "$LAKEBASE_PG_HOST" "$LAKEBASE_PG_DB" "$LAKEBASE_ENDPOINT" "$DEPLOY_USER" <<'PY'
+import sys
+
+import psycopg2
+from databricks.sdk import WorkspaceClient
+
+host, database, endpoint, user = sys.argv[1:5]
+w = WorkspaceClient()
+
+
+def _token() -> str:
+    """Same path the producer and the sink use (src/streaming_sim/lakebase_sink.py)."""
+    if endpoint:
+        try:
+            return w.postgres.generate_database_credential(endpoint=endpoint).token
+        except Exception as exc:  # noqa: BLE001
+            print(f"  generate_database_credential failed ({str(exc)[:100]}) — using workspace token")
+    tok = w.config.authenticate()
+    if callable(tok):
+        import requests
+
+        prepared = requests.Request("GET", "https://dummy").prepare()
+        tok(prepared)
+        return prepared.headers.get("Authorization", "").replace("Bearer ", "")
+    return str(tok)
+
+
+conn = psycopg2.connect(
+    host=host, dbname=database, user=user, password=_token(),
+    sslmode="require", connect_timeout=20,
+)
+conn.autocommit = True
+with conn.cursor() as cur:
+    for schema in ("ai_serving", "ai_chatbot", "appkit"):
+        print(f"  DROP SCHEMA IF EXISTS {schema} CASCADE")
+        cur.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+    # AppKit's Lakebase cache. Newer versions put it in an `appkit` schema
+    # (dropped above); older ones landed it in `public`, where DROP SCHEMA is
+    # not an option because `public` is not ours to remove.
+    print("  DROP TABLE IF EXISTS public.appkit_cache_entries")
+    cur.execute("DROP TABLE IF EXISTS public.appkit_cache_entries")
+conn.close()
+PY
+  then
+    success "Lakebase schemas dropped."
+  else
+    warn "Lakebase purge failed — drop ai_serving / ai_chatbot manually before redeploying."
+  fi
+
+  # deploy.sh registers a role for both the app SP and the producer SP, so both
+  # have to come back off. The role is addressed by its resource NAME
+  # (projects/<p>/branches/<b>/roles/rol-…), not by the SP client id — the id
+  # only appears as status.postgres_role. Deleting by client id silently 404s.
+  if [[ -n "$LAKEBASE_ENDPOINT" ]]; then
+    LAKEBASE_PARENT="${LAKEBASE_ENDPOINT%/endpoints/*}"
+    for _sp_pair in "app SP:$APP_CLIENT_ID" "producer SP:$PRODUCER_CLIENT_ID"; do
+      _sp_label="${_sp_pair%%:*}"
+      _sp_id="${_sp_pair#*:}"
+      [[ -z "$_sp_id" || "$_sp_id" == "SET_ME" ]] && continue
+      info "Removing Lakebase role for $_sp_label $_sp_id ..."
+      ROLE_NAME=$(databricks api get "/api/2.0/postgres/$LAKEBASE_PARENT/roles" --profile "$PROFILE" 2>/dev/null \
+        | python3 -c "
+import json, sys
+try:
+    roles = json.load(sys.stdin).get('roles', [])
+except Exception:
+    sys.exit(0)
+for r in roles:
+    if (r.get('status') or {}).get('postgres_role') == '$_sp_id':
+        print(r.get('name', ''))
+        break
+" 2>/dev/null || echo "")
+      if [[ -n "$ROLE_NAME" ]]; then
+        databricks api delete "/api/2.0/postgres/$ROLE_NAME" --profile "$PROFILE" >/dev/null 2>&1 \
+          && success "Lakebase role $ROLE_NAME removed." \
+          || warn "Could not remove Lakebase role $ROLE_NAME — check manually."
+      else
+        info "No Lakebase role registered for $_sp_id — nothing to remove."
+      fi
+    done
+  fi
 fi
 
 # ── Reset the config keys deploy.sh mutated ──────────────────────────────────
@@ -239,7 +454,13 @@ if [[ -f "$ROOT/config/project-settings.local.yaml" ]]; then
 import re, sys, yaml
 
 path, target = sys.argv[1], sys.argv[2]
-KEYS = ("app_client_id", "lakebase_pg_user", "genie_space_id", "mvm_genie_space_id")
+KEYS = (
+    "app_client_id", "lakebase_pg_user", "genie_space_id", "mvm_genie_space_id",
+    # deploy.sh writes these back too (step 7c). Leaving them behind made the
+    # next deploy "refresh" four spaces it had just deleted.
+    "genie_space_asset", "genie_space_quality",
+    "genie_space_inventory", "genie_space_production",
+)
 
 lines = open(path, encoding="utf-8").read().split("\n")
 doc = yaml.safe_load("\n".join(lines)) or {}

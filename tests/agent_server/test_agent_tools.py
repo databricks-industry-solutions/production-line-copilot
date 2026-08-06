@@ -72,10 +72,12 @@ class TestCalculatorRecovery:
     def test_ramp_up_reduces_effective_minutes(self):
         r = _invoke(calculator, operation="recovery_estimate",
                     params={"remaining_cases": 100, "speed_bpm": 400, "remaining_minutes": 60})
-        # default ramp_up=10 -> effective 50 min -> 400*50/60 = 333
+        # default ramp_up=10 -> effective 50 min. 400 bottles/min for 50 min is
+        # 20,000 bottles, which is 20000/24 = 833 cases. This used to divide by
+        # 60 — an hourly conversion on a per-minute rate — and expect 333.
         assert r["effective_production_minutes"] == 50
         assert r["ramp_up_minutes"] == 10
-        assert r["projected_cases"] == 333
+        assert r["projected_cases"] == 833
         assert r["feasible"] is True
 
     def test_infeasible(self):
@@ -181,6 +183,44 @@ class TestDetectAnomalies:
                     timestamp_start="yesterday",
                     timestamp_end="2026-01-01 01:00:00")
         assert "error" in r and "timestamp_start" in r["error"]
+
+    def test_accepts_the_offset_timestamp_the_context_hands_the_model(self, monkeypatch):
+        """`scenario.current_timestamp` is an isoformat string, so it ends `+00:00`.
+
+        Rejecting it made every context-derived call fail before it reached the
+        warehouse — 100% of detect_anomalies calls in a 99-question run.
+        """
+        seen: list[str] = []
+
+        class _Capture:
+            def invoke(self, query):
+                seen.append(query)
+                return []
+
+        monkeypatch.setattr(anomaly_detector, "sql_query", _Capture())
+        r = _invoke(detect_anomalies, machine_id="M1", shift_id="S1",
+                    timestamp_start="2026-01-01T00:00:00.123456+00:00",
+                    timestamp_end="2026-01-01T01:00:00Z")
+        assert "format" not in r.get("error", "")
+        assert seen, "the query should have been issued"
+        # Normalised to a naive UTC literal — the column is a plain TIMESTAMP,
+        # so an offset left in the literal would be read against the session zone.
+        assert "'2026-01-01 00:00:00'" in seen[0]
+        assert "'2026-01-01 01:00:00'" in seen[0]
+
+    def test_offset_timestamps_are_converted_not_truncated(self, monkeypatch):
+        seen: list[str] = []
+
+        class _Capture:
+            def invoke(self, query):
+                seen.append(query)
+                return []
+
+        monkeypatch.setattr(anomaly_detector, "sql_query", _Capture())
+        _invoke(detect_anomalies, machine_id="M1", shift_id="S1",
+                timestamp_start="2026-01-01T02:00:00+02:00",
+                timestamp_end="2026-01-01T03:00:00+02:00")
+        assert "'2026-01-01 00:00:00'" in seen[0]
 
     def test_no_data(self, monkeypatch):
         monkeypatch.setattr(anomaly_detector, "sql_query", _FakeSQL([]))
@@ -361,7 +401,63 @@ class TestSimilarCaseFallback:
         assert "machine_id = 'FILLER'" in q
         assert "event_type = 'major_stop'" in q
         assert "LIMIT 3" in q
-        assert r == [{"event_id": "e1"}]
+        # match_scope tells the model whether the case came off this machine or
+        # another one, so the answer can attribute it instead of implying it is
+        # this machine's own history.
+        assert r == [{"event_id": "e1", "retrieval": "keyword", "match_scope": "same_machine"}]
+
+    def test_only_resolved_cases_with_an_outcome_are_eligible(self, _force_vs_fallback):
+        """An open event is not a precedent.
+
+        Without this the search returned the current shift's own incidents —
+        for a machine asked about mid-fault, its own siblings and sometimes the
+        event being diagnosed — all with empty corrective_action and an
+        outcome_description of ''. The analyst reported "same-shift keyword
+        only, no outcome data" and dropped to LOW.
+        """
+        _invoke(retrieve_similar_cases, description="filler seized",
+                machine_id="FILLER", event_type="major_stop", top_k=3)
+        q = _force_vs_fallback.last_query
+        assert "e.timestamp_end IS NOT NULL" in q
+        assert "b.outcome_description IS NOT NULL" in q
+        assert "b.outcome_description <> ''" in q
+        # A LEFT JOIN would keep rows with no bronze match; the outcome columns
+        # are the point, so the join has to be inner.
+        assert "LEFT JOIN event_log_bronze" not in q
+        assert "JOIN event_log_bronze" in q
+
+    def test_the_description_actually_drives_the_ranking(self, _force_vs_fallback):
+        """The fallback used to ignore the description and return recent rows.
+
+        Whatever you asked about, you got the same events back, presented as
+        similar cases. Scoring on the query terms is the whole point of the tool.
+        """
+        _invoke(retrieve_similar_cases,
+                description="carousel bearing overheating on the filler", top_k=3)
+        q = _force_vs_fallback.last_query
+        assert "carousel" in q and "overheating" in q
+        assert "match_score" in q
+        assert "ORDER BY match_score DESC" in q
+
+    def test_the_outcome_fields_are_actually_returned(self, _force_vs_fallback):
+        """The tool's contract is "similar events *with outcome fields*".
+
+        Those three columns are written to event_log_bronze but dropped by the
+        quality gate on the way to gold, so selecting from gold alone returns a
+        past problem with no resolution — the one thing the caller wanted.
+        """
+        _invoke(retrieve_similar_cases, description="bearing overheated", top_k=2)
+        q = _force_vs_fallback.last_query
+        for column in ("resolution_minutes", "outcome_oee_impact", "outcome_description"):
+            assert column in q, f"{column} missing from the similar-case query"
+        assert "event_log_bronze" in q
+
+    def test_stopwords_and_short_tokens_are_not_scored(self, _force_vs_fallback):
+        _invoke(retrieve_similar_cases, description="what is the issue with it", top_k=3)
+        q = _force_vs_fallback.last_query
+        # Every term here is a stopword or too short to discriminate, so there is
+        # nothing to rank on and the score collapses to a constant.
+        assert "(0) AS match_score" in q
 
     def test_rejects_injection_in_filters(self, _force_vs_fallback):
         _invoke(retrieve_similar_cases, description="x",
@@ -458,3 +554,43 @@ class TestGenieHappyPath:
         monkeypatch.setattr(gq, "requests", _FakeRequests())
         r = _invoke(genie_query, question="What is the OEE trend?")
         assert "error" in r
+
+
+class TestPlanLoaderUsesTheReferenceShiftId:
+    """The live and reference tables are keyed by different shift ids.
+
+    A specialist is handed the live id (``shift_1_dev``). production_schedule
+    only ever holds the base id. Sending the live id through matched no rows and
+    returned ``{"plan": {}}``, which is indistinguishable from "this shift has
+    no plan" — so every dev answer was framed with no plan at all.
+    """
+
+    def _capture(self, monkeypatch):
+        from agent_server.tools import plan_constraints_loader as pcl
+        seen: list[str] = []
+
+        class _Recorder:
+            def invoke(self, query):
+                seen.append(query)
+                return [{"shift_id": "shift_1", "sku": "LAGER"}] if "production_schedule" in query else []
+
+        monkeypatch.setattr(pcl, "sql_query", _Recorder())
+        return pcl, seen
+
+    def test_env_suffix_is_stripped_for_the_schedule_lookup(self, monkeypatch):
+        pcl, seen = self._capture(monkeypatch)
+        result = pcl.load_plan_and_constraints.invoke({"shift_id": "shift_1_dev"})
+        plan_sql = next(q for q in seen if "production_schedule" in q)
+        assert "'shift_1'" in plan_sql
+        assert "shift_1_dev" not in plan_sql
+        assert result["plan"]["sku"] == "LAGER"
+
+    def test_a_base_shift_id_is_passed_through_untouched(self, monkeypatch):
+        pcl, seen = self._capture(monkeypatch)
+        pcl.load_plan_and_constraints.invoke({"shift_id": "shift_4"})
+        assert "'shift_4'" in next(q for q in seen if "production_schedule" in q)
+
+    def test_prod_suffix_is_stripped_too(self, monkeypatch):
+        pcl, seen = self._capture(monkeypatch)
+        pcl.load_plan_and_constraints.invoke({"shift_id": "shift_2_prod"})
+        assert "'shift_2'" in next(q for q in seen if "production_schedule" in q)

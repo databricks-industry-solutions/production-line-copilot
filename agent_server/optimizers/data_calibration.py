@@ -40,9 +40,9 @@ def calibrate_forecaster_params() -> dict:
     """Return calibrated Monte Carlo parameters from live data.
 
     Queries:
-    - production_schedule for actual ideal_rate (planned_cases / planned_hours * 60)
-    - line_kpi for oee_std (STDDEV of oee_to_now across recent shifts)
-    - event_log for historical MTTR (AVG duration of resolved major_stop events)
+    - production_schedule for ideal_rate_bpm (the planned line rate per SKU)
+    - gold_history_line_kpi for oee_std (STDDEV of oee_to_now across recent shifts)
+    - gold_history_event_log for historical MTTR (AVG duration of resolved stops)
     """
     global _fc_cache, _fc_cache_ts
     with _cache_lock:
@@ -52,9 +52,14 @@ def calibrate_forecaster_params() -> dict:
     params = dict(_DEFAULTS_FORECASTER)
 
     try:
+        # `ideal_rate_bpm` is the quantity itself, so it is read rather than
+        # derived. The previous expression divided by `planned_hours`, a column
+        # that does not exist — and even had it existed, cases-per-hour × 60 is
+        # not bottles per minute: it lands around 63,000 and the sanity guard
+        # below would have rejected it. This calibration has never once fired.
         rate_rows = _sql(
-            "SELECT AVG(planned_cases / NULLIF(planned_hours, 0) * 60) AS avg_rate "
-            "FROM production_schedule WHERE planned_cases > 0"
+            "SELECT AVG(ideal_rate_bpm) AS avg_rate "
+            "FROM production_schedule WHERE ideal_rate_bpm > 0"
         )
         if rate_rows and rate_rows[0].get("avg_rate"):
             val = float(rate_rows[0]["avg_rate"])
@@ -67,7 +72,7 @@ def calibrate_forecaster_params() -> dict:
     try:
         std_rows = _sql(
             "SELECT STDDEV(oee_to_now / 100.0) AS oee_std "
-            "FROM line_kpi WHERE oee_to_now IS NOT NULL AND oee_to_now > 0"
+            "FROM gold_history_line_kpi WHERE oee_to_now IS NOT NULL AND oee_to_now > 0"
         )
         if std_rows and std_rows[0].get("oee_std"):
             val = float(std_rows[0]["oee_std"])
@@ -78,10 +83,23 @@ def calibrate_forecaster_params() -> dict:
         logger.debug("Could not calibrate oee_std", exc_info=True)
 
     try:
+        # `major_stop` matched nothing: it belongs to the legacy seed generator,
+        # and the events that actually land in gold_history come from the
+        # producer and the backfill, which write micro_stop / minor_stop /
+        # machine_breakdown / sensor_failure / quality_hold / changeover /
+        # cip_cycle. The query never raised — it just averaged zero rows — so
+        # MTTR silently stayed at the 15-minute default for every forecast.
+        #
+        # The three classes below are the unplanned stops that need a repair.
+        # micro_stop is excluded deliberately: at three to four minutes it
+        # dominates by count and would drag MTTR toward "clear a jam", which is
+        # not what a caller asking how long a breakdown will last is after.
+        # changeover and cip_cycle are planned and are not repairs at all.
         mttr_rows = _sql(
             "SELECT AVG(duration_minutes) AS avg_mttr "
-            "FROM event_log "
-            "WHERE event_type = 'major_stop' AND duration_minutes IS NOT NULL "
+            "FROM gold_history_event_log "
+            "WHERE event_type IN ('machine_breakdown', 'minor_stop', 'sensor_failure') "
+            "AND duration_minutes IS NOT NULL "
             "AND duration_minutes > 0 AND duration_minutes < 480"
         )
         if mttr_rows and mttr_rows[0].get("avg_mttr"):
@@ -100,10 +118,10 @@ def calibrate_forecaster_params() -> dict:
 
 
 def calibrate_quality_cpt() -> dict[str, dict[str, float]]:
-    """Learn CPT values from historical quality_checks + event_log data.
+    """Learn CPT values from historical quality checks + events.
 
-    For each machine, computes the empirical probability of a quality failure
-    (reject_rate > threshold) co-occurring with each event root_cause.
+    For each machine, computes the empirical probability that a quality check
+    failed while an event with a given root_cause was open.
     Falls back to a uniform prior if insufficient data.
 
     Returns: {machine_id: {condition: probability, ...}, ...}
@@ -113,20 +131,25 @@ def calibrate_quality_cpt() -> dict[str, dict[str, float]]:
         if _cpt_cache and (time.monotonic() - _cpt_cache_ts) < _CACHE_TTL:
             return dict(_cpt_cache)
 
-    QUALITY_FAIL_THRESHOLD = 0.03
     MIN_SAMPLES = 5
 
+    # A failure is a check whose `result` is 'fail'. The previous version
+    # compared `q.reject_rate` against a threshold; the quality table has no
+    # such column — it holds one row per individual check, so a rate has to be
+    # counted rather than read. Counting `q.check_id` rather than `*` matters
+    # too: with a LEFT JOIN, an event with no checks in its window would
+    # otherwise contribute a row and be scored as a clean sample.
     rows = _sql(
         "SELECT e.machine_id, e.root_cause, "
-        "  COUNT(*) AS total, "
-        "  SUM(CASE WHEN q.reject_rate > {thr} THEN 1 ELSE 0 END) AS fail_count "
-        "FROM event_log e "
-        "LEFT JOIN quality_checks q "
+        "  COUNT(q.check_id) AS total, "
+        "  SUM(CASE WHEN q.result = 'fail' THEN 1 ELSE 0 END) AS fail_count "
+        "FROM gold_history_event_log e "
+        "LEFT JOIN quality_checks_bronze q "
         "  ON e.machine_id = q.machine_id "
         "  AND q.timestamp BETWEEN e.timestamp_start AND COALESCE(e.timestamp_end, e.timestamp_start) "
         "WHERE e.root_cause IS NOT NULL AND e.root_cause != '' "
         "GROUP BY e.machine_id, e.root_cause "
-        "HAVING COUNT(*) >= {min_s}".format(thr=QUALITY_FAIL_THRESHOLD, min_s=MIN_SAMPLES)
+        "HAVING COUNT(q.check_id) >= {min_s}".format(min_s=MIN_SAMPLES)
     )
 
     cpt: dict[str, dict[str, float]] = {}

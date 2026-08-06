@@ -20,15 +20,27 @@ _SCHEMA = os.environ.get("UC_SCHEMA", "line_manager_ai_kit")
 
 
 def _refresh_cache() -> dict[str, str]:
-    """Fetch all line_constraints rows and cache as {constraint_key: value}."""
+    """Fetch all line_constraints rows and cache as {parameter: value}.
+
+    The key column is ``parameter`` — ``min_speed_bpm``, ``allow_ot`` and the
+    rest. This asked for ``constraint_key``, which does not exist, so the query
+    failed, the failure was caught below, and the empty cache meant every
+    ``get_float``/``get_bool`` call fell through to its hardcoded default. The
+    table's values happen to match those defaults today, which is exactly why
+    nobody noticed: editing line_constraints changed nothing at all.
+    """
     global _cache, _cache_ts
     try:
         from agent_server.tools.sql_query import sql_query
-        rows = sql_query.invoke("SELECT constraint_key, value FROM line_constraints")
+        rows = sql_query.invoke("SELECT parameter, value FROM line_constraints")
         new_cache: dict[str, str] = {}
         for r in rows:
             if isinstance(r, dict) and "error" not in r:
-                new_cache[r.get("constraint_key", "")] = str(r.get("value", ""))
+                new_cache[r.get("parameter", "")] = str(r.get("value", ""))
+        if not new_cache:
+            # Distinguish "the table is empty" from "the query came back as an
+            # error row". Silently caching nothing is what hid this for so long.
+            logger.warning("line_constraints returned no usable rows: %r", rows[:2])
         with _cache_lock:
             _cache = new_cache
             _cache_ts = time.monotonic()

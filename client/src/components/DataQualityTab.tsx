@@ -148,7 +148,9 @@ export default function DataQualityTab() {
           {state === 'error' && (
             <div className="rounded-md border border-destructive/40 bg-destructive/5 p-3 text-xs text-destructive">
               <div className="font-medium">Dashboard not available.</div>
-              <div className="mt-1 opacity-80 break-words">{error}</div>
+              {/* pre-wrap: the server returns a copy-pasteable CLI command on
+                  its own line when the dashboard exists but is unpublished. */}
+              <div className="mt-1 whitespace-pre-wrap break-words font-mono opacity-80">{error}</div>
               <div className="mt-2 text-foreground opacity-70">
                 <div className="mb-1">
                   Most common cause after a fresh deploy: the app SP lacks CAN_READ on the Lakeview dashboard (or its

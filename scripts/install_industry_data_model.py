@@ -374,6 +374,41 @@ def _ensure_catalog(exec_one, catalog: str) -> None:
     print("[catalog] `%s` already exists (no CREATE CATALOG privilege — reusing)" % catalog)
 
 
+_METRIC_TARGET = re.compile(
+    r"CREATE\s+(?:OR\s+REPLACE\s+)?(?:MATERIALIZED\s+)?VIEW\s+"
+    r"`(?P<catalog>[^`]+)`\.`(?P<schema>[^`]+)`\.",
+    re.IGNORECASE,
+)
+
+
+def _ensure_metric_schemas(exec_one, catalog: str, metric_stmts: list[str]) -> None:
+    """Create the schemas the metric views target, if the model did not.
+
+    The upstream model ships `CREATE SCHEMA` for the domains that hold tables
+    (asset, production, quality, inventory) but not for `_metrics`, where every
+    metric view lives. On a fresh catalog all 95 views therefore failed with
+    SCHEMA_NOT_FOUND, twice — once on the first pass and once on the retry —
+    and the install still reported itself finished, just with a failure count
+    nobody was reading.
+
+    Derived from the statements rather than hard-coded, so a model that adds a
+    second metric schema is covered without changing this.
+    """
+    schemas = {
+        m.group("schema")
+        for stmt in metric_stmts
+        if (m := _METRIC_TARGET.search(stmt))
+    }
+    for schema in sorted(schemas):
+        ok, err = _exec_with_backoff(
+            exec_one, "CREATE SCHEMA IF NOT EXISTS `%s`.`%s`" % (catalog, schema)
+        )
+        if ok or _ignorable(err or ""):
+            print("  metric schema ready: %s.%s" % (catalog, schema))
+        else:
+            print("  WARN: could not create %s.%s -> %s" % (catalog, schema, (err or "")[:120]))
+
+
 def install(plan, exec_one, catalog: str, threads: int, ddl_threads: int,
             include_metrics: bool) -> list[tuple[str, str, str]]:
     """Apply the plan phase-by-phase, retry failures, return unrecoverable ones."""
@@ -390,6 +425,7 @@ def install(plan, exec_one, catalog: str, threads: int, ddl_threads: int,
     do("fk", ddl_threads)
     do("tag", ddl_threads)
     if include_metrics:
+        _ensure_metric_schemas(exec_one, catalog, plan.get("metric", []))
         do("metric", threads)
     if plan.get("other"):
         do("other", threads)
@@ -456,7 +492,6 @@ def main(argv: list[str] | None = None) -> int:
     _script_dir = os.path.dirname(os.path.abspath(globals().get("__file__") or sys.argv[0]))
     if _script_dir not in sys.path:
         sys.path.insert(0, _script_dir)
-    from _uc_sql import StmtCursor
 
     from databricks.sdk import WorkspaceClient
     from databricks.sdk.service.sql import StatementState

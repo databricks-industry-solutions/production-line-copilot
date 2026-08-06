@@ -1,7 +1,7 @@
 SELECT
   material_id,
   shift_id,
-  timestamp,
+  ts,
   on_hand_qty,
   safety_stock,
   reorder_point,

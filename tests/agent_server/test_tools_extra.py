@@ -415,15 +415,36 @@ def test_genie_query_http_error(monkeypatch):
 from agent_server.tools.similar_case_retriever import retrieve_similar_cases
 
 
+def _install_fake_vs(monkeypatch, vsc_cls):
+    fake_parent = types.ModuleType("databricks.vector_search")
+    fake_client = types.ModuleType("databricks.vector_search.client")
+    fake_client.VectorSearchClient = vsc_cls
+    monkeypatch.setitem(sys.modules, "databricks.vector_search", fake_parent)
+    monkeypatch.setitem(sys.modules, "databricks.vector_search.client", fake_client)
+
+
+# The exact envelope a Databricks index returns, captured from a live
+# similarity_search. Column names live under `manifest`; `result` carries only
+# row_count and data_array. The previous fixture here invented a
+# `result.columns` key, so the parser was written against a response no server
+# produces: every real call raised KeyError, the caller's except turned that
+# into a keyword-search fallback, and the test suite reported the semantic path
+# as covered and green.
+def _envelope(rows):
+    names = ["event_id", "machine_id", "description", "corrective_action", "score"]
+    return {
+        "manifest": {"column_count": len(names), "columns": [{"name": n} for n in names]},
+        "result": {"row_count": len(rows), "data_array": rows},
+    }
+
+
 def test_vector_search_happy_path(monkeypatch):
     class _Index:
         def similarity_search(self, **kw):
-            return {
-                "result": {
-                    "columns": [{"name": "event_id"}, {"name": "machine_id"}],
-                    "data_array": [["e1", "FILLER"], ["e2", "CAPPER"]],
-                }
-            }
+            return _envelope([
+                ["e1", "FILLER", "bearing overheated", "replaced bearing", 0.91],
+                ["e2", "CAPPER", "cap misfeed", "re-timed starwheel", 0.72],
+            ])
 
     class _VSC:
         def __init__(self, *a, **k):
@@ -432,16 +453,126 @@ def test_vector_search_happy_path(monkeypatch):
         def get_index(self, endpoint_name, index_name):
             return _Index()
 
+    _install_fake_vs(monkeypatch, _VSC)
+    # The semantic path is only attempted when an endpoint is configured; with
+    # VS_ENDPOINT unset the tool goes straight to keyword matching.
+    monkeypatch.setenv("VS_ENDPOINT", "vs-test")
+
+    out = _invoke(
+        retrieve_similar_cases, description="filler seized", machine_id="FILLER", top_k=2
+    )
+    assert [r["event_id"] for r in out] == ["e1", "e2"]
+    assert all(r["retrieval"] == "vector_search" for r in out)
+    assert out[0]["corrective_action"] == "replaced bearing"
+    # Renamed from `score` so callers need not know which path answered; the
+    # keyword fallback has always called it match_score.
+    assert out[0]["match_score"] == 0.91 and "score" not in out[0]
+
+
+def test_a_response_without_a_column_manifest_is_an_error_not_empty_results(monkeypatch):
+    """Returning [] here would read as "no similar cases", which is a lie."""
+    class _Index:
+        def similarity_search(self, **kw):
+            return {"result": {"row_count": 1, "data_array": [["e1"]]}}
+
+    class _VSC:
+        def __init__(self, *a, **k):
+            pass
+
+        def get_index(self, **kw):
+            return _Index()
+
+    _install_fake_vs(monkeypatch, _VSC)
+    monkeypatch.setenv("VS_ENDPOINT", "vs-test")
+    monkeypatch.setattr(
+        "agent_server.tools.similar_case_retriever._keyword_search",
+        lambda *a, **k: [{"retrieval": "keyword"}],
+    )
+    out = _invoke(retrieve_similar_cases, description="x", top_k=2)
+    assert out == [{"retrieval": "keyword"}], "should fall back, not report zero cases"
+
+
+class TestTheClientGetsCredentialsTheRuntimeActuallyHas:
+    """A Databricks App has OAuth client credentials and no PAT.
+
+    ``VectorSearchClient()`` with no arguments resolves credentials via MLflow,
+    which wants ``DATABRICKS_TOKEN``. In the app that raised on every call, and
+    the fallback swallowed it — so the endpoint stayed online, billed hourly,
+    and served nothing. The old fixture's ``__init__(self, *a, **k)`` accepted
+    any arguments, which is why no test noticed.
+    """
+
+    def _spy(self):
+        seen = {}
+
+        class _VSC:
+            def __init__(self, **kwargs):
+                seen.update(kwargs)
+
+            def get_index(self, **kw):
+                class _I:
+                    def similarity_search(self, **k):
+                        return _envelope([])
+                return _I()
+
+        return seen, _VSC
+
+    def test_app_service_principal_is_passed_explicitly(self, monkeypatch):
+        seen, vsc = self._spy()
+        _install_fake_vs(monkeypatch, vsc)
+        monkeypatch.setenv("VS_ENDPOINT", "vs-test")
+        monkeypatch.setenv("DATABRICKS_CLIENT_ID", "sp-id")
+        monkeypatch.setenv("DATABRICKS_CLIENT_SECRET", "sp-secret")
+        monkeypatch.setenv("DATABRICKS_HOST", "example.cloud.databricks.com")
+
+        _invoke(retrieve_similar_cases, description="x", top_k=1)
+
+        assert seen["service_principal_client_id"] == "sp-id"
+        assert seen["service_principal_client_secret"] == "sp-secret"
+        # The library rejects a bare hostname; Apps inject it without a scheme.
+        assert seen["workspace_url"] == "https://example.cloud.databricks.com"
+
+    def test_a_token_in_the_environment_is_passed_rather_than_rediscovered(self, monkeypatch):
+        seen, vsc = self._spy()
+        _install_fake_vs(monkeypatch, vsc)
+        monkeypatch.setenv("VS_ENDPOINT", "vs-test")
+        monkeypatch.delenv("DATABRICKS_CLIENT_ID", raising=False)
+        monkeypatch.delenv("DATABRICKS_CLIENT_SECRET", raising=False)
+        monkeypatch.setenv("DATABRICKS_HOST", "https://example.cloud.databricks.com")
+        monkeypatch.setenv("DATABRICKS_TOKEN", "dapi-xxx")
+
+        _invoke(retrieve_similar_cases, description="x", top_k=1)
+
+        assert seen["personal_access_token"] == "dapi-xxx"
+
+
+def test_no_configured_endpoint_skips_vector_search_entirely(monkeypatch):
+    """No index is provisioned in either environment today.
+
+    Attempting the search anyway cost a failed round-trip on every call and
+    recorded a vector_search_calls metric for work that never happened.
+    """
+    called = []
+
+    class _VSC:
+        def __init__(self, *a, **k):
+            called.append("constructed")
+
     fake_parent = types.ModuleType("databricks.vector_search")
     fake_client = types.ModuleType("databricks.vector_search.client")
     fake_client.VectorSearchClient = _VSC
     monkeypatch.setitem(sys.modules, "databricks.vector_search", fake_parent)
     monkeypatch.setitem(sys.modules, "databricks.vector_search.client", fake_client)
+    monkeypatch.delenv("VS_ENDPOINT", raising=False)
 
-    out = _invoke(
-        retrieve_similar_cases, description="filler seized", machine_id="FILLER", top_k=2
-    )
-    assert out == [
-        {"event_id": "e1", "machine_id": "FILLER"},
-        {"event_id": "e2", "machine_id": "CAPPER"},
-    ]
+    from agent_server.tools import similar_case_retriever as scr
+
+    class _FakeSQL:
+        def invoke(self, _q):
+            return [{"event_id": "e1"}]
+
+    monkeypatch.setattr("agent_server.tools.sql_query.sql_query", _FakeSQL())
+    out = _invoke(retrieve_similar_cases, description="filler seized", top_k=1)
+    assert called == []
+    assert out[0]["retrieval"] == "keyword"
+    assert scr is not None

@@ -12,7 +12,7 @@ WITH ranked AS (
         CASE WHEN ts <= :t_current THEN ts END DESC,
         CASE WHEN ts > :t_current THEN ts END ASC
     ) AS rn
-  FROM main.line_manager_ai_kit.machine_state
+  FROM main.line_manager_ai_kit.gold_history_machine_state
   WHERE shift_id = :shift_id
 )
 SELECT machine_id, status, throughput_per_min, speed_pct, alarm_count

@@ -30,7 +30,7 @@ from agent_server.optimizers.multi_shift_planner import MultiShiftPlanner
 from agent_server.optimizers.production_forecaster import ProductionForecaster
 from agent_server.optimizers.quality_causal_model import (
     QualityCausalModel,
-    _bayesian_update,
+    _combine_risk,
 )
 from agent_server.optimizers.rul_estimator import RULEstimator, _linear_regression
 from agent_server.optimizers.stochastic_schedule import (
@@ -93,8 +93,12 @@ class TestConstraintLoader:
 
     def test_refresh_cache_skips_error_rows(self, monkeypatch):
         from agent_server.tools import sql_query as sq
+        # Keyed by `parameter`, which is what line_constraints actually calls
+        # this column. The fixture used to say `constraint_key`, so it agreed
+        # with the query and both were wrong together: the test passed for as
+        # long as the feature was completely broken in production.
         rows = [
-            {"constraint_key": "min_speed_bpm", "value": "210"},
+            {"parameter": "min_speed_bpm", "value": "210"},
             {"error": "boom"},  # must be ignored
         ]
 
@@ -234,12 +238,29 @@ class TestProductionForecaster:
 # --------------------------------------------------------------------------- #
 # quality_causal_model
 # --------------------------------------------------------------------------- #
-class TestBayesianUpdate:
-    def test_high_likelihood_raises_posterior(self):
-        assert _bayesian_update(0.05, [0.9]) > 0.05
+class TestRiskCombination:
+    def test_a_likely_cause_raises_risk(self):
+        assert _combine_risk(0.05, [0.9]) > 0.05
 
     def test_clamped_to_unit_interval(self):
-        assert 0.0 <= _bayesian_update(0.5, [0.99, 0.99, 0.99]) <= 1.0
+        assert 0.0 <= _combine_risk(0.5, [0.99, 0.99, 0.99]) <= 1.0
+
+    def test_it_preserves_what_the_cpt_means(self):
+        """A cause the CPT puts at 0.85 should produce a risk near 0.85.
+
+        These two assertions are the whole bug: the odds-form update returned
+        0.23 for this, and moved risk *down* for any cause below 0.5.
+        """
+        assert _combine_risk(0.05, [0.85]) == pytest.approx(0.8575)
+        assert _combine_risk(0.05, [0.12]) > 0.05
+
+    def test_more_causes_never_lower_the_risk(self):
+        one = _combine_risk(0.05, [0.4])
+        two = _combine_risk(0.05, [0.4, 0.3])
+        assert two >= one
+
+    def test_no_causes_leaves_the_prior_alone(self):
+        assert _combine_risk(0.05, []) == pytest.approx(0.05)
 
 
 class TestQualityCausalModel:

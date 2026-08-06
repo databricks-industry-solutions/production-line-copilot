@@ -59,8 +59,9 @@ def resolve_scorers(judge_model: str = DEFAULT_JUDGE_MODEL, use_aligned: bool = 
     if not use_aligned:
         return scorers
 
-    from evaluations.alignment.base_judges import ALIGNABLE_JUDGE_FACTORIES
     from mlflow.genai.scorers import get_scorer
+
+    from evaluations.alignment.base_judges import ALIGNABLE_JUDGE_FACTORIES
 
     # By convention each judge's name == its factory function name.
     aligned_names = {f.__name__ for f in ALIGNABLE_JUDGE_FACTORIES}
@@ -196,6 +197,17 @@ def evaluate_gate(rows: list[dict]) -> tuple[bool, dict]:
     breakdown["forbidden_phrase"] = {
         "value": frac, "threshold": thresholds["forbidden_frac_le"],
         "n": n, "pass": frac <= thresholds["forbidden_frac_le"] or n == 0,
+    }
+
+    # An individual scorer with n == 0 passes: not every question is a routing
+    # question or a recovery plan, so a metric that does not apply must not
+    # fail the run. But if EVERY scorer saw nothing, the gate asserted nothing
+    # at all — and "no assertions" reported as a green gate is how a run
+    # against an empty workspace, or one where the scorer columns were renamed,
+    # looks identical to a passing one.
+    scored = sum(v["n"] for v in breakdown.values())
+    breakdown["_assertions"] = {
+        "value": scored, "threshold": 1, "n": scored, "pass": scored > 0,
     }
 
     passed = all(v["pass"] for v in breakdown.values())

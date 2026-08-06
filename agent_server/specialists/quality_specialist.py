@@ -13,7 +13,7 @@ from langchain_core.messages import SystemMessage
 
 from agent_server.model_roster import resolve
 from agent_server.optimizers.quality_causal_model import quality_risk_assessment
-from agent_server.prompts.quality_specialist import QUALITY_SPECIALIST_SYSTEM
+from agent_server.prompts.loader import prompt_text
 from agent_server.tools.anomaly_detector import detect_anomalies
 from agent_server.tools.calculator import calculator
 from agent_server.tools.governed_domain_query import (
@@ -27,7 +27,7 @@ from agent_server.tools.sql_query import sql_query
 
 def create_quality_specialist():
     """Build the ReAct agent registered as 'quality_specialist'."""
-    llm = ChatDatabricks(endpoint=resolve("quality_specialist"), max_tokens=2048)
+    llm = ChatDatabricks(endpoint=resolve("quality_specialist"))
     tools = [
         sql_query, load_plan_and_constraints, calculator,
         retrieve_similar_cases, detect_anomalies, quality_risk_assessment,
@@ -38,6 +38,7 @@ def create_quality_specialist():
         model=llm,
         tools=tools,
         system_prompt=SystemMessage(
-            content=QUALITY_SPECIALIST_SYSTEM + governed_domain_prompt("quality"),
+            content=prompt_text("quality_specialist_system")
+            + governed_domain_prompt("quality"),
         ),
     )
