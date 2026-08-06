@@ -3,6 +3,8 @@
 Uses the Databricks SDK to obtain OAuth tokens for authentication.
 Falls back gracefully when Postgres is not available.
 """
+import base64
+import json
 import logging
 import os
 import threading
@@ -259,10 +261,43 @@ def _is_pg_configured() -> bool:
     return bool(os.environ.get("PGHOST"))
 
 
+def _is_expired_token(password: str) -> bool:
+    """True when ``password`` is a JWT whose ``exp`` has passed.
+
+    ``PGPASSWORD`` is the documented way to hand this a Lakebase credential, and
+    ``scripts/init_lakebase.py`` recommends it. What the documentation does not
+    say is that the credential lasts an hour. Once exported it sits in the shell
+    for as long as that shell lives, and every later connection presents the
+    same dead token and is refused with "OAuth: User is not authorized" — which
+    reads like a permissions problem, so the time goes on checking grants and
+    roles that were correct all along. It cost exactly that here: the deploy's
+    incident reconciliation had been skipping its Lakebase pass for a day and a
+    half against a role with SUPERUSER on the right endpoint.
+
+    A static password that is not a JWT (a real Postgres password) has no expiry
+    to read and is returned untouched.
+    """
+    parts = password.split(".")
+    if len(parts) != 3:
+        return False
+    try:
+        payload = parts[1] + "=" * (-len(parts[1]) % 4)
+        exp = json.loads(base64.urlsafe_b64decode(payload)).get("exp")
+    except Exception:
+        return False
+    if not isinstance(exp, (int, float)):
+        return False
+    # A minute of slack: a token about to expire mid-connection is no use either.
+    if time.time() < exp - 60:
+        return False
+    logger.info("PGPASSWORD holds an expired credential; minting a fresh one instead")
+    return True
+
+
 def _get_pg_password() -> str:
     """Get password for Lakebase Autoscaling via ``w.postgres.generate_database_credential``."""
     static_pw = os.environ.get("PGPASSWORD")
-    if static_pw:
+    if static_pw and not _is_expired_token(static_pw):
         return static_pw
 
     endpoint = os.environ.get("LAKEBASE_ENDPOINT", "")

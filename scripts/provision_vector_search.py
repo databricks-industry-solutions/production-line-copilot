@@ -29,6 +29,13 @@ Three things had to be solved together, not just "create an index":
 Idempotent by construction: the endpoint, the table and the index are each
 created only when absent, and the MERGE upserts. Safe on every deploy.
 
+Re-running is also the only way the index gets fresher, because it is TRIGGERED
+rather than CONTINUOUS — so an existing index is sent a sync here rather than
+just being reported as present. The MERGE deduplicates the source to one row per
+event first: gold keeps a row per snapshot of an event, and feeding all of them
+to a MERGE keyed on ``event_id`` matched several source rows to one target row,
+which Delta refuses outright.
+
 Usage:
   python3 scripts/provision_vector_search.py --catalog C --schema S \\
       --warehouse-id W [--profile P] [--dry-run] [--wait]
@@ -110,25 +117,49 @@ def build_retrieval_table(wh: Warehouse, fqn: str, dry_run: bool) -> int:
     """
     # concat_ws skips nulls, so a case missing its corrective action still
     # embeds the text it does have rather than collapsing to NULL.
+    # One row per event, and specifically the last one. `gold_history_event_log`
+    # keeps a row per snapshot as an event progresses, so a single incident
+    # appears two or three times with *different* root_cause and
+    # corrective_action — the early guess and the eventual finding. Without this
+    # dedupe the first MERGE inserted every snapshot (nothing matches an empty
+    # target, so the declared PK, which Delta does not enforce, went unchallenged)
+    # and the index quietly kept whichever one it saw last. A library whose whole
+    # job is "how was this fixed" was answering with the interim theory as often
+    # as the fix. The second run then failed outright on
+    # DELTA_MULTIPLE_SOURCE_ROW_MATCHING_TARGET_ROW_IN_MERGE, so the script that
+    # documents itself as idempotent could only ever be run once.
+    #
+    # Latest `timestamp_end` wins, nulls last: a closed snapshot beats one still
+    # open, and `duration_minutes` then `case_text` break ties so two runs over
+    # unchanged data pick the same row rather than churning the index.
     merge = f"""
         MERGE INTO {table} AS t
         USING (
-          SELECT
-            e.event_id, e.shift_id, e.machine_id, e.event_type, e.severity,
-            e.description, e.root_cause, e.corrective_action,
-            CAST(e.duration_minutes AS DOUBLE) AS duration_minutes,
-            CAST(b.resolution_minutes AS DOUBLE) AS resolution_minutes,
-            CAST(b.outcome_oee_impact AS DOUBLE) AS outcome_oee_impact,
-            b.outcome_description,
-            concat_ws('. ',
+          SELECT * EXCEPT (rn) FROM (
+            SELECT
+              e.event_id, e.shift_id, e.machine_id, e.event_type, e.severity,
               e.description, e.root_cause, e.corrective_action,
-              concat('event type ', e.event_type),
-              concat('machine ', e.machine_id)
-            ) AS case_text,
-            current_timestamp() AS updated_at
-          FROM {fqn}.gold_history_event_log e
-          LEFT JOIN {fqn}.event_log_bronze b ON b.event_id = e.event_id
-          WHERE e.event_id IS NOT NULL AND e.description IS NOT NULL
+              CAST(e.duration_minutes AS DOUBLE) AS duration_minutes,
+              CAST(b.resolution_minutes AS DOUBLE) AS resolution_minutes,
+              CAST(b.outcome_oee_impact AS DOUBLE) AS outcome_oee_impact,
+              b.outcome_description,
+              concat_ws('. ',
+                e.description, e.root_cause, e.corrective_action,
+                concat('event type ', e.event_type),
+                concat('machine ', e.machine_id)
+              ) AS case_text,
+              current_timestamp() AS updated_at,
+              ROW_NUMBER() OVER (
+                PARTITION BY e.event_id
+                ORDER BY e.timestamp_end DESC NULLS LAST,
+                         e.duration_minutes DESC NULLS LAST,
+                         concat_ws('. ', e.description, e.root_cause,
+                                   e.corrective_action) DESC NULLS LAST
+              ) AS rn
+            FROM {fqn}.gold_history_event_log e
+            LEFT JOIN {fqn}.event_log_bronze b ON b.event_id = e.event_id
+            WHERE e.event_id IS NOT NULL AND e.description IS NOT NULL
+          ) WHERE rn = 1
         ) AS s
         ON t.event_id = s.event_id
         WHEN MATCHED AND t.case_text <> s.case_text THEN UPDATE SET *
@@ -153,6 +184,23 @@ def build_retrieval_table(wh: Warehouse, fqn: str, dry_run: bool) -> int:
             "real event history."
         )
     else:
+        # Clear out any event that already has more than one row before merging.
+        # Runs of this script from before the dedupe above left the library
+        # holding every snapshot, and the MERGE cannot repair that itself: one
+        # deduped source row matching three target rows updates all three and the
+        # duplicates survive, still outvoting each other for the index's single
+        # slot per key. Deleting them lets the MERGE reinsert the one right row.
+        dupes = wh.run(
+            f"SELECT count(*) FROM (SELECT event_id FROM {table} "
+            "GROUP BY event_id HAVING count(*) > 1)"
+        )
+        n_dupes = int(dupes[0][0]) if dupes else 0
+        if n_dupes:
+            print(f"  {n_dupes} event(s) had more than one row in the library — rebuilding those")
+            wh.run(
+                f"DELETE FROM {table} WHERE event_id IN "
+                f"(SELECT event_id FROM {table} GROUP BY event_id HAVING count(*) > 1)"
+            )
         wh.run(merge)
     return int(wh.run(f"SELECT count(*) FROM {table}")[0][0])
 
@@ -202,7 +250,22 @@ def ensure_index(w: WorkspaceClient, endpoint: str, index_fqn: str, source_fqn: 
                  embedding: str, dry_run: bool) -> bool:
     try:
         idx = w.vector_search_indexes.get_index(index_fqn)
-        print(f"  index {index_fqn}: exists, ready={idx.status.ready if idx.status else '?'}")
+        indexed = idx.status.indexed_row_count if idx.status else None
+        print(f"  index {index_fqn}: exists, ready={idx.status.ready if idx.status else '?'}"
+              f", indexed_rows={indexed}")
+        # A TRIGGERED index syncs when it is asked to and at no other time. This
+        # branch used to return here, so every run after the first refreshed the
+        # case library and left the index on whatever it had captured at
+        # creation — dev drifted to 24 rows against a 37-row library, and the
+        # retriever went on answering from a corpus missing a third of its
+        # cases while reporting `retrieval: vector_search`, which reads as the
+        # good path. Freshness is the whole reason to re-run this.
+        if not dry_run:
+            try:
+                w.vector_search_indexes.sync_index(index_name=index_fqn)
+                print("    triggered a sync (TRIGGERED index; runs in the background)")
+            except Exception as e:  # a sync already running is not a failure
+                print(f"    sync not triggered: {str(e)[:120]}")
         return True
     except Exception:
         pass

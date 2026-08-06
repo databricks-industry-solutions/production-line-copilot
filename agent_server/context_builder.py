@@ -49,6 +49,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
+from agent_server.uc import DEFAULT_UC_SCHEMA
 from agent_server.validation import validate_machine_id as _validate_machine_id
 from agent_server.validation import validate_shift_id as _validate_shift_id
 from agent_server.validation import validate_timestamp as _validate_timestamp
@@ -110,7 +111,7 @@ def _context_cache_clear() -> None:
 _WAREHOUSE_ID = os.environ.get("DATABRICKS_WAREHOUSE_ID", "")
 # Fallbacks are only useful for unit tests; the deployed app always sets these.
 _CATALOG = os.environ.get("UC_CATALOG", "main")
-_SCHEMA = os.environ.get("UC_SCHEMA", "line_manager_ai_kit")
+_SCHEMA = os.environ.get("UC_SCHEMA", DEFAULT_UC_SCHEMA)
 
 # One databricks-sql connection per worker thread. Long-lived because OAuth-
 # refresh on every request would add ~300ms to every context build.

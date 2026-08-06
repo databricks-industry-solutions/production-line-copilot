@@ -91,7 +91,9 @@ class TestTheSourceTableIsBuildable:
                 return True
 
         provisioner.build_retrieval_table(FakeWarehouse(), "cat.sch", dry_run=False)
-        merge = captured[1]
+        # By content, not position: the builder also runs a duplicate check and a
+        # count, and pinning an index made this fail for adding a statement.
+        merge = next(s for s in captured if "MERGE INTO" in s)
         assert "gold_history_event_log" in merge
         assert "event_log_bronze" in merge
         assert "MERGE INTO" in merge, "CREATE OR REPLACE would resync the whole corpus"
@@ -164,3 +166,126 @@ class TestTheDeployDoesNotRaceTheStreamingJob:
         assert "gold_history_event_log" in out
         assert "quality-sync" in out, "the message should name the job that creates it"
         assert "re-run" in out.lower(), "the operator needs to know this is recoverable"
+
+
+class TestOneRowPerEventReachesTheIndex:
+    """gold keeps a snapshot per stage of an event; the index keeps one row per key.
+
+    A single incident appears in `gold_history_event_log` two or three times as
+    it progresses, and those snapshots carry *different* root causes and
+    corrective actions — the early theory and the eventual finding. Feeding all
+    of them to a MERGE keyed on `event_id` did two bad things: the first run
+    inserted every snapshot (nothing matches an empty target, and Delta does not
+    enforce the declared primary key), leaving the index to keep whichever one it
+    happened to see; and the second run died on
+    DELTA_MULTIPLE_SOURCE_ROW_MATCHING_TARGET_ROW_IN_MERGE, so a script whose
+    docstring promises it is "safe on every deploy" could be run exactly once.
+
+    Observed in prod before the fix: 103 library rows for 44 events.
+    """
+
+    class _Warehouse:
+        def __init__(self, dupes=0):
+            self.statements: list[str] = []
+            self._dupes = dupes
+
+        def run(self, sql: str):
+            self.statements.append(sql)
+            if "HAVING count(*) > 1" in sql and sql.strip().upper().startswith("SELECT"):
+                return [[self._dupes]]
+            return [[44]]
+
+        def table_exists(self, fqn: str) -> bool:
+            return True
+
+    def test_the_source_is_reduced_to_one_row_per_event(self, provisioner):
+        wh = self._Warehouse()
+        provisioner.build_retrieval_table(wh, "cat.sch", dry_run=False)
+        merge = next(s for s in wh.statements if "MERGE INTO" in s)
+        assert "ROW_NUMBER() OVER" in merge
+        assert "PARTITION BY e.event_id" in merge
+        assert "rn = 1" in merge
+
+    def test_the_latest_closed_snapshot_wins(self, provisioner):
+        """A resolved event is the useful one; ordering must prefer it."""
+        wh = self._Warehouse()
+        provisioner.build_retrieval_table(wh, "cat.sch", dry_run=False)
+        merge = next(s for s in wh.statements if "MERGE INTO" in s)
+        order = merge[merge.index("ORDER BY"):merge.index("rn = 1")]
+        assert "e.timestamp_end DESC NULLS LAST" in order
+        # Deterministic tie-break, so re-running does not churn the index.
+        assert order.count("DESC NULLS LAST") >= 3
+
+    def test_a_library_left_duplicated_by_older_runs_is_rebuilt(self, provisioner):
+        wh = self._Warehouse(dupes=35)
+        provisioner.build_retrieval_table(wh, "cat.sch", dry_run=False)
+        deletes = [s for s in wh.statements if s.strip().upper().startswith("DELETE")]
+        assert deletes, "duplicated events must be cleared; MERGE cannot repair them"
+        assert "HAVING count(*) > 1" in deletes[0], "only the duplicated events"
+
+    def test_a_clean_library_is_not_deleted_from(self, provisioner):
+        wh = self._Warehouse(dupes=0)
+        provisioner.build_retrieval_table(wh, "cat.sch", dry_run=False)
+        assert not [s for s in wh.statements if s.strip().upper().startswith("DELETE")]
+
+
+class TestAnExistingIndexIsAskedToSync:
+    """TRIGGERED indexes sync when told to and never otherwise.
+
+    `ensure_index` used to see an existing index, print that it existed, and
+    return — so every run after the first refreshed the case library and left the
+    index frozen at whatever it captured on creation. Dev drifted to 24 indexed
+    rows against a 37-row library while `retrieve_similar_cases` went on
+    reporting `retrieval: vector_search`, which reads as the healthy path.
+    """
+
+    class _Indexes:
+        def __init__(self, exists=True):
+            self._exists = exists
+            self.synced: list[str] = []
+            self.created: list[str] = []
+
+        def get_index(self, fqn):
+            if not self._exists:
+                raise RuntimeError("not found")
+            return type("I", (), {"status": type("S", (), {
+                "ready": True, "indexed_row_count": 24})()})()
+
+        def sync_index(self, index_name):
+            self.synced.append(index_name)
+
+        def create_index(self, **kw):
+            self.created.append(kw["name"])
+
+    def _client(self, indexes):
+        return type("W", (), {"vector_search_indexes": indexes})()
+
+    def test_an_existing_index_is_synced(self, provisioner):
+        idx = self._Indexes(exists=True)
+        assert provisioner.ensure_index(
+            self._client(idx), "ep", "cat.sch.event_case_index",
+            "cat.sch.event_case_library", "emb", dry_run=False) is True
+        assert idx.synced == ["cat.sch.event_case_index"], "a stale index stays stale"
+        assert not idx.created
+
+    def test_dry_run_does_not_sync(self, provisioner):
+        idx = self._Indexes(exists=True)
+        provisioner.ensure_index(self._client(idx), "ep", "i", "s", "emb", dry_run=True)
+        assert idx.synced == []
+
+    def test_a_sync_already_running_is_not_fatal(self, provisioner):
+        class Busy(self._Indexes.__mro__[0]):
+            def sync_index(self, index_name):
+                raise RuntimeError("sync already in progress")
+
+        idx = Busy(exists=True)
+        assert provisioner.ensure_index(
+            self._client(idx), "ep", "i", "s", "emb", dry_run=False) is True
+
+    def test_a_missing_index_is_created_not_synced(self, provisioner):
+        idx = self._Indexes(exists=False)
+        provisioner.ensure_index(
+            self._client(idx), "ep", "cat.sch.event_case_index",
+            "cat.sch.event_case_library", "emb", dry_run=False)
+        assert idx.created == ["cat.sch.event_case_index"]
+        assert idx.synced == [], "creation performs the first sync itself"

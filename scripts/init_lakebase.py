@@ -7,6 +7,12 @@ Auth:
 - Preferred: provide a password/token via env var `PGPASSWORD` (or `LAKEBASE_OAUTH_TOKEN`)
 - Fallback: pass the token as the first CLI argument
 
+  A Lakebase OAuth credential is valid for one hour. Export it for this script
+  by all means, but do not leave it in a shell you keep using: the next thing to
+  read PGPASSWORD gets a dead token and Postgres refuses it with "OAuth: User is
+  not authorized", which looks like a missing grant rather than an expiry. The
+  app itself no longer trusts an expired PGPASSWORD, but other tooling might.
+
 Connection info:
 - Uses standard Postgres env vars: PGHOST, PGPORT, PGUSER, PGDATABASE, PGSSLMODE
 """

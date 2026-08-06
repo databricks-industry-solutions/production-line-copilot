@@ -24,7 +24,9 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from scripts.provision_prereqs import (  # noqa: E402
+    DEFAULT_LAKEBASE_PROJECT,
     _is_set,
+    _lakebase_path_parts,
     _load_profile,
     _parse_secret_ref,
     _write_profile_fields,
@@ -301,3 +303,48 @@ def test_zerobus_skips_when_region_unknown():
     out = derive_zerobus_url(w, {"zerobus_server_endpoint": "SET_ME"},
                              region=None, created_lakebase={})
     assert out == {}
+
+
+# --------------------------------------------------------------------------- #
+# which Lakebase project gets provisioned
+# --------------------------------------------------------------------------- #
+# The project id used to be the literal "prodline-copilot" regardless of
+# settings, so the documented `--apply --with-lakebase` run created one fixed
+# name for everybody. Two people in a workspace collided on it, and a settings
+# file that already named a project was ignored.
+
+
+def test_lakebase_project_comes_from_the_settings_endpoint():
+    prof = {"lakebase_endpoint": "projects/acme-line/branches/production/endpoints/primary"}
+    project, branch, endpoint, chosen = _lakebase_path_parts(prof)
+    assert (project, branch, endpoint, chosen) == ("acme-line", "production", "primary", True)
+
+
+def test_a_non_default_branch_and_endpoint_are_honoured():
+    prof = {"lakebase_endpoint": "projects/acme-line/branches/staging/endpoints/replica"}
+    assert _lakebase_path_parts(prof)[:3] == ("acme-line", "staging", "replica")
+
+
+def test_the_shipped_template_placeholder_is_not_taken_as_a_project_name():
+    """`_is_set` passes the whole path — the check must run on the segment."""
+    prof = {"lakebase_endpoint":
+            "projects/<your-lakebase-project>/branches/production/endpoints/primary"}
+    project, _, _, chosen = _lakebase_path_parts(prof)
+    assert chosen is False
+    assert project == DEFAULT_LAKEBASE_PROJECT
+    assert "<" not in project
+
+
+@pytest.mark.parametrize("value", ["", "SET_ME", "nonsense", "projects/only-two"])
+def test_unusable_endpoints_fall_back_to_the_default(value):
+    project, branch, endpoint, chosen = _lakebase_path_parts({"lakebase_endpoint": value})
+    assert (project, branch, endpoint, chosen) == (
+        DEFAULT_LAKEBASE_PROJECT, "production", "primary", False)
+
+
+def test_dry_run_reports_the_settings_project_not_the_default(capsys):
+    prof = {"lakebase_endpoint": "projects/acme-line/branches/production/endpoints/primary"}
+    assert provision_lakebase(FakeW(), prof, apply=False) == {}
+    out = capsys.readouterr().out
+    assert "acme-line" in out
+    assert DEFAULT_LAKEBASE_PROJECT not in out

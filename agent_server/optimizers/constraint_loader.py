@@ -8,6 +8,8 @@ import os
 import threading
 import time
 
+from agent_server.uc import DEFAULT_UC_SCHEMA
+
 logger = logging.getLogger(__name__)
 
 _cache_lock = threading.Lock()
@@ -16,7 +18,7 @@ _cache_ts: float = 0.0
 _CACHE_TTL = 300.0  # 5 min
 
 _CATALOG = os.environ.get("UC_CATALOG", "main")
-_SCHEMA = os.environ.get("UC_SCHEMA", "line_manager_ai_kit")
+_SCHEMA = os.environ.get("UC_SCHEMA", DEFAULT_UC_SCHEMA)
 
 
 def _refresh_cache() -> dict[str, str]:

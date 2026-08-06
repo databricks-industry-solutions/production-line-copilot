@@ -346,6 +346,13 @@ def compute_line_kpi(
     speed_count = 0
     _excl = exclude_from_speed or set()
 
+    # Both flow-starved states land in `starved` below: the KPI row has no
+    # machines_blocked column to put the other one in. Keep it that way only as
+    # long as both descriptions say so — starved (no input) and blocked
+    # (downstream full) point an operator in opposite directions, so a counter
+    # labelled "starved by upstream stoppage" sends half its cases the wrong
+    # way. Per-machine status keeps the two apart for anyone who needs them.
+
     # Line output is what leaves the last station, not the sum of all of them.
     # This is a series line: every bottle passes through all nineteen machines,
     # so adding their rates counts the same bottle nineteen times. The tile read

@@ -86,7 +86,13 @@ tables = [
             {"column_name": "machines_running", "description": ["Count of machines currently in 'running' status."]},
             {"column_name": "machines_stopped", "description": ["Count of machines currently in 'stopped' status (unplanned downtime)."]},
             {"column_name": "machines_degraded", "description": ["Count of machines in 'degraded' status (running below ideal speed)."]},
-            {"column_name": "machines_starved", "description": ["Count of machines starved by upstream stoppage."]},
+            {"column_name": "machines_starved", "description": [
+                "Count of machines idled by lack of flow, in either direction: starved "
+                "(nothing arriving from upstream) AND blocked (downstream cannot accept "
+                "output) both increment this one counter. There is no machines_blocked "
+                "column. The two have opposite remedies, so do not attribute this number "
+                "to upstream stoppage; use machine_state.status to split 'starved' from "
+                "'blocked' per machine."]},
             {"column_name": "total_throughput", "description": ["Line output rate right now, in bottle-equivalents per minute, measured at the last station. This is a series line, so it is NOT the sum of the per-machine rates in machine_state - every bottle passes through all 19 machines. Divide by 24 for cases per minute."]},
             {"column_name": "avg_speed_pct", "description": ["Average speed percentage across all machines, 0-100."]},
             {"column_name": "availability_to_now", "description": ["Availability % from start of shift, 0-100. Already a percentage; DO NOT multiply by 100."]},

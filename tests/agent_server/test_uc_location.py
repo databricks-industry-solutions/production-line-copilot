@@ -5,12 +5,14 @@ def test_get_uc_location_falls_back_on_placeholders(monkeypatch):
     monkeypatch.setenv("UC_CATALOG", "${var.catalog}")
     monkeypatch.setenv("UC_SCHEMA", "${var.schema}")
 
-    from agent_server.uc import get_uc_location
+    from agent_server.uc import DEFAULT_UC_SCHEMA, get_uc_location
 
     loc = get_uc_location()
     assert loc.catalog == "main"
-    assert loc.schema == "line_manager_ai_kit_preview"
-    assert loc.table("x") == "main.line_manager_ai_kit_preview.x"
+    # Named, not spelled out: this used to pin "line_manager_ai_kit_preview",
+    # which kept a fallback pointing at a schema the app no longer installs into.
+    assert loc.schema == DEFAULT_UC_SCHEMA
+    assert loc.table("x") == f"main.{DEFAULT_UC_SCHEMA}.x"
 
 
 def test_get_uc_location_uses_real_values(monkeypatch):

@@ -31,6 +31,8 @@ import re
 
 from langchain_core.tools import tool
 
+from agent_server.uc import DEFAULT_UC_SCHEMA
+
 logger = logging.getLogger(__name__)
 
 _SAFE_ID = re.compile(r"^[a-zA-Z0-9_-]+$")
@@ -102,7 +104,7 @@ def retrieve_similar_cases(
         vsc = _vector_search_client(VectorSearchClient)
         index_name = os.environ.get("VS_INDEX", "").strip() or (
             f"{os.environ.get('UC_CATALOG', 'main')}."
-            f"{os.environ.get('UC_SCHEMA', 'line_manager_ai_kit')}.{_DEFAULT_INDEX}"
+            f"{os.environ.get('UC_SCHEMA', DEFAULT_UC_SCHEMA)}.{_DEFAULT_INDEX}"
         )
 
         filters = {}

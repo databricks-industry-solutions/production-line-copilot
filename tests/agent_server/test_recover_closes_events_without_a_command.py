@@ -18,6 +18,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 
 import pytest
+from psycopg2.extras import RealDictRow
 
 from agent_server.serving import realtime_store
 
@@ -33,7 +34,12 @@ class _Cursor:
         self.statements.append((self._last, args))
 
     def fetchone(self):
-        return [self._open_events]
+        # The real row type, not a look-alike. The pool builds every connection
+        # with RealDictCursor, and this fake used to hand back a list — the
+        # positional access that permitted raised KeyError against the real
+        # thing, so the whole function died on the count it was about to act
+        # on, in production only.
+        return RealDictRow([("open_events", self._open_events)])
 
     @property
     def inserts(self):
@@ -87,7 +93,8 @@ class TestClosingAMachinesOpenEvents:
         realtime_store.mark_machine_events_resolved("shift_1_dev", "LABELLER")
         select = cur.statements[0]
         assert "shift_id = %s" in select[0]
-        assert select[1] == ("shift_1_dev", "LABELLER")
+        # One shift_id per branch of the merged-events union, then the machine.
+        assert select[1] == ("shift_1_dev", "shift_1_dev", "LABELLER")
 
     def test_it_ignores_resolve_markers_when_counting(self, cursor):
         cur = cursor(open_events=1)

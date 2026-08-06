@@ -230,6 +230,42 @@ def provision_service_principal(w, prof: dict, apply: bool) -> dict[str, str]:
     return out
 
 
+DEFAULT_LAKEBASE_PROJECT = "prodline-copilot"
+
+
+def _lakebase_path_parts(prof: dict) -> tuple[str, str, str, bool]:
+    """Project / branch / endpoint to provision, and whether the settings chose them.
+
+    ``lakebase_endpoint`` is where this project already keeps the Lakebase path —
+    ``deploy.sh`` parses the project out of it with awk to register SP roles — so
+    it is also where an operator states which project they want, well before
+    ``lakebase_pg_host`` can be known (the host only exists once the project
+    does). This used to hardcode ``prodline-copilot`` and ignore that field
+    entirely, which meant two people running the documented
+    ``provision_prereqs.py <target> --apply --with-lakebase`` in one workspace
+    raced for a single fixed name, and anyone who had written their own project
+    into the settings watched it be disregarded.
+
+    Note the placeholder check has to run on the parsed segment, not the whole
+    path: the shipped template reads ``projects/<your-lakebase-project>/...``,
+    which passes ``_is_set`` as a string because it does not itself start with
+    ``<``.
+    """
+    raw = str(prof.get("lakebase_endpoint") or "").strip().strip("/")
+    parts = raw.split("/")
+    parsed: dict[str, str] = {}
+    if len(parts) >= 6 and parts[0] == "projects":
+        parsed = {"project": parts[1], "branch": parts[3], "endpoint": parts[5]}
+
+    chosen = _is_set(parsed.get("project"))
+    return (
+        parsed["project"] if chosen else DEFAULT_LAKEBASE_PROJECT,
+        parsed.get("branch") if chosen and _is_set(parsed.get("branch")) else "production",
+        parsed.get("endpoint") if chosen and _is_set(parsed.get("endpoint")) else "primary",
+        chosen,
+    )
+
+
 def provision_lakebase(w, prof: dict, apply: bool) -> dict[str, str]:
     from databricks.sdk.service import postgres as pg
 
@@ -240,10 +276,17 @@ def provision_lakebase(w, prof: dict, apply: bool) -> dict[str, str]:
     print("  ! Lakebase Autoscale provisions BILLABLE compute. It stays online and "
           "bills hourly until you delete the project.")
 
-    project_id = "prodline-copilot"
-    branch_id = "production"
-    endpoint_id = "primary"
+    project_id, branch_id, endpoint_id, from_settings = _lakebase_path_parts(prof)
     endpoint_path = f"projects/{project_id}/branches/{branch_id}/endpoints/{endpoint_id}"
+
+    if from_settings:
+        print(f"  · lakebase project {project_id!r} (from lakebase_endpoint)")
+    else:
+        print(f"  ! lakebase_endpoint names no project, so defaulting to {project_id!r}. "
+              "Anyone else running this in the same workspace lands on that same "
+              "name — set lakebase_endpoint to "
+              "projects/<your-project>/branches/production/endpoints/primary first "
+              "if you want your own.")
 
     if not apply:
         print(f"  · [dry-run] would create Lakebase project {project_id!r} "

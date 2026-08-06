@@ -1330,7 +1330,14 @@ async def ops_cost_live(minutes: int = 60):
     # charged the hourly when ``vs_calls > 0`` in the window which under-
     # reported actual cost (an idle-but-live endpoint still bills). Toggle
     # ``OPS_VS_ENDPOINT_ALWAYS_ON=false`` for envs without an index.
-    vs_endpoint_always_on = (os.environ.get("OPS_VS_ENDPOINT_ALWAYS_ON", "true").strip().lower()
+    # When the flag is absent, read it off VS_ENDPOINT rather than assuming — the
+    # same rule render_app_yaml.py applies when it derives the two together (true
+    # iff an endpoint is named). The old default was a bare "true", so an app
+    # missing the flag billed ~$58/month of hourly Vector Search against the
+    # shipped configuration, which names no endpoint at all. Cost panels are
+    # believed, so inventing a line item is worse than omitting one.
+    _vs_default = "true" if os.environ.get("VS_ENDPOINT", "").strip() else "false"
+    vs_endpoint_always_on = (os.environ.get("OPS_VS_ENDPOINT_ALWAYS_ON", _vs_default).strip().lower()
                              in ("1", "true", "yes", "on"))
     vs_endpoint_live = vs_endpoint_always_on or vs_calls > 0
     vs_endpoint_usd = round(_LIVE_RATES["vector_search_usd_per_hour"] * win_h, 4) if vs_endpoint_live else 0.0
@@ -1643,7 +1650,15 @@ def _ops_user(req: Request) -> str:
 def _ops_role(user: str) -> str:
     admins = {x.strip().lower() for x in os.environ.get("OPS_ADMIN_EMAILS", "").split(",") if x.strip()}
     operators = {x.strip().lower() for x in os.environ.get("OPS_OPERATOR_EMAILS", "").split(",") if x.strip()}
-    default_role = os.environ.get("OPS_DEFAULT_ROLE", "operator").strip().lower() or "operator"
+    # Fall back to the least privilege, not the most. Every shipped app yaml sets
+    # this to 'viewer'; the code used to disagree and default to 'operator', so
+    # any deployment that lost the env var — a bare `uvicorn`, a container that
+    # skipped the rendered yaml — promoted every unrecognised caller, including
+    # the literal "unknown" that `_ops_user` returns when no identity header
+    # arrives, to a role that can POST /ops/control/action. A default is what
+    # runs when configuration is missing, which is exactly when it should assume
+    # the least about who is calling.
+    default_role = os.environ.get("OPS_DEFAULT_ROLE", "viewer").strip().lower() or "viewer"
     u = user.strip().lower()
     if u in admins:
         return "admin"
@@ -3080,7 +3095,7 @@ async def serving_stream():
             it asks ``read_*_after(cursor)`` for the NEXT distinct timestamp's
             rows and advances the cursor.
           * On first connect the cursor is positioned at
-            ``MAX(ts) - SSE_BUFFER_SECONDS`` (default 20 s) so we have a small
+            ``MAX(ts) - SSE_BUFFER_SECONDS`` (default 2 s) so we have a small
             buffer of replay queued — this absorbs Zerobus + streaming
             coalescing jitter and keeps the visible cadence smooth at 1 Hz.
           * When no row newer than the cursor exists yet, the payload carries
@@ -3113,7 +3128,11 @@ async def serving_stream():
         # connect. Empirically: bronze commits ~5 s, streaming batch ~5–10 s,
         # processing ~2 s — 20 s gives one full batch of headroom with margin.
         # Tune via env if you observe sustained underruns or want fresher data.
-        buffer_s = max(1, int(os.environ.get("SSE_BUFFER_SECONDS", "20")))
+        # Matches the '2' every app yaml ships. The code default was 20, so a run
+        # without the rendered env opened the stream 18 s further into the past
+        # and replayed its way forward — a dashboard that looked live but lagged,
+        # which is the hardest kind of wrong to notice.
+        buffer_s = max(1, int(os.environ.get("SSE_BUFFER_SECONDS", "2")))
 
         # Per-shift cursors. Dict because future multi-shift support stays simple.
         # Keyed by (kind, shift_id) — separate cursors per stream because each

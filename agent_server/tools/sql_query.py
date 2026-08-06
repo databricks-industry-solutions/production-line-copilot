@@ -22,11 +22,13 @@ import time
 
 from langchain_core.tools import tool
 
+from agent_server.uc import DEFAULT_UC_SCHEMA
+
 logger = logging.getLogger(__name__)
 
 _WAREHOUSE_ID = os.environ.get("DATABRICKS_WAREHOUSE_ID", "")
 _CATALOG = os.environ.get("UC_CATALOG", "main")
-_SCHEMA = os.environ.get("UC_SCHEMA", "line_manager_ai_kit")
+_SCHEMA = os.environ.get("UC_SCHEMA", DEFAULT_UC_SCHEMA)
 
 # One connection per thread, because the driver says so: databricks-sql-connector
 # declares PEP 249 ``threadsafety = 1`` — "threads may share the module, but not

@@ -29,9 +29,11 @@ your own deployment. It ships with placeholder configuration and synthetic data
 ## Known advisories in dependencies
 
 Checked at the v0.3.6 release against [OSV](https://osv.dev): all 938 packages
-in the npm tree are clean. Two Python packages carry advisories, both pulled in
-transitively and both held below their fix by an upstream pin, so neither can be
-resolved from this repository:
+in the npm tree are clean. No dependency changed in v0.3.7 — neither `uv.lock`
+nor `package-lock.json` was touched — so the review below is still current. Two
+Python packages carry advisories, both pulled in transitively and both held
+below their fix by an upstream pin, so neither can be resolved from this
+repository:
 
 | Package | Version | Advisories | Fixed in | Held back by |
 |---|---|---|---|---|

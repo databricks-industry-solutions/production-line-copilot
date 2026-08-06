@@ -6,6 +6,153 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.7] - 2026-08-06
+
+Everything here was found by watching v0.3.6 run in production rather than by
+reading it. Two of the nine were invisible to the test suite by construction:
+one lived in the gap between a mock cursor and a real one, and one only showed
+up as a stopwatch difference between two panels of the same dashboard. Both
+were found by measuring against a live workspace, which is the practice this
+release argues for.
+
+**9 bugs fixed · 60 new tests (2,314 → 2,374).**
+Since v0.1.0: 160 bugs fixed, 6 security advisories closed, 27 features added,
+and the test suite grown from 511 to 2,374.
+
+Counts are measured rather than estimated: `pytest --collect-only` reports
+2,153 tests at v0.3.6 and 2,213 here; the TypeScript suites are unchanged at
+161 blocks. No dependency changed in this release, so the advisory review
+recorded in `SECURITY.md` at v0.3.6 still stands.
+
+### Fixed
+
+- **Recover never closed an event, and only production could tell you.** The
+  pool builds every connection with `RealDictCursor`, so rows arrive keyed by
+  column name. `mark_machine_events_resolved` read its open-event count with
+  `(cur.fetchone() or [0])[0]`, and indexing a dict row by position raises
+  `KeyError: 0` — before the guard, before the insert, on every single call.
+  The idempotency fix this function received earlier in the release was
+  therefore never reached. The suite passed throughout because its fake cursor
+  returned a list where Postgres returns a mapping; that fake now hands back a
+  real `RealDictRow`, so the substitution the code depends on is the one the
+  tests exercise.
+
+- **A triggered incident reached the line tiles in a second and the feed beside
+  them a minute later.** The event feed read only `ai_serving.event_log_recent`,
+  which the quality-sync job writes once per `Trigger.AvailableNow` pass. The
+  producer dual-writes incident starts and resolves to `event_log_history`
+  every second, so the Events tab sat a full sync cycle behind the tiles
+  reporting the same fault. The feed now reads both and dedupes on the
+  `event_id` the producer mints before the fan-out, preferring the closed copy
+  when bronze has already landed an end the live row lacks. Reading both
+  matters in each direction: the producer never dual-writes micro stops,
+  quality holds, changeovers or CIP cycles, so the sync table is still the only
+  source for those. `mark_machine_events_resolved` judges openness over the
+  same merged view, or Recover would report nothing to clear for an incident
+  the operator can read on screen.
+
+- **The dashboard's first paint and the agent's KPIs ran a minute behind the
+  line.** Two writers fill the Lakebase serving layer at very different rates:
+  the producer dual-writes `ai_serving.*_history` every second, while the
+  streaming quality-sync job upserts `ai_serving.*_latest` once per
+  `Trigger.AvailableNow` pass — 60 s at the default `TRIGGER_MILLIS`, plus the
+  10–15 s of serverless spin-up the job's own comment budgets for. SSE warmup
+  and the agent's context bundle both read the `*_latest` tables, so they
+  inherited that cycle: the dashboard painted minute-old state before the
+  playback cursor took over, and the assistant answered from a KPI row that
+  could contradict the tiles rendered beside it. Measured against prod, the gap
+  ran 29–62 s depending on where in the cycle you looked — with FILLER still
+  reported `stopped` in `machine_state_latest` after the line had recovered.
+  The three "latest" readers now collapse the producer-written `*_history`
+  tables to the newest row per key, behind the same 300 s wall-clock guard the
+  cursor reads use, so a dead producer yields an honest empty result instead of
+  a stale row presented as current. Both source tables carry the indexes this
+  needs, and the columns are identical, so nothing downstream changes shape.
+
+- **An expired `PGPASSWORD` was trusted forever.** A Lakebase OAuth credential
+  lasts an hour. `PGPASSWORD` is the documented way to supply one, and
+  `scripts/init_lakebase.py` recommends it, but `_get_pg_password` returned it
+  unconditionally — so once exported into a shell it outlived its own validity,
+  and every connection afterwards presented the same dead token. Postgres
+  refuses that with "OAuth: User is not authorized", which reads as a missing
+  grant and sends you to check roles and permissions that were correct all
+  along. The deploy's incident reconciliation had been silently skipping its
+  Lakebase pass for a day and a half against a role holding SUPERUSER on the
+  right endpoint. An expired JWT is now ignored in favour of a fresh credential;
+  an ordinary password, which has no expiry to read, is left alone.
+
+- **Clicking "resolved" twice appended two markers.** The guard meant to prevent
+  exactly that counted open events with `timestamp_end IS NULL`. The log is
+  append-only, so the original row keeps that NULL forever and the second click
+  saw the same event still open. It now reconciles against later resolve
+  markers, as every other consumer of that table already did.
+
+- **A machine blocked by a jam downstream was reported as starved of input.**
+  `machines_starved` counts both flow faults, because the KPI row has no
+  `machines_blocked` column to hold the other one. That fold is survivable; the
+  label was not. Genie was told the column meant "count of machines starved by
+  upstream stoppage", so a line backed up behind a full buffer was described to
+  the operator as short of supply — and the two faults are at opposite ends of
+  the line, so the advice that follows sends someone the wrong way. Both
+  descriptions now say the counter covers starved and blocked, and point at
+  `machine_state.status`, which has kept them apart all along.
+
+- **Everyone provisioning Lakebase raced for the same project name.**
+  `provision_prereqs.py --with-lakebase`, which `DEPLOY.md` documents, hardcoded
+  the project as `prodline-copilot` no matter what the settings said. Two people
+  running it in one workspace collided, and anyone who had written their own
+  project into `lakebase_endpoint` — the field `deploy.sh` already parses the
+  project out of — watched that choice be ignored. It now reads the endpoint
+  path, and says which name it is using and why when it falls back.
+
+- **Four defaults contradicted the configuration they shipped alongside.** A
+  default is what runs when the yaml is missing, so it decides how the system
+  behaves in its least-configured state; these had each drifted to the opposite
+  of what every app yaml says. `OPS_DEFAULT_ROLE` shipped as `viewer` and
+  defaulted to `operator`, promoting an unrecognised caller — including the
+  literal `unknown` used when no identity header arrives — into the role allowed
+  to post control actions. The UC schema fell back to `line_manager_ai_kit` in
+  four modules and `line_manager_ai_kit_preview` in a fifth, neither of which is
+  where the app installs; the first is the seed schema an earlier version copied
+  *from* and it still holds stale rows, so the fallback did not fail, it answered
+  with months-old numbers. `SSE_BUFFER_SECONDS` shipped as 2 and defaulted to 20,
+  opening the stream eighteen seconds further back and replaying forward, which
+  looks live and lags. And `OPS_VS_ENDPOINT_ALWAYS_ON` defaulted to true against
+  a configuration that names no Vector Search endpoint, inventing roughly $58 a
+  month on the cost panel; it now follows `VS_ENDPOINT`, the same rule
+  `render_app_yaml.py` uses to derive the pair. A test now walks every
+  `os.environ.get` default in `agent_server/` against both shipped yamls, so the
+  next one is caught when it is written rather than four at a time.
+
+- **The similar-case index could be built once, and never refreshed after.**
+  Provisioning Vector Search for the prod schema turned up three faults in a
+  script whose docstring promises it is "idempotent by construction" and "safe
+  on every deploy". `gold_history_event_log` keeps a row per snapshot as an
+  event progresses, and those snapshots hold *different* root causes and
+  corrective actions — the first theory and the eventual finding. The MERGE fed
+  all of them to a statement keyed on `event_id`: the first run inserted every
+  snapshot, because nothing matches an empty target and Delta does not enforce
+  the primary key the table declares, so prod's library held 103 rows for 44
+  events and the index kept whichever snapshot it saw last. A library whose only
+  purpose is answering "how was this fixed" was as likely to return the interim
+  guess as the fix. The second run then failed outright on
+  `DELTA_MULTIPLE_SOURCE_ROW_MATCHING_TARGET_ROW_IN_MERGE`. The source is now
+  reduced to one row per event, latest closed snapshot winning, and a library
+  left duplicated by earlier runs is rebuilt rather than merged into.
+
+  The third fault was quieter and had been live in dev for as long as the index
+  existed. A `TRIGGERED` index syncs when it is asked to and at no other time,
+  and `ensure_index` saw an existing index, reported it, and returned — so every
+  later run refreshed the case library and left the index frozen at what it
+  captured on creation. Dev was serving 24 indexed cases against a 37-row
+  library, and because the drift is invisible from the outside, the retriever
+  kept labelling those answers `retrieval: vector_search`, which reads as the
+  healthy path. An existing index is now sent a sync. Dev came back to 37.
+
+  Compounding all of it, `deploy.sh` turns any failure here into a `WARN` and
+  carries on, which is defensible for an enrichment step but meant the MERGE had
+  been failing without anyone reading the line.
+
 ## [0.3.6] - 2026-08-06
 
 Validated the way a user meets it: both environments destroyed down to service

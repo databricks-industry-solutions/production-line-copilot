@@ -4,8 +4,9 @@ This module is the single boundary between the App and Postgres for live data.
 It exposes read helpers used by the SSE generator and agent context bundle:
 
 1. **Latest reads** (``read_machine_state_latest`` …) — used for SSE warmup
-   and for the agent's context bundle. Always reads from ``ai_serving.*_latest``,
-   which is per-shift unique on (shift_id, machine_id) so row counts are tiny.
+   and for the agent's context bundle. Collapses ``ai_serving.*_history`` to the
+   newest row per key rather than reading the ``*_latest`` tables, which the
+   quality-sync job refreshes only once per ~60 s cycle.
 
 2. **Append-history cursor reads** (``read_*_after``) — the SSE generator
    maintains a per-shift cursor and asks "what's the next distinct ts after
@@ -28,6 +29,11 @@ from typing import Any
 from agent_server.memory.pg_pool import query, transaction
 
 logger = logging.getLogger(__name__)
+
+# Wall-clock window for the "latest" reads, matching the default the cursor
+# reads use. Rows older than this belong to a previous producer run, and a
+# stale row presented as current is worse than an honest empty result.
+LATEST_RECENT_SECONDS = 300
 
 
 def _synced_schema() -> str:
@@ -91,30 +97,58 @@ def clear_serving_tables(shift_id: str) -> None:
         logger.warning("clear_serving_tables failed: %s", str(e)[:300])
 
 
-def read_machine_state_latest(shift_id: str) -> list[dict[str, Any]]:
-    """Tier-1 dashboard: latest rows from ``ai_serving.machine_state_latest`` only.
+def read_machine_state_latest(
+    shift_id: str, recent_seconds: int = LATEST_RECENT_SECONDS
+) -> list[dict[str, Any]]:
+    """Tier-1 dashboard: newest row per machine, derived from ``*_history``.
+
+    Reads ``machine_state_history`` rather than ``machine_state_latest``. Only
+    the quality-sync job writes the ``*_latest`` tables, and on serverless it
+    runs ``Trigger.AvailableNow`` on a ``cycle_sleep_s`` loop — 60 s at the
+    default ``TRIGGER_MILLIS``, plus per-cycle spin-up. The producer dual-writes
+    ``*_history`` at 1 Hz, so ``*_latest`` trailed live truth by up to ~75 s and
+    both callers here paid for it: SSE warmup painted a minute-old dashboard
+    before the cursor took over, and the agent answered from KPIs that
+    contradicted the tiles beside them.
+
+    The ``recent_seconds`` guard matches ``read_machine_state_after``: rows from
+    an older producer run are not "latest", and returning nothing lets callers
+    show the same "waiting for fresh data" state the cursor already shows.
 
     Synced Table mirrors (``public.machine_state``, etc.) are not queried here — Lakebase
     often injects ``LAKEBASE_SYNCED_DATA_SCHEMA=public`` before mirrors exist, which broke SSE.
     """
     return query(
-        """
-        SELECT shift_id, machine_id, ts, status, throughput_per_min, speed_pct, alarm_count
-        FROM ai_serving.machine_state_latest
+        f"""
+        SELECT DISTINCT ON (machine_id)
+               shift_id, machine_id, ts, status,
+               throughput_per_min, speed_pct, alarm_count
+        FROM ai_serving.machine_state_history
         WHERE shift_id = %s
-        ORDER BY machine_id
+          AND ts > NOW() - INTERVAL '{int(recent_seconds)} seconds'
+        ORDER BY machine_id, ts DESC
         """,
         (shift_id,),
     ) or []
 
 
-def read_line_kpi_latest(shift_id: str) -> dict[str, Any] | None:
-    """Single KPI row for ``shift_id``, normalised to fill optional gold columns."""
+def read_line_kpi_latest(
+    shift_id: str, recent_seconds: int = LATEST_RECENT_SECONDS
+) -> dict[str, Any] | None:
+    """Newest KPI row for ``shift_id``, normalised to fill optional gold columns.
+
+    Sourced from ``line_kpi_history`` for the reason given in
+    ``read_machine_state_latest`` — ``line_kpi_latest`` is on the sync job's
+    ~60 s cycle, and this row is what the agent quotes as the current OEE.
+    """
     row = query(
-        """
+        f"""
         SELECT *
-        FROM ai_serving.line_kpi_latest
+        FROM ai_serving.line_kpi_history
         WHERE shift_id = %s
+          AND ts > NOW() - INTERVAL '{int(recent_seconds)} seconds'
+        ORDER BY ts DESC
+        LIMIT 1
         """,
         (shift_id,),
         fetch="one",
@@ -122,18 +156,52 @@ def read_line_kpi_latest(shift_id: str) -> dict[str, Any] | None:
     return _normalize_line_kpi_row(row)
 
 
+_EVENT_COLUMNS = """event_id, shift_id, machine_id, event_type, severity,
+           timestamp_start, timestamp_end, duration_minutes,
+           root_cause, description, corrective_action"""
+
+# The event feed has two suppliers and needs both.
+#
+#   event_log_history — producer dual-write, ~1 s. Carries incident starts and
+#     resolves, which is everything the operator triggers and therefore
+#     everything they sit watching the feed for.
+#   event_log_recent  — quality-sync job, one AvailableNow pass per cycle
+#     (60 s at the default TRIGGER_MILLIS, plus spin-up). Carries the full
+#     bronze taxonomy the producer does not dual-write — micro stops, quality
+#     holds, changeovers, CIP cycles — plus the resolve markers this module
+#     appends itself.
+#
+# Reading only the sync table put a triggered incident on the operator's line
+# tiles in about a second and in the feed beside them up to a minute later.
+# Both copies of a dual-written event share the event_id the producer minted
+# before the fan-out, so the union dedupes exactly.
+_MERGED_EVENTS_CTE = f"""
+    WITH merged AS (
+        SELECT {_EVENT_COLUMNS} FROM ai_serving.event_log_history WHERE shift_id = %s
+        UNION ALL
+        SELECT {_EVENT_COLUMNS} FROM ai_serving.event_log_recent  WHERE shift_id = %s
+    ),
+    events AS (
+        SELECT DISTINCT ON (event_id) *
+        FROM merged
+        -- Prefer the closed copy: bronze may land a row already carrying its
+        -- end while the producer's live copy still has it open.
+        ORDER BY event_id, (timestamp_end IS NOT NULL) DESC, timestamp_start DESC
+    )
+"""
+
+
 def read_event_log_recent(shift_id: str, limit: int = 200) -> list[dict[str, Any]]:
     """Recent events for the EventFeed panel. ``limit`` is clamped to [1,1000]."""
     safe_limit = min(max(int(limit), 1), 1000)
     return query(
         f"""
-        SELECT *
-        FROM ai_serving.event_log_recent
-        WHERE shift_id = %s
+        {_MERGED_EVENTS_CTE}
+        SELECT * FROM events
         ORDER BY timestamp_start DESC NULLS LAST
         LIMIT {safe_limit}
         """,
-        (shift_id,),
+        (shift_id, shift_id),
     ) or []
 
 
@@ -144,11 +212,16 @@ def mark_machine_events_resolved(
 ) -> int:
     """Append a resolve marker for a machine's open events. Returns how many it closes.
 
-    ``event_log_recent`` is append-only, mirroring the Zerobus bronze ingest it
+    The event log is append-only, mirroring the Zerobus bronze ingest it
     shadows, so an event is closed by a later ``event_type='resolved'`` row for
     the same machine rather than by updating the original. The feed pairs them
     on the machine's most recent marker, so one row closes everything open on
     that machine — which is exactly what the producer emits per target machine.
+
+    Openness is judged over the same merged view the feed renders, but the
+    marker is appended to ``event_log_recent``: that table is the app's to
+    write, and a row lands there the instant we insert it rather than waiting
+    on a producer tick.
 
     This exists because Recover could only ever clear faults a producer command
     was holding open. Events with no command behind them — most visibly the
@@ -169,15 +242,33 @@ def mark_machine_events_resolved(
                 "(shift_id=%s machine_id=%s)", shift_id, machine_id,
             )
             return 0
+        # The guard has to see exactly what the feed shows, or Recover reports
+        # "nothing to clear" for an incident the operator can read on screen —
+        # which is what happens if this looks only at the sync-job table while
+        # the feed also reads the producer's. On the naive rule the original
+        # event keeps timestamp_end NULL forever, so a second click still found
+        # an "open" event and appended a second marker — the exact littering
+        # this was written to prevent.
         cur.execute(
-            """
-            SELECT count(*) FROM ai_serving.event_log_recent
-            WHERE shift_id = %s AND machine_id = %s
-              AND timestamp_end IS NULL AND event_type <> 'resolved'
+            f"""
+            {_MERGED_EVENTS_CTE}
+            SELECT count(*) AS open_events FROM events e
+            WHERE e.machine_id = %s
+              AND e.timestamp_end IS NULL AND e.event_type <> 'resolved'
+              AND NOT EXISTS (
+                    SELECT 1 FROM events r
+                    WHERE r.machine_id = e.machine_id
+                      AND r.event_type = 'resolved'
+                      AND r.timestamp_start >= e.timestamp_start
+              )
             """,
-            (shift_id, machine_id),
+            (shift_id, shift_id, machine_id),
         )
-        open_events = int((cur.fetchone() or [0])[0])
+        # The pool hands out RealDictCursor rows. Indexing one by position
+        # raises KeyError, which took this whole function out before it could
+        # write a thing — every Recover click that reached here died on the
+        # count it was about to act on.
+        open_events = int((cur.fetchone() or {}).get("open_events", 0))
         if not open_events:
             return 0
         cur.execute(
@@ -204,15 +295,24 @@ def mark_machine_events_resolved(
     return open_events
 
 
-def read_inventory_latest(shift_id: str) -> list[dict[str, Any]]:
-    """All current inventory materials for ``shift_id`` (one row per material)."""
+def read_inventory_latest(
+    shift_id: str, recent_seconds: int = LATEST_RECENT_SECONDS
+) -> list[dict[str, Any]]:
+    """All current inventory materials for ``shift_id`` (one row per material).
+
+    Derived from ``inventory_status_history`` for the reason given in
+    ``read_machine_state_latest``: ``inventory_status`` is written by the
+    quality-sync job's ~60 s cycle, ``*_history`` by the producer at 1 Hz.
+    """
     return query(
-        """
-        SELECT material_id, on_hand_qty, safety_stock, reorder_point,
+        f"""
+        SELECT DISTINCT ON (material_id)
+               material_id, on_hand_qty, safety_stock, reorder_point,
                status, consumption_rate_per_hour
-        FROM ai_serving.inventory_status
+        FROM ai_serving.inventory_status_history
         WHERE shift_id = %s
-        ORDER BY material_id
+          AND ts > NOW() - INTERVAL '{int(recent_seconds)} seconds'
+        ORDER BY material_id, ts DESC
         """,
         (shift_id,),
     ) or []
