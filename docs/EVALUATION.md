@@ -81,6 +81,50 @@ Traces land in the experiment set by `MLFLOW_EXPERIMENT_PATH` (per env, so dev
 and prod don't intermix). Open the experiment in MLflow to inspect a run, or use
 the in-app reasoning-trace card which surfaces the same spans inline.
 
+## Who can see the traces
+
+Sharing the app does not share its traces, and the gap is silent: a colleague
+with CAN_MANAGE on the app opens the traces tab and sees an empty list rather
+than an error. The reason is that the app never renders traces itself — it
+deep-links into the workspace MLflow UI, so the traces page runs under *their*
+identity, not the app's service principal. The spans are there; their identity
+just can't select them.
+
+The traces live in Delta tables, so a viewer needs all four of these, and
+missing any one produces the same empty page:
+
+| Grant | On | Why |
+| --- | --- | --- |
+| `USE CATALOG` | the catalog | traverse to the schema |
+| `USE SCHEMA` | the trace schema | traverse to the tables |
+| `SELECT` | each `<prefix>_otel_*` table | the spans themselves |
+| `CAN_USE` | the SQL warehouse | the traces page reads those tables with a query, which needs somewhere to run |
+
+`scripts/provision_trace_storage.py` applies all four on every deploy, plus
+`CAN_READ` on the experiment for the case where `/Shared` has been locked down.
+By default it grants them to everyone. That is the deliberate default for a
+demo: the cost of granting too little is a confusing blank page, and the cost
+of granting too much is a colleague reading spans from a simulated production
+line.
+
+One wrinkle worth knowing if you grant by hand: the everyone-group has two
+names. Unity Catalog is account-level and calls it `account users`; the
+workspace ACLs behind warehouses and experiments call it `users`. Each rejects
+the other's spelling, and UC fails with `PRINCIPAL_DOES_NOT_EXIST`. Named
+groups such as `data-team` are the same in both.
+
+**If those traces are sensitive, narrow it.** Set `trace_viewers` in your
+profile in `config/project-settings.yaml` to a comma-separated list of groups
+and/or user emails, or to `none` to grant nobody but the app:
+
+```yaml
+trace_viewers: 'data-platform-team,alice@example.com'
+```
+
+Narrowing only affects grants made from then on — it does not revoke access
+already granted by an earlier deploy. Revoke those yourself with `REVOKE`, and
+note that the warehouse `CAN_USE` grant is separate from Unity Catalog.
+
 ## Judge quality and alignment (known limitation)
 
 The LLM-backed judges here are **unaligned** — they reflect the base judge

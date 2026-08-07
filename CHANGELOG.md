@@ -6,6 +6,56 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.8] - 2026-08-07
+
+One fix, reported by a colleague rather than by anything in the repo: the app
+had been shared with them to manage, and its traces were invisible. Nothing was
+broken in the sense a test can reach — every component worked, and the seam
+between two permission systems was simply never crossed. The interesting part
+is that fixing it surfaced two further traps that grant nothing while reporting
+success, both of which were caught by running the fix against a live workspace
+rather than by reading it. That is the same practice v0.3.7 argued for, applied
+to provisioning instead of serving.
+
+**1 bug fixed · 20 new tests (2,213 → 2,233).**
+Since v0.1.0: 161 bugs fixed, 6 security advisories closed, 27 features added,
+and the test suite grown from 511 to 2,233.
+
+Counts are measured rather than estimated: `pytest --collect-only` reports
+2,213 tests at v0.3.7 and 2,233 here. No TypeScript changed, and `vitest` runs
+194 tests across 19 files as it did at v0.3.7 — earlier releases quoted "161
+blocks" for this, a figure that had drifted from anything reproducible, so it
+is stated here as the runner reports it. No dependency changed either, so the
+advisory review recorded in `SECURITY.md` at v0.3.6 still stands.
+
+### Fixed
+
+- **Sharing the app did not share its traces, and said nothing about it.** The
+  app writes traces as its own service principal, but nobody reads them that
+  way: the UI deep-links into the workspace MLflow experiment, so the traces
+  page runs under whoever clicked. Granting someone CAN_MANAGE on the app
+  grants them nothing in Unity Catalog, so a colleague opened the traces tab to
+  an empty list rather than an error — the spans were there, their identity
+  just could not select them. `provision_trace_storage.py` now grants trace
+  readers the four things that stand between them and a span: `USE CATALOG`,
+  `USE SCHEMA`, `SELECT` on each trace table, and `CAN_USE` on the warehouse
+  that runs the query, plus `CAN_READ` on the experiment for deployments that
+  have locked `/Shared` down. Missing any one produces the same blank page,
+  which is why each is granted and tested separately.
+
+  The default is everyone in the account, on the grounds that an under-grant
+  fails silently while an over-grant means a colleague reads spans from a
+  simulated line. Set `trace_viewers` in your profile to narrow it to named
+  groups or emails, or to `none` to grant nobody; see docs/EVALUATION.md.
+
+  Two traps are pinned by tests because both grant nothing while appearing to
+  work. The everyone-group has two names — Unity Catalog is account-level and
+  knows it as `account users`, the workspace ACLs behind warehouses and
+  experiments as `users` — and each layer rejects the other's spelling. And
+  `update_permissions` sets a principal's level rather than raising it, so
+  granting `CAN_USE` to someone already holding `CAN_MANAGE` would have quietly
+  demoted them; existing holders are now skipped.
+
 ## [0.3.7] - 2026-08-06
 
 Everything here was found by watching v0.3.6 run in production rather than by
@@ -1966,6 +2016,8 @@ GenAI copilot for production-line operations, real-time streaming
 simulator (Zerobus → Lakebase), one-command `deploy.sh`, Data Quality
 dashboard, and a baseline MLflow eval harness.
 
+[0.3.8]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.3.8
+[0.3.7]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.3.7
 [0.3.6]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.3.6
 [0.3.5]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.3.5
 [0.3.4]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.3.4

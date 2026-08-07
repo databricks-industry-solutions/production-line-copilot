@@ -57,3 +57,20 @@ def test_the_changelog_keeps_an_unreleased_section():
     """Somewhere to write the next change down, so it does not go unrecorded."""
     changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
     assert "## [Unreleased]" in changelog
+
+
+def test_every_released_version_links_to_its_tag():
+    """A bracketed heading with no link definition renders as literal brackets.
+
+    v0.3.7 shipped without its definition and nothing noticed, because the
+    heading still reads correctly as text — the break is only visible to
+    someone clicking it on GitHub.
+    """
+    changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    headings = set(re.findall(r"^## \[(\d+\.\d+\.\d+)\]", changelog, re.M))
+    linked = set(re.findall(r"^\[(\d+\.\d+\.\d+)\]:\s*https?://", changelog, re.M))
+    missing = sorted(headings - linked, key=lambda v: [int(p) for p in v.split(".")])
+    assert not missing, (
+        f"CHANGELOG.md has sections with no link definition: {missing}. "
+        "Add a '[x.y.z]: <release url>' line at the foot of the file."
+    )

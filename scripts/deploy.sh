@@ -799,10 +799,16 @@ fi
 # yaml swap and the redeploy below pick the file up.
 #
 # Non-fatal: a failure costs observability, not a working app.
+#
+# Who may READ the traces, on top of the app SP that writes them. Unset means
+# the script's default (every workspace user); set trace_viewers in
+# project-settings to narrow it, or to 'none' to grant nobody.
+TRACE_VIEWERS=$(_profile_field trace_viewers)
 echo "=== provision_trace_storage.py $ENV ==="
 TRACE_OUT=$("${PROJECT_PY[@]}" scripts/provision_trace_storage.py "$ENV" \
   --settings "$ROOT_DIR/$PROJECT_SETTINGS_YAML" \
-  ${APP_SP_ID:+--app-sp "$APP_SP_ID"} 2>&1) || true
+  ${APP_SP_ID:+--app-sp "$APP_SP_ID"} \
+  ${TRACE_VIEWERS:+--trace-viewers "$TRACE_VIEWERS"} 2>&1) || true
 echo "$TRACE_OUT"
 if echo "$TRACE_OUT" | grep -q 'MLFLOW_EXPERIMENT_ID updated'; then
   NEEDS_REDEPLOY=1

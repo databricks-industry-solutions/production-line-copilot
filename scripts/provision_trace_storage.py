@@ -33,6 +33,17 @@ failure rather than written into the app config.
 Idempotent: the link is recorded in experiment tags, so a second run reads the
 tags and reports rather than re-linking. Safe to run on every deploy.
 
+Writing traces and reading them need different grants, and the second set is
+easy to forget because nothing about it is visible to whoever deployed the app.
+The app writes as its own service principal (``--app-sp``), but nobody reads
+that way: the UI deep-links into the workspace MLflow experiment, so the traces
+page runs under the *viewer's* identity. Sharing the app itself grants nothing
+in Unity Catalog, so a collaborator with CAN_MANAGE on the app still opens the
+traces tab to an empty list — the spans are there, their identity just cannot
+select them. ``--trace-viewers`` closes that gap and defaults to every user in
+the workspace; see ``_grant_trace_viewers`` for what is granted and
+docs/EVALUATION.md ("Who can see the traces") for how to narrow it.
+
 Usage:
   python3 scripts/provision_trace_storage.py dev  --profile <p> [--app-sp <id>]
   python3 scripts/provision_trace_storage.py prod --profile <p> --dry-run
@@ -83,6 +94,28 @@ TRACES_SUFFIX = "-traces"
 # Names the trace tables so they read as ours in a schema that also holds the
 # app's own tables, rather than as MLflow's generic defaults.
 TABLE_PREFIX = "prodline_traces"
+
+# Databricks' own name for "everyone", as Unity Catalog spells it. The default
+# is deliberately open: traces are a debugging surface for whoever is running
+# the demo, and the failure mode of granting too little is silent and confusing
+# (an empty traces tab) while the cost of granting too much is a colleague
+# reading spans from a simulated line. Deployments where that trade is wrong
+# should pass --trace-viewers with a narrower group, or 'none' to grant nobody.
+DEFAULT_TRACE_VIEWERS = "account users"
+
+# The same group has two names depending on which layer is asked. Unity Catalog
+# is an account-level service and knows it as "account users"; the workspace
+# ACLs behind warehouses and experiments know it as "users" and reject the
+# other spelling — as does UC, in reverse, with PRINCIPAL_DOES_NOT_EXIST. Only
+# the everyone-group is affected: an account group like "data-team" is synced
+# into the workspace under the name it already has.
+_WORKSPACE_ALIASES = {"account users": "users"}
+
+# Levels that already imply being able to run a query on the warehouse. Checked
+# before granting, because update_permissions sets a principal's level rather
+# than raising it, so granting CAN_USE to someone holding CAN_MANAGE would take
+# permission away.
+_WAREHOUSE_USE_LEVELS = {"CAN_USE", "CAN_MANAGE", "IS_OWNER"}
 
 
 def _candidates(base: str):
@@ -165,7 +198,163 @@ def _ensure_schema(warehouse_id: str, catalog: str, schema: str) -> None:
         cur.close()
 
 
-def provision(env: str, settings: Path, app_sp: str = "", dry_run: bool = False) -> int:
+def _split_viewers(raw: str) -> list[str]:
+    """Parse the comma-separated --trace-viewers value.
+
+    ``none`` is spelled out as well as accepted empty, because the opt-out has
+    to be expressible in project-settings.yaml, where a blank value is
+    indistinguishable from a key nobody set.
+    """
+    parts = [part.strip() for part in (raw or "").split(",") if part.strip()]
+    return [] if parts == ["none"] else parts
+
+
+def _principal_field(principal: str) -> dict[str, str]:
+    """Address a principal the way the workspace permissions APIs expect.
+
+    Two adjustments, both of which are otherwise a silent no-grant: the APIs
+    take the principal in a differently-named field per type ("@" is what
+    separates the two in practice, since users are identified by email and
+    groups by a bare name), and the everyone-group goes by a different name
+    here than it does in Unity Catalog.
+    """
+    principal = _WORKSPACE_ALIASES.get(principal, principal)
+    return {"user_name": principal} if "@" in principal else {"group_name": principal}
+
+
+def _grant_trace_viewers(
+    warehouse_id: str,
+    catalog: str,
+    schema: str,
+    tables: list[str],
+    experiment_id: str,
+    viewers: list[str],
+) -> None:
+    """Let people other than the app read the traces the app writes.
+
+    Four separate grants stand between a viewer and a trace, and missing any
+    one of them produces the same symptom — a traces tab that loads and shows
+    nothing:
+
+      * USE CATALOG and USE SCHEMA, to traverse to the tables at all
+      * SELECT on each trace table, where the spans actually live
+      * CAN_USE on the warehouse, because the traces page reads those tables
+        with a query and the query needs somewhere to run
+      * CAN_READ on the experiment, which the default viewers already inherit
+        from /Shared but a narrower group would not
+
+    None of these follow from sharing the app, which is the part that surprises
+    people: the app permission governs who can open the app, not who can read
+    the Delta tables behind it.
+
+    The first two grants go through Unity Catalog and the last two through the
+    workspace ACLs, which is why the everyone-group is named twice — see
+    ``_WORKSPACE_ALIASES``.
+    """
+    if not viewers:
+        print("  no --trace-viewers; skipping viewer grants (only the app can read traces)")
+        return
+
+    print(f"  granting trace read access to {', '.join(viewers)}")
+    for viewer in viewers:
+        _grant(warehouse_id, f"GRANT USE CATALOG ON CATALOG `{catalog}` TO `{viewer}`")
+        _grant(warehouse_id, f"GRANT USE SCHEMA ON SCHEMA `{catalog}`.`{schema}` TO `{viewer}`")
+        for table in tables:
+            _grant(warehouse_id, f"GRANT SELECT ON TABLE {table} TO `{viewer}`")
+    _grant_warehouse_use(warehouse_id, viewers)
+    _grant_experiment_read(experiment_id, viewers)
+
+
+def _grant_warehouse_use(warehouse_id: str, viewers: list[str]) -> None:
+    """Give viewers CAN_USE on the warehouse that answers the traces query.
+
+    Principals that can already use the warehouse are skipped rather than
+    re-granted: update_permissions sets a level rather than raising it, so
+    sending CAN_USE for someone who holds CAN_MANAGE would demote them.
+    """
+    if not warehouse_id:
+        print("  no warehouse id in profile — skipping warehouse grants for viewers")
+        return
+    from databricks.sdk import WorkspaceClient
+    from databricks.sdk.service.sql import (
+        WarehouseAccessControlRequest,
+        WarehousePermissionLevel,
+    )
+
+    try:
+        client = WorkspaceClient()
+        current = client.warehouses.get_permissions(warehouse_id)
+        already = {
+            entry.group_name or entry.user_name or entry.service_principal_name
+            for entry in (current.access_control_list or [])
+            if any(
+                (perm.permission_level.value if perm.permission_level else "")
+                in _WAREHOUSE_USE_LEVELS
+                for perm in (entry.all_permissions or [])
+            )
+        }
+        # Compare under the workspace's own name for the principal, or the
+        # everyone-group looks absent from an ACL it is already in — and the
+        # grant below would then set a level it may already exceed.
+        pending = [
+            viewer
+            for viewer in viewers
+            if _WORKSPACE_ALIASES.get(viewer, viewer) not in already
+        ]
+        if not pending:
+            print(f"  warehouse {warehouse_id}: viewers can already query it")
+            return
+        client.warehouses.update_permissions(
+            warehouse_id,
+            access_control_list=[
+                WarehouseAccessControlRequest(
+                    **_principal_field(viewer),
+                    permission_level=WarehousePermissionLevel.CAN_USE,
+                )
+                for viewer in pending
+            ],
+        )
+        print(f"  ok: CAN_USE on warehouse {warehouse_id} for {', '.join(pending)}")
+    except Exception as exc:  # noqa: BLE001 - a missing grant is visible in the UI
+        print(f"  WARN: could not grant CAN_USE on warehouse {warehouse_id}: {exc}")
+
+
+def _grant_experiment_read(experiment_id: str, viewers: list[str]) -> None:
+    """Give viewers CAN_READ on the traces experiment.
+
+    Usually redundant — an experiment under /Shared is already readable by the
+    workspace — but a deployer who narrows --trace-viewers to a group may also
+    have locked /Shared down, and then this is the grant that matters.
+    """
+    from databricks.sdk import WorkspaceClient
+    from databricks.sdk.service.ml import (
+        ExperimentAccessControlRequest,
+        ExperimentPermissionLevel,
+    )
+
+    try:
+        WorkspaceClient().experiments.update_permissions(
+            experiment_id,
+            access_control_list=[
+                ExperimentAccessControlRequest(
+                    **_principal_field(viewer),
+                    permission_level=ExperimentPermissionLevel.CAN_READ,
+                )
+                for viewer in viewers
+            ],
+        )
+        print(f"  ok: CAN_READ on experiment {experiment_id} for {', '.join(viewers)}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  WARN: could not grant CAN_READ on the experiment: {exc}")
+
+
+def provision(
+    env: str,
+    settings: Path,
+    app_sp: str = "",
+    dry_run: bool = False,
+    trace_viewers: str = DEFAULT_TRACE_VIEWERS,
+) -> int:
     import mlflow
     from mlflow.entities import UnityCatalog
 
@@ -229,14 +418,19 @@ def provision(env: str, settings: Path, app_sp: str = "", dry_run: bool = False)
     else:
         raise SystemExit(f"No usable experiment name near {name} — clean up the scrap ones by hand.")
 
+    tables = [tags[t] for t in TABLE_TAGS if tags.get(t)]
+
     if app_sp:
-        tables = [tags[t] for t in TABLE_TAGS if tags.get(t)]
         print(f"  granting {app_sp} on {len(tables)} trace table(s)")
         for table in tables:
             _grant(warehouse, f"GRANT SELECT, MODIFY ON TABLE {table} TO `{app_sp}`")
         _grant_experiment(experiment_id, app_sp)
     else:
         print("  no --app-sp given; skipping grants (the app cannot write traces yet)")
+
+    _grant_trace_viewers(
+        warehouse, catalog, schema, tables, experiment_id, _split_viewers(trace_viewers)
+    )
 
     app_yaml = _pick_app_yaml(ENV_TO_APP_YAML[env])
     changed = _patch_yaml(app_yaml, {"MLFLOW_EXPERIMENT_ID": str(experiment_id)})
@@ -282,6 +476,15 @@ def main() -> int:
         help="project-settings file (defaults to the gitignored .local.yaml)",
     )
     ap.add_argument("--app-sp", default="", help="app service principal id to grant")
+    ap.add_argument(
+        "--trace-viewers",
+        default=DEFAULT_TRACE_VIEWERS,
+        help=(
+            "comma-separated users/groups to grant trace read access "
+            f"(default: {DEFAULT_TRACE_VIEWERS!r}, every workspace user; "
+            "pass an empty string to grant nobody)"
+        ),
+    )
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -290,7 +493,13 @@ def main() -> int:
         settings = ROOT / "config" / "project-settings.yaml"
 
     try:
-        return provision(args.env, settings, app_sp=args.app_sp, dry_run=args.dry_run)
+        return provision(
+            args.env,
+            settings,
+            app_sp=args.app_sp,
+            dry_run=args.dry_run,
+            trace_viewers=args.trace_viewers,
+        )
     except SystemExit:
         raise
     except Exception as exc:  # noqa: BLE001 - never fail a deploy over observability
