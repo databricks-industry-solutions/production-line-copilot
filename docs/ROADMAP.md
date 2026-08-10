@@ -247,19 +247,81 @@ Reviewed 2026-08-06. A sibling Databricks App
 (`production-optimizer-…databricksapps.com`, branded "Production Optimizer",
 titled "CO₂-EOR Digital Twin") covers a different domain — enhanced oil
 recovery in the Delaware Basin — but solves several presentation problems we
-have not. None of the below is started. Screenshots were taken at review time
-but are not committed.
+have not. Screenshots were taken at review time and deliberately stay out of
+the repo — they are another team's product and this repo is publicly mirrored.
+The 33-shot set is untracked in `.tmp_competitor/`, which means it survives
+only until someone cleans the working tree; re-capture rather than assume.
 
-- **Demo Guide as a first-class in-app tab.** Their default landing tab is a
-  presenter talk track: the customer scene, business-case stat cards, then six
-  numbered walkthrough steps, each with a quoted script, a duration (~45–60 s),
-  "point at" bullets, product-name chips, and a button that deep-links into the
-  exact view being discussed. Every other tab is numbered to match. This
-  accelerator is public and will be demoed by people who did not build it, and
-  right now the only guide is a README. Impact: High. Effort: S.
-  Prerequisite we do not have: the app is a single page with no routing, so a
-  deep link needs tab state in the URL — worth doing regardless, since no view
-  in ProdLine CoPilot is currently linkable either.
+- ~~**Demo Guide as a first-class in-app tab.**~~ **Done** —
+  `client/src/components/DemoGuideTab.tsx`. Eight beats over the seven other
+  tabs, each with a script written to be read aloud, a duration, "point at"
+  bullets, product chips, and a button that opens the view being described.
+  Two departures from their version. The counts are derived from the same
+  catalogs the rest of the app renders from rather than typed in, because a
+  guide is the one screen a presenter reads out loud and a stale number there
+  is said to a customer rather than merely displayed. And it closes with the
+  honest answers to the three questions this demo always provokes — does it
+  write anywhere, is the data real, what is the ROI — since the fastest way to
+  lose a technical room is to be caught overclaiming on the thing it already
+  suspects.
+
+  The prerequisite came with it: tab state now lives in the URL
+  (`client/src/lib/tabRouting.ts`), so every view is linkable. It rides in the
+  query string rather than the path because AppKit's `createApp` serves the
+  client and its history fallback is not ours to guarantee, which is the
+  difference between a deep link that survives a reload and one that 404s in
+  front of an audience. The guide leads the tab bar; the line is still what
+  opens by default, so the app does not greet an operator with instructions.
+
+- ~~**A live schematic you can watch, not just read.**~~ **Done** —
+  `client/src/components/ProcessFlowSchematic.tsx`, on the Line Status tab.
+  Their fluid schematic draws the estate as one connected process with animated
+  flow and per-equipment telemetry; ours drew three disconnected rows of tiles,
+  so the line never read as a line. The new view lays the 19 stations out as a
+  serpentine derived from `MACHINE_FLOW_ORDER`, which makes every consecutive
+  pair adjacent and every row change a short vertical drop, and animates each
+  section at its measured speed.
+
+  It shipped first as a tab of its own beside Line Status, and that was the
+  wrong shape: two pictures of one line, drawn from the same map, with the tile
+  grid the weaker of the two and no reason for anyone to keep both true. It
+  replaced the grid instead. Going the other way — keeping both — would have
+  meant the stale one is the one someone eventually screenshots.
+
+  Three decisions worth keeping. Motion is CSS `stroke-dashoffset` with the
+  duration set per element, so ~18 connectors animate on the compositor rather
+  than putting a repaint on the main thread every frame. Pace comes from
+  `speed_pct` rather than `throughput_per_min`, because throughput is measured
+  in different units along the line and animating 420 bottles a minute against
+  17 cases a minute would make the front look twenty times faster for no
+  physical reason. And the view finally distinguishes `blocked` from `starved`
+  — both are real cascade statuses, `blocked` is absent from `STATUS_COLORS`
+  and so renders as "idle" everywhere else in the app, and they point at
+  opposite ends of the line for a diagnosis.
+
+  It also closed a data gap rather than working around one: `feeds_machine_id`
+  was emitted by the producer and stored in UC but dropped by the quality-sync
+  job, the Lakebase inventory tables, and the SSE readers, so the app could say
+  a material was low but not what would stop. It now travels the whole chain,
+  pinned by `tests/agent_server/test_the_app_knows_what_a_material_feeds.py`.
+
+  Still open, deliberately: the quantity standing between two stations. The
+  cascade engine computes those buffer levels and drops them at emit, so no
+  gauge in the view claims to know them. Publishing them is the next item.
+
+- **Publish the buffer levels the cascade already computes.**
+  `src/streaming_sim/cascade.py` maintains a `BufferState` between every
+  adjacent pair — the thing that produces starved and blocked in the first
+  place — and `snapshot_to_dicts` discards it, so the honest line schematic
+  above can animate rate but not fill. Two columns on the machine row
+  (`input_buffer_pct`, `output_buffer_pct`) would carry it without a new table
+  or a new stream, following the same path
+  `scripts/migrate_line_kpi_add_oee_columns.sql` took for the OEE columns:
+  bronze DDL, the sync job's `select_cols`, the Lakebase DDL plus an idempotent
+  `ADD COLUMN IF NOT EXISTS`, and the SSE reader. It would turn the schematic's
+  connectors into real fill gauges and make "the buffer between the filler and
+  the capper has 40 seconds left" a thing the app can say. Impact: Med-High.
+  Effort: S-M.
 
 - **Time-series charts.** We render none. Not one: no OEE across the shift, no
   sensor history on the machine detail card, no trend behind an incident. The
@@ -297,6 +359,50 @@ but are not committed.
   current position, where every recommended action is a proposal because
   write-back does not exist. Tiering would let the distinction be a product
   decision rather than a limitation. Impact: Med. Effort: S.
+
+- **Asset topology as a graph, with the analytics on the graph.** Their Field
+  Overview draws the physical estate as a node-link network — wells, facilities,
+  pipelines, CO₂ sources, monitoring points, fleet, flares — over a map, with a
+  layer panel that toggles each class and carries its count, a right rail that
+  inspects whatever you click, and an Ask Agent box scoped to the selection.
+  Our line is already a graph and we draw it as a picture of one:
+  `ProcessFlowSchematic` lays the 19 machines out as a connected path with live
+  motion on it. That is still a picture rather than something you can compute
+  over — which is the part still missing.
+  The interesting version for us is not a map — we have one line, not a basin — but
+  the analytics a graph makes available: cascade reachability (which machines
+  a given fault can starve or block, and in what order), critical path and
+  bottleneck ranking, and buffer capacity as edge weight. The cascade engine in
+  the producer already computes propagation; nothing surfaces it as structure.
+  Pairs naturally with per-node inspection, since clicking a machine already
+  opens a detail card. Impact: Med-High. Effort: M.
+  (Reference screenshot of their Field Overview kept out of the repo — it is
+  another team's product and this repo is publicly mirrored. It is in the
+  review set described below.)
+
+- **An architecture view with live numbers on it.** Their Data & AI Flow tab is
+  a three-swimlane diagram — Data Sources, Lakehouse inside a dashed Unity
+  Catalog boundary, AI Agents & Serving — with animated edges, a legend,
+  clickable node drawers, and **live row counts on the nodes**. We have the
+  shape of this already in `SystemMap`, and we deliberately moved away from
+  theirs: its docstring records that an earlier version drew surfaces →
+  orchestrator → domains → foundation and was reshaped into a capability tree
+  because the flow form "reads as plumbing". So this is not a new idea, it is a
+  reversal to consider on new evidence. The evidence being the row counts: a
+  diagram nobody can check is plumbing, and a diagram whose nodes report how
+  many rows are in them is a claim the reviewer can audit live. Worth trying as
+  an addition to the map rather than a replacement for it. Impact: Med.
+  Effort: M.
+
+- **A surface where the fan-out is the point.** Their Supervisor tab runs five
+  specialists in parallel against one question and lands a synthesized verdict
+  on top of the five cards. Ours routes to exactly one specialist, which is the
+  better default — it is cheaper, faster, and the routing decision is itself
+  the interesting engineering. But it means the compound-AI story is told and
+  never shown. A deliberate fan-out mode, used sparingly, would demonstrate in
+  one screen what the System Map currently has to assert. Note their version is
+  also where their flagship bug lives (see below), so the failure mode is
+  charted. Impact: Med. Effort: M.
 
 ### What their build got wrong, and what it warns us about
 

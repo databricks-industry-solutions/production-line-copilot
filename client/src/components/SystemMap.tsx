@@ -76,7 +76,7 @@ interface Chip {
 const CONTROL_TOWER = [
   {
     name: 'Line Status',
-    desc: 'KPI strip, line schematic, machine detail, inventory',
+    desc: 'Animated schematic, every machine drawn as itself, plus KPIs and inventory',
     tag: 'SSE · LAKEBASE · SUB-SECOND',
     accent: 'bg-sky-500',
   },
@@ -331,7 +331,9 @@ export default function SystemMap(props: SystemMapProps = {}) {
           subtitle="What the line is doing right now — streamed, deterministic, no model in the path"
           topBar="bg-sky-500"
         >
-          <SectionLabel>4 operational tabs</SectionLabel>
+          {/* Counted, not typed. This label said "4" while the app had five,
+              because adding a tab elsewhere cannot reach a number written here. */}
+          <SectionLabel>{CONTROL_TOWER.length} operational tabs</SectionLabel>
           <div className="mt-2 space-y-1.5">
             {CONTROL_TOWER.map((t) => (
               <Leaf key={t.name} {...t} />

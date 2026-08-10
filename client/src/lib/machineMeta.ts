@@ -1,6 +1,6 @@
 /**
  * Defines machine registry metadata and fallback sensor derivations for the UI.
- * Used by `App`, `LineSchematic`, and `MachineDetailCard` for labels, neighbors, and inferred readings.
+ * Used by `App`, `ProcessFlowSchematic`, and `MachineDetailCard` for labels, neighbors, and inferred readings.
  * Fallback formulas intentionally mirror server-side sim logic so demo tiles stay numerically consistent.
  */
 

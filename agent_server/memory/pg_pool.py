@@ -129,6 +129,11 @@ CREATE TABLE IF NOT EXISTS ai_serving.inventory_status (
     reorder_point INTEGER DEFAULT 0,
     status TEXT DEFAULT 'OK',
     consumption_rate_per_hour DOUBLE PRECISION DEFAULT 0,
+    -- Which machine consumes this material. The producer has always emitted
+    -- it and UC has always stored it, but Lakebase dropped it on the way in,
+    -- so the app could say a material was low without being able to say what
+    -- would stop. The process-flow view draws supply lines from it.
+    feeds_machine_id TEXT,
     PRIMARY KEY (shift_id, material_id)
 );
 
@@ -231,10 +236,21 @@ CREATE TABLE IF NOT EXISTS ai_serving.inventory_status_history (
     reorder_point             DOUBLE PRECISION,
     status                    TEXT,
     consumption_rate_per_hour DOUBLE PRECISION,
+    feeds_machine_id          TEXT,
     PRIMARY KEY (shift_id, material_id, ts)
 );
 CREATE INDEX IF NOT EXISTS idx_inventory_status_history_shift_ts
     ON ai_serving.inventory_status_history (shift_id, ts);
+
+-- Same idempotent-migration reasoning as the scenario_commands ALTERs above:
+-- ``CREATE TABLE IF NOT EXISTS`` does nothing on a Lakebase provisioned
+-- before ``feeds_machine_id`` existed, so the quality-sync job would fail
+-- every batch trying to write a column that is not there. No-ops on fresh
+-- installs, where the column was just declared.
+ALTER TABLE ai_serving.inventory_status
+    ADD COLUMN IF NOT EXISTS feeds_machine_id TEXT;
+ALTER TABLE ai_serving.inventory_status_history
+    ADD COLUMN IF NOT EXISTS feeds_machine_id TEXT;
 
 CREATE TABLE IF NOT EXISTS ai_serving.event_log_history (
     event_id           TEXT NOT NULL,

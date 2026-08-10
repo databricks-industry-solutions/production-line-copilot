@@ -29,11 +29,21 @@ your own deployment. It ships with placeholder configuration and synthetic data
 ## Known advisories in dependencies
 
 Checked at the v0.3.6 release against [OSV](https://osv.dev): all 938 packages
-in the npm tree are clean. No dependency changed in v0.3.7 — neither `uv.lock`
-nor `package-lock.json` was touched — so the review below is still current. Two
-Python packages carry advisories, both pulled in transitively and both held
-below their fix by an upstream pin, so neither can be resolved from this
-repository:
+in the npm tree are clean. No dependency changed in v0.3.7 or v0.3.8, and
+`package-lock.json` is still untouched, so the npm side of the review stands.
+
+One Python package has moved since: `gitpython` 3.1.57 → 3.1.58, which closes
+six advisories in the 3.1.58 release — argument injection through
+`GitConfigParser.set_value`, code execution through a `Repo.init` template
+directory, and path traversal through submodule names. It reaches us only
+transitively, through `mlflow-skinny`, and none of those paths take input this
+application controls: mlflow uses it to read commit metadata, not to init
+repositories or write config. Taken anyway, because it was free — nothing pins
+`gitpython` below its fix, which is exactly what separates it from the two
+below.
+
+Those two remain, both pulled in transitively and both held below their fix by
+an upstream pin, so neither can be resolved from this repository:
 
 | Package | Version | Advisories | Fixed in | Held back by |
 |---|---|---|---|---|

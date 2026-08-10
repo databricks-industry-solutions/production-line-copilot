@@ -1,6 +1,6 @@
 /**
  * Central UI constants for status styling and the production-line node layout.
- * Used by `LineSchematic`, `KPIStrip`, and `App` when rendering machine state maps.
+ * Used by `ProcessFlowSchematic`, `KPIStrip`, and `App` when rendering machine state maps.
  * Coordinates are fixed to preserve visual lane ordering expected by operators and screenshots.
  */
 export const STATUS_COLORS = {

@@ -119,8 +119,15 @@ def test_trace_storage_runs_after_the_app_sp_is_known(lines):
 
 
 def test_a_new_experiment_id_triggers_a_redeploy(lines):
-    """The id lands in app.<env>.local.yaml, which only ships on a deploy."""
-    text = "\n".join(lines)
+    """The id lands in app.<env>.local.yaml, which only ships on a deploy.
+
+    Comments are stripped before the window is measured. This read a fixed
+    slice of raw source until twice in a row a comment explaining that step
+    pushed the wiring past the 600th character and failed a test about
+    redeploys. The invariant is unchanged; it is just no longer possible to
+    break it by writing prose.
+    """
+    text = "\n".join(t for _, t in _code_lines(lines))
     block = text.split("provision_trace_storage.py", 1)[1][:600]
     assert "MLFLOW_EXPERIMENT_ID updated" in block and "NEEDS_REDEPLOY=1" in block
 

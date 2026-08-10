@@ -12,7 +12,7 @@ import IncidentPanel from './components/IncidentPanel';
 import { useIncidentApi } from './lib/useIncidentApi';
 import { useSSELiveData } from './lib/useSSELiveData';
 import { shiftProgress, SHIFT_PLANNED_CASES } from './lib/shiftWindow';
-import LineSchematic from './components/LineSchematic';
+import ProcessFlowSchematic from './components/ProcessFlowSchematic';
 import KPIStrip from './components/KPIStrip';
 import InventoryPanel from './components/InventoryPanel';
 import EventFeed from './components/EventFeed';
@@ -20,13 +20,13 @@ import { isEventActive, buildResolvedTsByMachine } from './lib/eventFeedUtils';
 import { emptyKpiHoldState, resolveKpiFrame, type KpiHoldState } from './lib/kpiHold';
 import ChatPanel from './components/ChatPanel';
 import AboutTab from './components/AboutTab';
+import DemoGuideTab from './components/DemoGuideTab';
 import MultiAITab from './components/MultiAITab';
 import MachineDetailCard from './components/MachineDetailCard';
 import CostObservabilityTab from './components/CostObservabilityTab';
 import DataQualityTab from './components/DataQualityTab';
 import AdminJobControls from './components/AdminJobControls';
-
-type TabId = 'tower' | 'alerts' | 'ops' | 'quality' | 'multiai' | 'about';
+import { DEFAULT_TAB, searchWithTab, tabFromSearch, type TabId } from './lib/tabRouting';
 
 // Mirrors ``apply_incident`` in ``src/streaming_sim/incidents.py`` — kept in
 // sync manually because the client must override tile color the moment a
@@ -61,7 +61,9 @@ function App() {
     text: '',
     id: 0,
   });
-  const [activeTab, setActiveTab] = useState<TabId>('tower');
+  // Seeded from the URL so a shared link opens on the view it names — the Demo
+  // Guide's walkthrough buttons are the main producer of those links.
+  const [activeTab, setActiveTab] = useState<TabId>(() => tabFromSearch(window.location.search) ?? DEFAULT_TAB);
   const incidentApi = useIncidentApi();
   const [simRunning, setSimRunning] = useState(true);
   // Hide the "Trigger Incident" simulator card by default so the dashboard
@@ -129,8 +131,24 @@ function App() {
     setPath(nextPath);
   }, []);
 
+  /**
+   * Switch tabs and leave the URL saying so, so Back works and the address bar
+   * is worth copying. pushState rather than replaceState because a walkthrough
+   * that cannot be stepped back through is worse than one that never moved.
+   */
+  const selectTab = useCallback((tab: TabId) => {
+    setActiveTab(tab);
+    const nextSearch = searchWithTab(window.location.search, tab);
+    if (window.location.search !== nextSearch) {
+      window.history.pushState({}, '', `${window.location.pathname}${nextSearch}`);
+    }
+  }, []);
+
   useEffect(() => {
-    const onPop = () => setPath(window.location.pathname || '/');
+    const onPop = () => {
+      setPath(window.location.pathname || '/');
+      setActiveTab(tabFromSearch(window.location.search) ?? DEFAULT_TAB);
+    };
     window.addEventListener('popstate', onPop);
     return () => window.removeEventListener('popstate', onPop);
   }, []);
@@ -207,10 +225,13 @@ function App() {
     }
   }, []);
 
-  const handleAskAgent = useCallback((query: string) => {
-    setChatQuery((prev) => ({ text: query, id: prev.id + 1 }));
-    setActiveTab('alerts');
-  }, []);
+  const handleAskAgent = useCallback(
+    (query: string) => {
+      setChatQuery((prev) => ({ text: query, id: prev.id + 1 }));
+      selectTab('alerts');
+    },
+    [selectTab]
+  );
 
   const handleMachineClick = useCallback((machineId: string) => {
     setSelectedMachine((prev) => (prev === machineId ? null : machineId));
@@ -407,11 +428,10 @@ function App() {
         performance_to_now: toNumber(k.performance_to_now),
       },
       totalThroughput,
-      kpiHoldRef.current,
+      kpiHoldRef.current
     );
     kpiHoldRef.current = resolved.state;
-    const { oee_to_now: oee, availability_to_now: availability, performance_to_now: performance } =
-      resolved.value;
+    const { oee_to_now: oee, availability_to_now: availability, performance_to_now: performance } = resolved.value;
 
     return {
       oee_to_now: oee,
@@ -657,10 +677,14 @@ function App() {
           {/* Tab bar */}
           {path !== '/admin' && (
             <nav className="flex gap-0 -mb-px" role="tablist">
-              <TabButton active={activeTab === 'tower'} onClick={() => setActiveTab('tower')} label="Line Status" />
+              {/* First, so a presenter does not hunt for it. Not the default
+                  tab, though: someone opening the app cold should see a plant,
+                  not instructions about a plant. */}
+              <TabButton active={activeTab === 'guide'} onClick={() => selectTab('guide')} label="Demo Guide" />
+              <TabButton active={activeTab === 'tower'} onClick={() => selectTab('tower')} label="Line Status" />
               <TabButton
                 active={activeTab === 'alerts'}
-                onClick={() => setActiveTab('alerts')}
+                onClick={() => selectTab('alerts')}
                 label="Events & AI"
                 /* Red number = currently-active incidents only. Resolved
                    rows still appear under the feed's History filter but
@@ -668,18 +692,10 @@ function App() {
                    for the exact reconciliation (mirrors EventFeed). */
                 badge={activeIncidentBadge}
               />
-              <TabButton active={activeTab === 'ops'} onClick={() => setActiveTab('ops')} label="Cost & Obs" />
-              <TabButton
-                active={activeTab === 'quality'}
-                onClick={() => setActiveTab('quality')}
-                label="Data Integrity"
-              />
-              <TabButton
-                active={activeTab === 'multiai'}
-                onClick={() => setActiveTab('multiai')}
-                label="Multi-AI"
-              />
-              <TabButton active={activeTab === 'about'} onClick={() => setActiveTab('about')} label="About" />
+              <TabButton active={activeTab === 'ops'} onClick={() => selectTab('ops')} label="Cost & Obs" />
+              <TabButton active={activeTab === 'quality'} onClick={() => selectTab('quality')} label="Data Integrity" />
+              <TabButton active={activeTab === 'multiai'} onClick={() => selectTab('multiai')} label="Multi-AI" />
+              <TabButton active={activeTab === 'about'} onClick={() => selectTab('about')} label="About" />
             </nav>
           )}
         </div>
@@ -719,12 +735,14 @@ function App() {
                     </ErrorBoundary>
 
                     <ErrorBoundary>
-                      <LineSchematic
+                      <ProcessFlowSchematic
                         machineStates={machineStatesMap}
+                        inventory={sseLive.inventory}
+                        kpi={kpiAtT}
                         selectedMachine={selectedMachine}
-                        highlightMachines={[]}
                         onMachineClick={handleMachineClick}
                         loading={!sseLive.hasConnected}
+                        waiting={sseLive.waiting}
                       />
                     </ErrorBoundary>
 
@@ -756,39 +774,41 @@ function App() {
                     </div>
                   )}
                 </div>
-
-                {selectedMachine && selectedMachineDetail && (
-                  <div
-                    className="fixed inset-0 z-[100] flex items-end justify-center sm:items-center sm:justify-end p-3 sm:p-6"
-                    role="dialog"
-                    aria-modal="true"
-                    aria-labelledby="machine-detail-title"
-                  >
-                    <button
-                      type="button"
-                      className="absolute inset-0 bg-black/45 backdrop-blur-[1px]"
-                      aria-label="Close machine details"
-                      onClick={() => setSelectedMachine(null)}
-                    />
-                    <div className="relative z-10 w-full max-w-md max-h-[min(88vh,640px)] overflow-y-auto rounded-lg shadow-2xl">
-                      <MachineDetailCard
-                        machineId={selectedMachineDetail.machineId}
-                        meta={selectedMachineDetail.meta}
-                        neighbors={neighborsDisplay}
-                        lineKpi={lineKpiForDetail}
-                        materialsHere={materialsAtSelectedMachine}
-                        state={selectedMachineDetail.state}
-                        readingsEstimated={selectedMachineDetail.readingsEstimated}
-                        events={eventsForSelectedMachine}
-                        onClose={() => setSelectedMachine(null)}
-                        onAskAgent={handleAskAgent}
-                        loading={!sseLive.hasConnected && selectedMachineDetail.state == null}
-                      />
-                    </div>
-                  </div>
-                )}
               </div>
             )
+          )}
+
+          {/* Sits outside the tab body so the modal is not nested inside the
+              scrolling column that opened it. */}
+          {path !== '/admin' && activeTab === 'tower' && selectedMachine && selectedMachineDetail && (
+            <div
+              className="fixed inset-0 z-[100] flex items-end justify-center sm:items-center sm:justify-end p-3 sm:p-6"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="machine-detail-title"
+            >
+              <button
+                type="button"
+                className="absolute inset-0 bg-black/45 backdrop-blur-[1px]"
+                aria-label="Close machine details"
+                onClick={() => setSelectedMachine(null)}
+              />
+              <div className="relative z-10 w-full max-w-md max-h-[min(88vh,640px)] overflow-y-auto rounded-lg shadow-2xl">
+                <MachineDetailCard
+                  machineId={selectedMachineDetail.machineId}
+                  meta={selectedMachineDetail.meta}
+                  neighbors={neighborsDisplay}
+                  lineKpi={lineKpiForDetail}
+                  materialsHere={materialsAtSelectedMachine}
+                  state={selectedMachineDetail.state}
+                  readingsEstimated={selectedMachineDetail.readingsEstimated}
+                  events={eventsForSelectedMachine}
+                  onClose={() => setSelectedMachine(null)}
+                  onAskAgent={handleAskAgent}
+                  loading={!sseLive.hasConnected && selectedMachineDetail.state == null}
+                />
+              </div>
+            </div>
           )}
 
           <div className={path !== '/admin' && activeTab === 'alerts' ? '' : 'hidden'}>
@@ -849,6 +869,14 @@ function App() {
           {path !== '/admin' && activeTab === 'about' && (
             <ErrorBoundary>
               <AboutTab />
+            </ErrorBoundary>
+          )}
+
+          {/* Static content, but boundaried like the rest: the one tab that
+              must not break is the one someone is presenting from. */}
+          {path !== '/admin' && activeTab === 'guide' && (
+            <ErrorBoundary>
+              <DemoGuideTab onOpenTab={selectTab} />
             </ErrorBoundary>
           )}
         </div>

@@ -1,6 +1,6 @@
 /**
  * Shows per-machine diagnostics, contextual KPIs, and incident history in the right-side modal.
- * Used by `App` when a node is selected from `LineSchematic`.
+ * Used by `App` when a node is selected from `ProcessFlowSchematic`.
  * Combines live values with metadata/fallback estimates so operators still get coherent context during sparse payloads.
  */
 import { Card, CardContent, CardHeader, CardTitle, Skeleton } from '@databricks/appkit-ui/react';

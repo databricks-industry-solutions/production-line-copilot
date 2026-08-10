@@ -16,6 +16,19 @@ ProdLine CoPilot simulates a 19-machine bottling/packaging line in real time. A 
 
 **The demo story:** You're a line manager. The line is running normally at ~82 % OEE. You trigger an incident (e.g. filler breakdown). Watch the cascade ripple across the line in real time. Ask the AI assistant what happened, get root-cause analysis and action items, then resolve.
 
+## Watching the cascade
+
+The Line Status tab draws the line the way the line is built. Each of the 15 machines is drawn as the equipment it is — the filler as a bowl and filling valves, the palletiser as an arm over a pallet — so you find the machine you want by its shape rather than by reading every label. The four conveyors are not machines you stop at, so they are drawn as the belts between the others, which is what they are; they keep their status, their alarms and their detail card. Each section animates at the speed it is actually running, so a fault is visible as stillness spreading rather than as tiles changing colour.
+
+Below is the moment the demo turns on: the filler has stopped, the two machines behind it are **blocked** because their output buffers filled, and the five in front of it are **starved** because their input drained — while the far end of the line is still working through product that was already past the fault, running degraded at 65 % of design rather than stopped. Blocked and starved point in opposite directions: starved means the fault is upstream of you, blocked means it is downstream. That is the difference between sending a fitter to the right end of the line and the wrong one. The dashed lines dropping in are the materials each machine consumes, coloured by how much cover is left and read from live inventory rather than a diagram — including the belt lubricant that feeds a conveyor.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/media/process_flow_dark.png">
+  <img alt="The live line schematic on the Line Status tab: a bottling line drawn as a serpentine, where each machine is a schematic symbol of itself — a depalletiser, a wash tunnel with spray nozzles, a camera inspector, a filler bowl with valves, a rotary capper, a pasteuriser tunnel, a label reel, a coder, a case packer, a shrink wrapper, a tape sealer, a checkweigher, a palletising arm and a stretch wrapper — joined by animated conveyor belts with rollers. The filler is stopped and lit red; the inspector and the conveyor behind it are blocked in orange; the five machines after it are starved in grey; the last seven still run degraded in amber on product already past the fault. Eight material feeds hang above the machines they supply, coloured by remaining cover, one of them belt lubricant feeding a conveyor." src="docs/media/process_flow.png">
+</picture>
+
+What the schematic will not draw is how much product is standing between two stations. The cascade engine computes those buffer levels and discards them at emit, so nothing downstream has them and no gauge here pretends otherwise. Regenerate with `node scripts/dev/capture_process_flow.mjs`.
+
 ## System Map
 
 One app, two branches. The **Control Tower** is what the line is doing right now — streamed and deterministic, with no model in the path. The **Specialist Copilot** is where you ask a question and a router hands it to the one specialist that owns the problem. Each governed Genie space covers one domain of the manufacturing model, because narrow scope is what keeps Genie accurate; a specialist reaches the domain it works in. Some domains serve several specialists — `production` answers for the OEE coach, the schedule optimizer and the strategic advisor — and the shift briefing has no governed space at all, since it reads the live shift rather than the enterprise model. The spaces are opt-in per domain (`GENIE_SPACE_*`); a specialist whose domain is unprovisioned simply has one fewer tool and falls back to direct SQL.
@@ -49,6 +62,7 @@ Each downtime minute, OEE point, and MTTR reduction carries a line-specific doll
 
 - **Real-Time Simulation:** a deterministic cascade engine (in the producer job) with buffer-based propagation streams the live line state.
 - **Live KPIs:** OEE, availability, performance, and quality update via SSE (~1 s playback from the Lakebase serving layer) with smooth number transitions.
+- **Animated Line Schematic:** the whole line as one connected path, with every machine drawn as a schematic symbol of itself and the conveyors drawn as the belts between them. Each section moves at its measured rate and stops where product has stopped, and material feeds are drawn from live inventory. Motion runs on the compositor, and `prefers-reduced-motion` is honoured without losing the numbers.
 - **Incident Management:** trigger faults per scenario, watch cascading effects, resolve with one click.
 - **Data Source Labels:** every panel shows where data originates (SCADA, MES, SAP, LIMS, CMMS, WMS).
 - **GenAI Assistant:** 8 specialist agents analyze live simulation state and recommend actions.

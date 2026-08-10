@@ -805,7 +805,24 @@ fi
 # project-settings to narrow it, or to 'none' to grant nobody.
 TRACE_VIEWERS=$(_profile_field trace_viewers)
 echo "=== provision_trace_storage.py $ENV ==="
-TRACE_OUT=$("${PROJECT_PY[@]}" scripts/provision_trace_storage.py "$ENV" \
+# Two env vars this call cannot do without, and the second was hidden behind
+# the first.
+#
+# DATABRICKS_CONFIG_PROFILE, because the script builds a bare WorkspaceClient()
+# and takes no --profile. Without it the SDK runs its own default chain and
+# ignores the profile the rest of this deploy is using — so a non-default
+# DATABRICKS_PROFILE would provision trace storage, and grant read on it, in
+# whatever workspace the default profile happens to point at. It fails loudly
+# when that profile has no valid token, which is the good case; the bad case is
+# a valid token for the wrong workspace.
+#
+# MLFLOW_TRACKING_URI, because mlflow defaults to a local ./mlruns store when
+# it is unset. The script then creates its experiment on disk, and the UC link
+# fails with "trace_location is only supported with a Databricks tracking URI"
+# — after leaving an mlruns directory in the deploy tree. This never surfaced
+# while the profile was missing, because auth failed first.
+TRACE_OUT=$(DATABRICKS_CONFIG_PROFILE="$PROFILE" MLFLOW_TRACKING_URI=databricks \
+  "${PROJECT_PY[@]}" scripts/provision_trace_storage.py "$ENV" \
   --settings "$ROOT_DIR/$PROJECT_SETTINGS_YAML" \
   ${APP_SP_ID:+--app-sp "$APP_SP_ID"} \
   ${TRACE_VIEWERS:+--trace-viewers "$TRACE_VIEWERS"} 2>&1) || true
@@ -1400,7 +1417,11 @@ echo "    (a fresh run appears within a minute or two; the SSE stream gaps brief
 echo
 echo "=== Closing incidents that were resolved but still look open ==="
 SIM_SHIFT=$(_profile_field sim_shift_id)
-"${PROJECT_PY[@]}" scripts/close_open_incidents.py \
+# DATABRICKS_CONFIG_PROFILE for the same reason as the trace provisioning
+# above: this one builds a bare WorkspaceClient() too, and would otherwise
+# reconcile incidents through whatever workspace the default profile names.
+DATABRICKS_CONFIG_PROFILE="$PROFILE" \
+  "${PROJECT_PY[@]}" scripts/close_open_incidents.py \
   --catalog "$UC_CATALOG" --schema "$UC_SCHEMA" \
   --shift-id "${SIM_SHIFT:-shift_1}" --warehouse-id "$WAREHOUSE_ID" \
   || echo "  WARN: incident reconciliation failed — the assistant may report incidents the board does not show." >&2

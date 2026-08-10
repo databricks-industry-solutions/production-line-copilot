@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Run every gate before a push, because on this repository nothing else does.
+#
+# GitHub Enterprise disables hosted runners here, so
+# `.github/workflows/tests.yml` cannot start: it reports failure in about three
+# seconds without having run a single test. Both that workflow and
+# `scripts/check.sh` already say so in their headers; this is the "wire it to a
+# pre-push hook" half of the advice, which had never been done. Until now the
+# only thing standing between a broken commit and `main` was remembering.
+#
+# Installed by `scripts/hooks/install.sh`, which links it to
+# `.git/hooks/pre-push`. That path still works even though the Databricks
+# managed hooks own `core.hooksPath` globally: their pre-push explicitly runs
+# the repo-local hook first and aborts the push if it exits non-zero. So this
+# layers on top of the secret scan rather than replacing it, and installing it
+# needs no change to your git config.
+#
+# To push without running the gates:
+#
+#   SKIP_CHECKS=1 git push
+#
+# Prefer that to `git push --no-verify`, which skips every hook — including the
+# managed secret scan, which is the one you actually want to keep.
+
+set -uo pipefail
+
+if [[ -n "${SKIP_CHECKS:-}" ]]; then
+  echo "pre-push: SKIP_CHECKS set, skipping ./scripts/check.sh" >&2
+  exit 0
+fi
+
+# Git feeds the refs being pushed on stdin, as
+# "<local ref> <local sha> <remote ref> <remote sha>". A deletion has an
+# all-zero local sha and nothing worth testing.
+#
+# If stdin carries no refs at all, fall through and run the checks anyway: an
+# empty read is not evidence that there is nothing to verify, and the safe
+# default for a gate is to run.
+saw_ref=0
+only_deletions=1
+while read -r _local_ref local_sha _remote_ref _remote_sha; do
+  saw_ref=1
+  [[ "$local_sha" =~ ^0+$ ]] || only_deletions=0
+done
+
+if ((saw_ref == 1 && only_deletions == 1)); then
+  echo "pre-push: deletions only, nothing to check" >&2
+  exit 0
+fi
+
+ROOT="$(git rev-parse --show-toplevel)" || exit 1
+
+echo "pre-push: running ./scripts/check.sh (SKIP_CHECKS=1 to bypass)" >&2
+"$ROOT/scripts/check.sh"

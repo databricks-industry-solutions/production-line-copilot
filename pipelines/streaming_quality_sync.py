@@ -555,6 +555,7 @@ _INV_HIST_COLS = [
 _INV_LATEST_COLS = [
     "shift_id", "material_id", "on_hand_qty", "safety_stock",
     "reorder_point", "status", "consumption_rate_per_hour",
+    "feeds_machine_id",
 ]
 _INV_LATEST = _build_values_sql(
     "ai_serving.inventory_status", _INV_LATEST_COLS,
@@ -563,7 +564,8 @@ _INV_LATEST = _build_values_sql(
       safety_stock = EXCLUDED.safety_stock,
       reorder_point = EXCLUDED.reorder_point,
       status = EXCLUDED.status,
-      consumption_rate_per_hour = EXCLUDED.consumption_rate_per_hour""",
+      consumption_rate_per_hour = EXCLUDED.consumption_rate_per_hour,
+      feeds_machine_id = EXCLUDED.feeds_machine_id""",
 )
 
 
@@ -1177,8 +1179,12 @@ def main() -> None:
     inv_sink = _make_dual_sink(
         "inventory_status", _INV_LATEST, _INV_PK,
         select_cols=[*_INV_PK, "ts", "on_hand_qty", "safety_stock",
-                     "reorder_point", "status", "consumption_rate_per_hour"],
+                     "reorder_point", "status", "consumption_rate_per_hour",
+                     "feeds_machine_id"],
         pg_conf=pg_conf, token_holder=token_holder,
+        # Optional so a bronze table written before the column existed still
+        # syncs, backfilled as NULL rather than failing the batch.
+        optional_cols=("feeds_machine_id",),
     )
 
     candidate_tasks = [

@@ -22,8 +22,8 @@ Aligned with the Databricks reference architecture for Industrial AI, GenAI agen
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │  React Frontend (AppKit)                                    │
-│  KPIStrip · LineSchematic · EventFeed · InventoryPanel      │
-│  IncidentPanel · ChatPanel · ActionPanel                    │
+│  KPIStrip · ProcessFlowSchematic · EventFeed                │
+│  InventoryPanel · IncidentPanel · ChatPanel · ActionPanel   │
 │  ←── SSE (~1 s, Lakebase playback) ──→                     │
 ├─────────────────────────────────────────────────────────────┤
 │  Express Proxy (server.ts)                                  │

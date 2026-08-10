@@ -308,7 +308,7 @@ def read_inventory_latest(
         f"""
         SELECT DISTINCT ON (material_id)
                material_id, on_hand_qty, safety_stock, reorder_point,
-               status, consumption_rate_per_hour
+               status, consumption_rate_per_hour, feeds_machine_id
         FROM ai_serving.inventory_status_history
         WHERE shift_id = %s
           AND ts > NOW() - INTERVAL '{int(recent_seconds)} seconds'
@@ -469,7 +469,7 @@ def read_inventory_after(
               AND ts > NOW() - INTERVAL '{int(recent_seconds)} seconds'
         )
         SELECT i.material_id, i.on_hand_qty, i.safety_stock, i.reorder_point,
-               i.status, i.consumption_rate_per_hour, i.ts
+               i.status, i.consumption_rate_per_hour, i.feeds_machine_id, i.ts
         FROM ai_serving.inventory_status_history i, next_ts n
         WHERE i.shift_id = %s
           AND n.ts IS NOT NULL

@@ -14,6 +14,21 @@ workflow cannot start — it reports a failure without having run anything, so a
 red check there does not necessarily mean a broken change, and a missing check
 does not mean a safe one.
 
+Since remembering to run it is the weakest link — and on a repository with
+hosted runners disabled it is the only link — you can have git run it for you:
+
+```bash
+./scripts/hooks/install.sh   # symlinks scripts/hooks/pre-push into .git/hooks
+```
+
+Every push then runs the gate first and aborts if it fails. To push without it,
+use `SKIP_CHECKS=1 git push` rather than `git push --no-verify`: the latter
+skips *every* hook, including any secret scanning your organisation installs.
+
+The installer changes nothing in your git config, so it is safe alongside
+managed hooks that set `core.hooksPath` — those run the repo-local hook before
+their own checks.
+
 The Playwright smoke test is not part of the gate, because it boots the real
 server against a warehouse and a Lakebase instance. Run `npm run test:smoke`
 yourself if you have a workspace and your change touches the UI.

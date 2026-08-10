@@ -6,6 +6,254 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.9] - 2026-08-10
+
+### Security
+
+- **`gitpython` 3.1.57 → 3.1.58**, closing six advisories: argument injection
+  through `GitConfigParser.set_value`, code execution through a `Repo.init`
+  template directory, and path traversal through submodule names. Transitive,
+  via `mlflow-skinny`, and none of the affected paths take input this
+  application controls — mlflow uses it to read commit metadata, not to
+  initialise repositories or write git config. Taken because nothing pins it
+  below the fix, which is what distinguishes it from the two advisories
+  `SECURITY.md` still records as held back.
+
+  Applied here rather than by merging the Dependabot PR raised against the
+  public mirror. That PR carried the four lines that matter and ~570 that do
+  not: its resolver writes the index as `https://pypi.org/simple` where ours
+  writes `https://pypi.org/simple/`, rewriting the registry line of all 253
+  packages. Merging it would also have been undone, since the mirror is a
+  squashed commit per release built from this tree — the next release would
+  have quietly reverted the bump. The lock was edited surgically and both
+  artifact hashes verified against `files.pythonhosted.org` before the change
+  went in.
+
+### Added
+
+- **A live line schematic on Line Status: the line as one connected process,
+  with the product moving along it.** The tile grid it replaces drew 19 machines
+  as three separate rows with 20-pixel arrows between tiles *in the same row*
+  and nothing joining the rows at all, so the thing it is a picture of never
+  read as a single line. `ProcessFlowSchematic` lays the line out as a
+  serpentine derived from `MACHINE_FLOW_ORDER` — the top row runs left to right,
+  the next turns and runs back — which makes every consecutive pair adjacent and
+  every row change a short vertical drop, each row anchored on the turn so it
+  begins directly beneath wherever the row above finished. Each section animates
+  at its own measured speed, stops where product has stopped, and carries the
+  material each machine consumes. Clicking anything opens the same detail card
+  as before.
+
+  It went in first as a tab of its own beside Line Status and was moved into it
+  before release. Two pictures of one line, drawn from the same map, is two
+  things to keep true, and the tile grid was the weaker of them — the stale one
+  is the one someone eventually screenshots. `LineSchematic` is deleted, the
+  `flow` tab is gone, and a test asserts both, so the second copy cannot quietly
+  return. The schematic keeps the grid's data-source badge and its loading
+  skeleton: before the first frame every machine would read "idle", which is a
+  status this line can genuinely be in, so an absence has to look like one.
+
+  One behaviour was dropped rather than carried over. The grid inferred
+  "cascade risk" in the client by dashing the three machines downstream of
+  anything stopped — a guess, drawn in the same colours as the measurements
+  beside it. The stream already carries `starved` and `blocked`, which is the
+  same question answered by the line itself rather than by a heuristic about it.
+
+  Two things are drawn the way the line is built rather than the way a table of
+  machines would suggest. **Each machine is a schematic symbol of itself** —
+  `client/src/components/processFlowSymbols.tsx` — because on a real schematic
+  the shape is how you find the machine you are looking for without reading
+  every label: a bowl and valves is the filler, a tunnel with spray nozzles is
+  the washer, an arm over a pallet is the palletiser. The equipment is stroked
+  in the status colour and whatever it is acting on is drawn dim, so the eye
+  takes the state first and the product second. **And the four conveyors are
+  drawn as the belts between the others**, because a conveyor is not a place
+  product stops — it is what carries product between the places where something
+  happens to it. Drawn as a box in the row, `Conv 1` sat between the
+  depalletiser and the uncaser looking like a machine that does something to a
+  bottle. They lose nothing by it: a belt carries its own status colour, its
+  alarm count, its rate and its name, and clicks through to the same detail card
+  as any other machine. So the schematic draws 15 stations and 4 belts, and the
+  running tally still counts all 19. Every section is drawn as a belt, in fact,
+  since product does not teleport between a filler and a capper; the four the
+  plant maintains as assets are the ones that are labelled and clickable, and
+  the rest are dim and unnamed.
+
+  One consequence worth having found before a customer did: belt lubricant feeds
+  `CONVEYOR_1`. A supply chip that could only hang over a station would have
+  silently dropped a material the line actually consumes, so feeds anchor to a
+  belt as readily as to a station.
+
+  Motion is CSS `stroke-dashoffset` with the duration set per element through a
+  custom property, not a render loop. Roughly 18 connectors re-rendering every
+  frame would put a repaint on the main thread for each one, at 1 Hz data; the
+  compositor runs a dashoffset on its own. `prefers-reduced-motion` stops the
+  dashes, and because motion is what encodes rate, the numeric rate sits beside
+  every section and a chevron carries direction, so nothing is lost by holding
+  still.
+
+  Two judgements are worth recording because the obvious alternative is wrong in
+  each. Pace comes from `speed_pct`, not `throughput_per_min`: throughput is
+  measured in different units along the line — bottles a minute at the filler,
+  cases a minute at the packer — and animating those against each other would
+  make the front of the line look twenty times faster than the back for no
+  physical reason. Percent of design rate is the one quantity that means the
+  same thing at every station — and where a conveyor carries the section it is
+  counted as a third limit, so a belt that has stopped stops the section
+  whatever the machines at either end are doing. And the view distinguishes
+  `blocked` from
+  `starved`. Both are real cascade statuses, but `blocked` is missing from
+  `STATUS_COLORS`, so everywhere else in the app it lands on the unknown colour
+  and reads as idle — while on a flow diagram it is half the diagnosis. Starved
+  means the fault is upstream of you; blocked means it is downstream.
+
+  What the schematic deliberately does not draw is how much product is standing
+  between two stations. `src/streaming_sim/cascade.py` maintains a buffer
+  between every adjacent pair and derives starved and blocked from them, then
+  discards the levels at emit, so nothing downstream has them. A fill gauge here
+  would be invented, a test asserts none appears, and the legend says so in one
+  line. Publishing those two columns is now the next item on the roadmap.
+
+  Four bugs found reading it back, two of them latent and worth naming for the
+  shape of the failure. A conveyor at the end of the line, or the second of two
+  in a row, was folded into a link that never existed and silently vanished —
+  a machine simply absent from a diagram whose whole claim is that it draws the
+  line, with nothing about the picture looking wrong. A conveyor sitting on a
+  row change would have boxed itself as if horizontal and collapsed to a
+  zero-width hit area. Neither arrangement exists on this line, and both are now
+  covered by rebuilding the layout over hypothetical ones. The two that were
+  real: the legend counted material feeds it had skipped drawing, promising a
+  chip the reader could not find; and because tab order is DOM order in SVG,
+  drawing all the belts and then all the machines had the keyboard visit four
+  conveyors before reaching the depalletiser. Sections are now emitted just
+  before the station they arrive at, which gives the reading order and the paint
+  order at once.
+
+  `client/src/preview.tsx` gained a `?view=` switch and
+  `scripts/dev/capture_process_flow.mjs` renders the real component against a
+  fixed cascade — a stopped filler, blocked upstream, starved downstream — so
+  the docs image is the component rather than a mockup of it, and the README
+  leads with it.
+
+  The System Map went stale twice over this — once when the tab was added, once
+  when it was removed — which is worth recording because nothing caught either:
+  `SystemMap` lists the Control Tower's surfaces from an array typed into the
+  component, with "4 operational tabs" written beside it as a literal, and that
+  map is both the About tab's self-description and the README's front-page
+  image. A screenshot cannot notice it is out of date, and a hardcoded count
+  gets it wrong in both directions. The count is now derived from the array, and
+  a test requires every entry in `TAB_IDS` to be either drawn on the map or
+  listed as deliberately absent with a reason. `vitest` runs 309 tests across 25
+  files, up from 233 across 21.
+
+- **A demo guide inside the app, and URLs that can point at anything.** This
+  accelerator is public and gets demoed by people who did not build it, and the
+  only guide was a README — read before the demo, if at all, and never during.
+  The new first tab is a presenter's talk track: seven beats over the six other
+  tabs, each with a script written to be read aloud, a duration, what to point
+  at, the Databricks products on screen, and a button that opens the view being
+  described. It closes with the honest answers to the three questions this demo
+  always provokes, because being caught overclaiming is the fastest way to lose
+  a technical room: nothing writes back to a CMMS or SAP, the telemetry is
+  synthetic, and no payback figure is asserted.
+
+  Every count on the page is derived from the catalogs the rest of the app
+  renders from, never typed in. A guide is the one screen a presenter reads out
+  loud, so a stale number there is said to a customer rather than merely
+  displayed — the same reasoning that already makes the System Map count its
+  own chips. A test pins the machine count the script speaks to the layout that
+  defines it, and another fails when a tab is added and the guide is not
+  updated.
+
+  The deep links needed something the app never had: tab state was component
+  state, so no view was linkable. It now travels in the query string
+  (`?tab=`) rather than the path, because AppKit's `createApp` serves the
+  client and its history fallback is not ours to guarantee — the difference
+  between a link that survives a reload and one that 404s in front of an
+  audience. Back works, and the address bar is worth copying. The guide leads
+  the tab bar, but the line is still what opens by default, so the app does not
+  greet an operator with instructions about itself.
+
+  `vitest` now runs 232 tests across 21 files, up from 194 across 19. No
+  Python changed.
+
+- **An optional pre-push hook, because nothing else runs the gate here.**
+  GitHub Enterprise disables hosted runners on this repository, so
+  `.github/workflows/tests.yml` cannot start: it reports failure in about three
+  seconds without having run a test, and has done on every push since the
+  workflow was added — never once green. Both that workflow and `check.sh`
+  already said so in their headers and suggested wiring a pre-push hook; nobody
+  had. Until now the only thing between a broken commit and `main` was
+  remembering. `./scripts/hooks/install.sh` symlinks `scripts/hooks/pre-push`
+  into `.git/hooks`, and every push then runs the same `check.sh` and aborts if
+  it fails. Deletions skip it; `SKIP_CHECKS=1` bypasses it.
+
+  Installing changes nothing in your git config, which is what makes it safe to
+  layer on managed hooks: those set `core.hooksPath` globally, and their
+  pre-push runs the repo-local hook before its own checks. Nobody has to choose
+  between the project's gate and their organisation's secret scanning.
+
+  That interaction is also where the sharp edge is, and this found it the
+  expensive way. The installer first located its target with
+  `git rev-parse --git-path hooks`, which is the obvious call and the wrong
+  one: it resolves *through* `core.hooksPath`, so on a machine with managed
+  hooks it returns the shared directory. Run once, it moved the managed
+  pre-push aside and symlinked its own in place — disabling secret scanning for
+  every repository on that machine rather than installing a hook in one. It now
+  asks for the git directory and appends `hooks` itself, and refuses outright
+  to write anywhere outside the repository. Tests assert both, since the
+  failure is not one worth reproducing to detect. `pytest` gains 11 tests.
+
+### Fixed
+
+- **"Materials here" was empty on every machine detail card.** The card filters
+  live inventory by `feeds_machine_id`, and its own type comment asserted the
+  sim path supplies it. It does not. The producer emits the column and Unity
+  Catalog stores it, but it was dropped on the way to the serving layer three
+  times over: the quality-sync job selected every inventory column except that
+  one, neither `ai_serving.inventory_status` nor `inventory_status_history` had
+  a column to receive it, and both SSE readers left it out of their `SELECT`.
+  So `feeds_machine_id` arrived undefined for every material, the filter matched
+  nothing, and the section rendered empty — for every machine, always.
+
+  The failure mode is the quiet kind this repo keeps finding: no error anywhere,
+  because each hop drops an unknown column rather than complaining, and an empty
+  list is indistinguishable from "this machine consumes nothing". The app could
+  tell an operator a material was low but never what would stop when it ran out.
+
+  Fixed along the whole chain, with `ADD COLUMN IF NOT EXISTS` for Lakebases
+  provisioned before the column existed and the sync-job column marked optional
+  so bronze written before it still syncs. A test walks all five hops, since
+  this is a class of bug rather than an instance:
+  `tests/agent_server/test_the_app_knows_what_a_material_feeds.py`, `pytest`
+  gains 14 tests.
+
+- **Two deploy steps ignored the profile the rest of the deploy was using.**
+  Found by deploying to dev with `DATABRICKS_PROFILE` set to a non-default
+  profile. `deploy.sh` passes the profile to the CLI as `--profile`, but the
+  SDK reads `DATABRICKS_CONFIG_PROFILE`, and two of the nine Python steps —
+  `provision_trace_storage.py` and `close_open_incidents.py` — build a bare
+  `WorkspaceClient()` and were given neither. They ran the SDK's own default
+  chain instead, landing in whatever workspace `~/.databrickscfg` calls
+  DEFAULT.
+
+  Trace provisioning is the bad one to lose that way. It links Unity Catalog
+  trace storage to an experiment and grants read on it, and a UC link is
+  permanent. Here the default profile's token had expired, so it failed loudly
+  and the deploy printed a warning that traces would be empty — the lucky
+  outcome. A *valid* token for the wrong workspace would have provisioned and
+  granted there instead, while the deploy reported success.
+
+- **The trace provisioning step never set `MLFLOW_TRACKING_URI`.** With it
+  unset, mlflow defaults to a local `./mlruns` store: the script creates its
+  experiment on disk, the UC link fails with "trace_location is only supported
+  with a Databricks tracking URI", and an `mlruns` directory is left in the
+  deploy tree. This had been invisible behind the bug above, because auth
+  failed before the tracking URI could matter.
+
+  The guard is structural rather than a list of the two known-bad scripts, so
+  a Python step added later cannot quietly join them.
+
 ## [0.3.8] - 2026-08-07
 
 One fix, reported by a colleague rather than by anything in the repo: the app
@@ -2016,6 +2264,7 @@ GenAI copilot for production-line operations, real-time streaming
 simulator (Zerobus → Lakebase), one-command `deploy.sh`, Data Quality
 dashboard, and a baseline MLflow eval harness.
 
+[0.3.9]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.3.9
 [0.3.8]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.3.8
 [0.3.7]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.3.7
 [0.3.6]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.3.6

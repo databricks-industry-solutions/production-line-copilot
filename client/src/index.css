@@ -137,3 +137,56 @@ main > div > * {
   transition: color 0.3s ease;
   font-variant-numeric: tabular-nums;
 }
+
+/* ── Process flow schematic ──────────────────────────────────────────────
+   Product travelling between stations, and material being drawn into them.
+
+   The dashes march by animating stroke-dashoffset over exactly one dash
+   period, which the compositor can run on its own: at ~19 stations and 18
+   connectors updating once a second from SSE, animating in JavaScript would
+   put a repaint on the main thread for every frame of every pipe. The pace is
+   set per element through --pf-duration, so each section of line can run at
+   its own measured speed without a stylesheet per rate. */
+@keyframes pfFlowDash {
+  from {
+    stroke-dashoffset: var(--pf-period, 24);
+  }
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
+.pf-flow {
+  animation: pfFlowDash var(--pf-duration, 1s) linear infinite;
+}
+
+/* A slow drift rather than a march: supply is drawn continuously, not in
+   discrete units like bottles. */
+.pf-feed {
+  animation: pfFlowDash var(--pf-duration, 3s) linear infinite;
+}
+
+.pf-pulse {
+  animation: pfPulse 2.4s ease-in-out infinite;
+}
+
+@keyframes pfPulse {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 0.9;
+  }
+}
+
+/* Motion here encodes rate, so removing it would remove information. The
+   dashes stay, holding the position they would have started from, and the
+   numeric rate beside every connector carries the meaning instead. */
+@media (prefers-reduced-motion: reduce) {
+  .pf-flow,
+  .pf-feed,
+  .pf-pulse {
+    animation: none;
+  }
+}
