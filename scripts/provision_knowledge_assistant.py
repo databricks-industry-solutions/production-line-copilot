@@ -152,6 +152,10 @@ def build_rest_client(profile: str | None):
             return requests.put(f"{host}{path}", headers=self._headers(),
                                 json=body or {}, timeout=60)
 
+        def patch(self, path: str, body: dict | None = None):
+            return requests.patch(f"{host}{path}", headers=self._headers(),
+                                  json=body or {}, timeout=60)
+
     return _Rest(), host
 
 
@@ -482,6 +486,12 @@ def grant_query(rest, assistant_id: str, principal: str, dry_run: bool,
     deploy that printed "granted CAN_QUERY" still produced 403 on every question
     — and did it convincingly, since the specialist then reported the documents
     as unavailable exactly as it would for an unconfigured assistant.
+
+    PATCH, not PUT: one assistant can serve both environments (see
+    ``knowledge_docs_schema`` in the settings), and PUT *replaces* the list, so
+    each deploy would hand access to its own app by taking it from the other's.
+    PATCH merges, and re-granting a principal that already has CAN_QUERY is a
+    no-op — which is what a deploy run twice needs.
     """
     if dry_run:
         print(f"  [dry-run] would grant CAN_QUERY to {principal}")
@@ -492,7 +502,7 @@ def grant_query(rest, assistant_id: str, principal: str, dry_run: bool,
     acl = {"access_control_list": [
         {"service_principal_name": principal, "permission_level": "CAN_QUERY"}
     ]}
-    resp = rest.put(f"{PERMISSIONS_API}/{assistant_id}", acl)
+    resp = rest.patch(f"{PERMISSIONS_API}/{assistant_id}", acl)
     if resp.ok:
         print(f"  granted CAN_QUERY to {principal}")
     else:
@@ -509,7 +519,7 @@ def grant_query(rest, assistant_id: str, principal: str, dry_run: bool,
         print(f"  WARN: could not resolve endpoint {endpoint} to grant on it — "
               f"the app will get 403 when it asks about documents.")
         return
-    resp = rest.put(f"/api/2.0/permissions/serving-endpoints/{endpoint_id}", acl)
+    resp = rest.patch(f"/api/2.0/permissions/serving-endpoints/{endpoint_id}", acl)
     if resp.ok:
         print(f"  granted CAN_QUERY on endpoint {endpoint} to {principal}")
     else:

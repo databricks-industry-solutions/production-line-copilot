@@ -6,6 +6,40 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-08-12
+
+### Added
+
+- **Two environments can share one Knowledge Assistant.** The assistant is found
+  by display name and indexes a knowledge source per volume *path*, so until now
+  sharing one was not possible: give both profiles the same name and each deploy
+  attaches its own schema's copy of the same 22 documents — which the API refuses
+  outright, since source display names must be unique. The alternative was two
+  agent endpoints, each billing hourly to answer from identical documents.
+
+  `knowledge_docs_catalog` / `knowledge_docs_schema` point the corpus volume at
+  another schema, defaulting to the profile's own `uc_catalog` / `uc_schema` so a
+  single-environment deploy needs neither key. With both profiles naming one
+  volume, the second deploy finds the assistant and its source already there and
+  only adds its own app service principal.
+
+### Fixed
+
+- **A deploy no longer revokes the other environment's app.** The `CAN_QUERY`
+  grant on the assistant and on its serving endpoint was a `PUT`, which
+  *replaces* the access list. With one assistant serving two environments, each
+  deploy handed access to its own app by taking it from the other's, and the
+  symptom is silent: the app that lost the grant gets 403 and its specialists
+  report the documents as unavailable — indistinguishable from no assistant being
+  configured. `PATCH` merges, and re-granting a principal that already has
+  `CAN_QUERY` is a no-op.
+- **`scripts/cleanup.sh` keeps an assistant another profile is using.** Teardown
+  deletes by `knowledge_assistant_id`, so tearing down dev deleted the assistant
+  prod was querying, along with its knowledge sources and endpoint. It now names
+  the profiles that share it and skips the delete unless `--purge-shared` is
+  given, matching how the AI Search endpoint and the Lakebase schemas are
+  treated.
+
 ## [0.4.0] - 2026-08-11
 
 ### Added
@@ -3013,6 +3047,7 @@ GenAI copilot for production-line operations, real-time streaming
 simulator (Zerobus → Lakebase), one-command `deploy.sh`, Data Quality
 dashboard, and a baseline MLflow eval harness.
 
+[0.4.1]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.4.1-public
 [0.4.0]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.4.0-public
 [0.3.9]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.3.9-public
 [0.3.8]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.3.8-public

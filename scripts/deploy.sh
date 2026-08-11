@@ -1558,8 +1558,17 @@ fi
 # one when absent, then re-uploads the corpus and asks for a sync so edited
 # documents actually reach it.
 KA_NAME=$(_profile_field knowledge_assistant_name)
-KA_CATALOG=$(_profile_field uc_catalog)
-KA_SCHEMA=$(_profile_field uc_schema)
+# The corpus volume defaults to this environment's own schema. `knowledge_docs_*`
+# override it so two environments can point at ONE volume and therefore share one
+# assistant: the assistant is looked up by display name and carries a knowledge
+# source per *path*, so two schemas mean two sources over the same documents —
+# and the API refuses the second one anyway, since source names must be unique.
+# Pointing dev at prod's volume makes the second deploy find the source already
+# there and skip it, which is the same trick the shared AI Search endpoint uses.
+KA_CATALOG=$(_profile_field knowledge_docs_catalog)
+[[ -z "$KA_CATALOG" || "$KA_CATALOG" == "SET_ME" ]] && KA_CATALOG=$(_profile_field uc_catalog)
+KA_SCHEMA=$(_profile_field knowledge_docs_schema)
+[[ -z "$KA_SCHEMA" || "$KA_SCHEMA" == "SET_ME" ]] && KA_SCHEMA=$(_profile_field uc_schema)
 KA_VOLUME=$(_profile_field knowledge_docs_volume)
 # What the RUNNING app was deployed with, read from the rendered template steps
 # 3-5 deployed it from — not from settings. Settings is the wrong side of the

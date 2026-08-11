@@ -127,6 +127,14 @@ profiles:
     #     online. Clear this value to turn it back off.
     knowledge_assistant_name: 'Plant documents'
     knowledge_docs_volume: 'plant_docs'
+    # Where that volume lives. Empty means this profile's own uc_catalog /
+    # uc_schema, which is what a single environment wants. Set both profiles to
+    # the same pair to run ONE assistant across dev and prod: it is found by
+    # display name and indexes a knowledge source per volume path, so separate
+    # schemas would index the same documents twice — and the API rejects the
+    # second source anyway, because source names must be unique.
+    knowledge_docs_catalog: ''
+    knowledge_docs_schema: ''
     # Written back by deploy.sh; do not edit by hand. The endpoint is what the
     # app queries, the id is carried so the app can name what it is talking to.
     knowledge_assistant_endpoint: ''
@@ -248,12 +256,20 @@ profiles:
     # The same endpoint as prod on purpose: workspace-level resource, per-schema
     # index underneath.
     vector_search_endpoint: 'prodline-copilot-vs'
-    # Must differ from prod's — the assistant is looked up by display name, and a
-    # shared name would point both environments at one corpus, so a dev teardown
-    # would delete the assistant prod is querying. The endpoint and id below are
-    # written back by deploy.sh; do not edit them by hand.
+    # Differs from prod's by default, which keeps the two independent: the
+    # assistant is looked up by display name, so one name across both
+    # environments is one assistant, and then a dev teardown deletes what prod is
+    # querying.
+    #
+    # To run a single shared assistant anyway — two endpoints bill twice for the
+    # same 22 documents — give both profiles this same name AND the same
+    # knowledge_docs_catalog / knowledge_docs_schema, so both deploys converge on
+    # one volume and one knowledge source. Then only tear it down from the
+    # profile that owns it.
     knowledge_assistant_name: 'Plant documents — dev'
     knowledge_docs_volume: 'plant_docs'
+    knowledge_docs_catalog: ''
+    knowledge_docs_schema: ''
     knowledge_assistant_endpoint: ''
     knowledge_assistant_id: ''
     lakebase_catalog: ''

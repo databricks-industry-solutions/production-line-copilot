@@ -123,6 +123,10 @@ class FakeRest:
         self.calls.append(("PUT", path, body))
         return FakeResponse({})
 
+    def patch(self, path, body=None):
+        self.calls.append(("PATCH", path, body))
+        return FakeResponse({})
+
     def methods(self) -> list[str]:
         return [f"{m} {p}" for m, p, _ in self.calls]
 
@@ -615,7 +619,7 @@ class TestTheAppIsAllowedToQuery:
 
     def test_the_endpoint_the_app_queries_is_granted_too(self, corpus: Path, monkeypatch):
         rest = self._run(corpus, monkeypatch)
-        grants = [(p, b) for m, p, b in rest.calls if m == "PUT" and "permissions" in p]
+        grants = [(p, b) for m, p, b in rest.calls if m == "PATCH" and "permissions" in p]
         paths = [p for p, _ in grants]
         assert any("permissions/knowledge-assistants/" in p for p in paths)
         assert any("permissions/serving-endpoints/" in p for p in paths), (
@@ -626,12 +630,22 @@ class TestTheAppIsAllowedToQuery:
             assert acl == {"service_principal_name": "app-sp-1",
                            "permission_level": "CAN_QUERY"}
 
+    def test_granting_one_app_does_not_revoke_the_other(self, corpus: Path, monkeypatch):
+        """Two environments can share one assistant, and PUT would make them
+        fight over it: it replaces the list, so each deploy would take the
+        endpoint away from the app the other one deployed. PATCH merges."""
+        rest = self._run(corpus, monkeypatch)
+        replaced = [p for m, p, _ in rest.calls if m == "PUT" and "permissions" in p]
+        assert replaced == [], (
+            "a grant that replaces the access list revokes the other environment's app"
+        )
+
     def test_the_endpoint_is_addressed_by_id_not_by_name(self, corpus: Path, monkeypatch):
         """The permissions api rejects the name with "not a valid Inference
         Endpoint ID", so the id has to be looked up first."""
         rest = self._run(corpus, monkeypatch)
         granted = [p for m, p, _ in rest.calls
-                   if m == "PUT" and "permissions/serving-endpoints/" in p]
+                   if m == "PATCH" and "permissions/serving-endpoints/" in p]
         assert granted == ["/api/2.0/permissions/serving-endpoints/ep-id-123"]
 
     def test_no_principal_means_no_grant(self, corpus: Path, monkeypatch):

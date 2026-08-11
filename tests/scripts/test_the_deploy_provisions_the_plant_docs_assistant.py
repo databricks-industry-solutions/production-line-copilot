@@ -45,6 +45,22 @@ class TestTheDeployStep:
         assert "WARN" in block
         assert "exit 1" not in block
 
+    def test_the_corpus_volume_can_be_pointed_at_another_schema(self):
+        """Two environments share one assistant only if they share one volume.
+
+        The assistant is found by display name and indexes a knowledge source per
+        volume path, so without an override each environment attaches its own
+        schema's copy of the same documents — which the API rejects outright,
+        because source display names must be unique. Falling back to uc_catalog /
+        uc_schema keeps a single-environment deploy needing no new keys.
+        """
+        block = DEPLOY[DEPLOY.index("KA_NAME=$(_profile_field"):][:1400]
+        for key in ("knowledge_docs_catalog", "knowledge_docs_schema"):
+            assert key in block, f"{key} cannot redirect the corpus volume"
+        assert "_profile_field uc_catalog" in block and "_profile_field uc_schema" in block, (
+            "no fallback, so every existing profile has to add the new keys"
+        )
+
     def test_both_values_are_written_back_into_the_settings_file(self):
         for key in ("knowledge_assistant_endpoint", "knowledge_assistant_id"):
             assert re.search(rf'write_genie_space_id\s+"[^"]*"\s+{key}', DEPLOY), (

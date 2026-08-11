@@ -377,7 +377,24 @@ fi
 # Deleting the assistant takes its knowledge sources and its serving endpoint
 # with it. Left behind, the next deploy finds an assistant whose corpus volume
 # was dropped underneath it, and re-syncs an empty knowledge base.
-if [[ -n "$KA_ID" && "$KA_ID" != "SET_ME" ]]; then
+#
+# Unless another profile names the same assistant. Two environments are allowed
+# to share one (same name, same knowledge_docs_* volume — one endpoint instead of
+# two billing for the same corpus), and then this delete is not a teardown of
+# what this profile built, it is a teardown of the other environment's document
+# tool. Shared, so --purge-shared, exactly like the AI Search endpoint below.
+KA_SHARED_WITH=$(python3 -c "
+import yaml
+doc = yaml.safe_load(open('$SETTINGS', encoding='utf-8')) or {}
+print(' '.join(n for n, p in (doc.get('profiles') or {}).items()
+               if (p or {}).get('knowledge_assistant_id') == '$KA_ID'
+               and (p or {}).get('bundle_target') != '$TARGET'))
+" 2>/dev/null || echo "")
+
+if [[ -n "$KA_ID" && "$KA_ID" != "SET_ME" && -n "$KA_SHARED_WITH" && "$PURGE_SHARED" != "1" ]]; then
+  warn "Keeping Knowledge Assistant 'knowledge-assistants/$KA_ID' — also configured by: $KA_SHARED_WITH."
+  warn "  Deleting it would take that environment's plant documents with it. Use --purge-shared to delete anyway."
+elif [[ -n "$KA_ID" && "$KA_ID" != "SET_ME" ]]; then
   info "Deleting Knowledge Assistant 'knowledge-assistants/$KA_ID' ..."
   databricks knowledge-assistants delete-knowledge-assistant \
     "knowledge-assistants/$KA_ID" --profile "$PROFILE" >/dev/null 2>&1 \

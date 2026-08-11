@@ -212,8 +212,18 @@ On by default. It lets four specialists (downtime, quality, maintenance, schedul
 
 | Config field                | Meaning                                                                          |
 | --------------------------- | -------------------------------------------------------------------------------- |
-| `knowledge_assistant_name`  | Display name of the assistant. Ships set; blank turns the feature off. Dev and prod must differ — the assistant is looked up by display name. |
+| `knowledge_assistant_name`  | Display name of the assistant. Ships set; blank turns the feature off. Dev and prod ship different names — the assistant is looked up by display name, so one name is one assistant. |
 | `knowledge_docs_volume`     | Volume under `uc_catalog.uc_schema` holding the documents. Defaults to `plant_docs`. |
+| `knowledge_docs_catalog` / `knowledge_docs_schema` | Where that volume lives. Empty means this profile's own `uc_catalog` / `uc_schema`. Set them, with a shared name, to run **one** assistant across dev and prod. |
+
+Sharing one assistant is worth it when the two environments answer from the same
+corpus: an agent endpoint bills while it is online, and two of them index the
+same documents twice. It only works if both profiles agree on the volume as well
+as the name — the assistant carries a knowledge source per volume *path*, so
+separate schemas mean a second source over the same documents, which the API
+rejects because source names must be unique. The cost of sharing is ownership:
+`scripts/cleanup.sh` refuses to delete an assistant another profile names, and
+`--purge-shared` deletes it for both environments.
 
 The first deploy after setting the name creates the volume, uploads `data/plant_docs/*.md`, creates an [Agent Bricks Knowledge Assistant](https://docs.databricks.com/aws/en/generative-ai/agent-bricks/knowledge-assistant) over it, registers the example questions, and grants the app service principal `CAN_QUERY`. Later deploys re-upload the corpus and request a sync, so an edited document reaches the assistant — unless an ingest is still running, in which case the edit waits for the deploy after it. Two ingests at once exceed the organisation's embedding quota, and that failure is not retried by the platform: it fails the build.
 
