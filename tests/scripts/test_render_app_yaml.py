@@ -504,3 +504,51 @@ class TestVectorSearchIsDerivedFromSettings:
         out = _run(monkeypatch, tmp_path, {"bundle_target": "line_manager_dev", "vector_search_endpoint": "SET_ME"})
         assert "SET_ME" not in out.split("VS_ENDPOINT")[1][:40]
         assert "'false'" in out.split("OPS_VS_ENDPOINT_ALWAYS_ON")[1][:40]
+
+
+class TestTheKnowledgeAssistantReachesTheApp:
+    """DOCS_KA_ENDPOINT is what ``query_plant_docs`` queries, so it must arrive.
+
+    Both keys are written back by the provisioning script rather than typed, and
+    neither app template declared them when the feature was added — which is the
+    exact shape of the bug ``_insert_missing_env`` exists to prevent, so it is
+    asserted here rather than assumed.
+    """
+
+    def _env(self, out: str) -> dict:
+        import yaml
+
+        return {e["name"]: e["value"] for e in yaml.safe_load(out)["env"]}
+
+    def test_the_endpoint_and_id_are_delivered_even_though_the_template_omits_them(
+        self, monkeypatch, tmp_path
+    ):
+        out = _run(monkeypatch, tmp_path, {
+            "bundle_target": "line_manager_dev",
+            "knowledge_assistant_endpoint": "ka-plant-docs-endpoint",
+            "knowledge_assistant_id": "ka-1234",
+        })
+        env = self._env(out)
+        assert env["DOCS_KA_ENDPOINT"] == "ka-plant-docs-endpoint"
+        assert env["DOCS_KA_ID"] == "ka-1234"
+
+    def test_clearing_the_endpoint_turns_the_document_path_off(self, monkeypatch, tmp_path):
+        out = _run(monkeypatch, tmp_path, {
+            "bundle_target": "line_manager_dev",
+            "knowledge_assistant_endpoint": "",
+        })
+        assert self._env(out)["DOCS_KA_ENDPOINT"] == ""
+
+    def test_an_unprovisioned_placeholder_does_not_point_the_app_anywhere(
+        self, monkeypatch, tmp_path
+    ):
+        out = _run(monkeypatch, tmp_path, {
+            "bundle_target": "line_manager_dev",
+            "knowledge_assistant_endpoint": "SET_ME",
+        })
+        assert self._env(out)["DOCS_KA_ENDPOINT"] == ""
+
+    def test_a_profile_that_never_mentions_it_is_left_alone(self, monkeypatch, tmp_path):
+        out = _run(monkeypatch, tmp_path, {"bundle_target": "line_manager_dev",
+                                           "uc_catalog": "cat"})
+        assert "DOCS_KA_ENDPOINT" not in out

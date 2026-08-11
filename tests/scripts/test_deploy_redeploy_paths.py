@@ -155,7 +155,7 @@ def test_steps_needing_project_deps_use_the_project_interpreter(lines):
             )
 
 
-class TestTheVectorSearchGateReadsTheShippedConfig:
+class TestTheAISearchGateReadsTheShippedConfig:
     """Which app.yaml the gate reads decides whether the step runs at all.
 
     `app.yaml` is the committed prod template and is deliberately blank, so a
@@ -169,7 +169,7 @@ class TestTheVectorSearchGateReadsTheShippedConfig:
     def test_the_gate_reads_app_source_yaml_not_a_fixed_filename(self, lines):
         block = "\n".join(lines)
         gate = block.split("VS_ENDPOINT_NAME=$(", 1)
-        assert len(gate) == 2, "the Vector Search gate has moved or been renamed"
+        assert len(gate) == 2, "the AI Search gate has moved or been renamed"
         snippet = gate[1].split(")\n", 1)[0]
         assert "$APP_SOURCE_YAML" in snippet, (
             "the gate must read the file this deploy ships; a literal app.yaml "
@@ -178,9 +178,15 @@ class TestTheVectorSearchGateReadsTheShippedConfig:
         assert "open('app.yaml')" not in snippet
 
     def test_the_operator_is_told_the_first_run_is_slow(self, lines):
-        """`--wait` blocks with no output; without a warning it looks hung."""
+        """A slow step with no warning looks hung and gets Ctrl-C'd.
+
+        The window covers the three branches the step now has — endpoint already
+        there, VS_WAIT=1 blocking, and the default that starts the endpoint and
+        leaves the index to the next deploy — each of which has to say the wait
+        exists and that paying it once is enough.
+        """
         block = "\n".join(lines)
-        vs = block.split("Provisioning Vector Search", 1)[1][:1600]
+        vs = block.split("Provisioning AI Search", 1)[1][:2400]
         assert "15-40" in vs and "minutes" in vs, (
             "no duration hint near the provisioning step — someone will Ctrl-C it"
         )

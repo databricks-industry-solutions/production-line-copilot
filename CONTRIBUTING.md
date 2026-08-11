@@ -33,6 +33,27 @@ The Playwright smoke test is not part of the gate, because it boots the real
 server against a warehouse and a Lakebase instance. Run `npm run test:smoke`
 yourself if you have a workspace and your change touches the UI.
 
+### Publishing a release
+
+The public repository is not a remote of this one. Each release is a single
+squashed commit whose tree is a copy of this tree, parented on the previous
+public commit, so **everything tracked here is published unless it is named in
+`scripts/public-exclude.txt`**. Do not build that commit by hand:
+
+```bash
+./scripts/mirror_public.sh --message-file notes.md          # build and verify
+./scripts/mirror_public.sh --message-file notes.md --push   # publish it
+```
+
+It strips the excluded paths, then refuses to publish a tree that still contains
+one, that has a document linking a file it no longer ships, or that cannot build
+and pass its checks without them. Without `--push` it stops after verifying and
+prints the commit it would publish.
+
+If you add something that must stay internal, add it to
+`scripts/public-exclude.txt` — and make sure the public copy still stands up
+without it, since the mirror is checked in that state rather than in this one.
+
 ### Contributor License Agreement (CLA)
 
 By submitting a contribution to this repository, you certify that:

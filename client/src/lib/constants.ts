@@ -3,12 +3,20 @@
  * Used by `ProcessFlowSchematic`, `KPIStrip`, and `App` when rendering machine state maps.
  * Coordinates are fixed to preserve visual lane ordering expected by operators and screenshots.
  */
+/**
+ * Machine states, one step darker than the mid-tone tints these started as.
+ * Those were picked while the schematic was drawn on a near-black canvas, where
+ * a bright fill glows; on the white page the rest of the app lives on, yellow-500
+ * against white is under 2:1 and a degraded machine's rate was legible only if
+ * you already knew what it said. These are the 600 weights, which hold up as
+ * small text and as a 2px border without changing which colour means what.
+ */
 export const STATUS_COLORS = {
-  running: '#22c55e',
-  stopped: '#ef4444',
-  degraded: '#eab308',
-  starved: '#9ca3af',
-  idle: '#3b82f6',
+  running: '#16a34a',
+  stopped: '#dc2626',
+  degraded: '#a16207',
+  starved: '#6b7280',
+  idle: '#2563eb',
 } as const;
 
 export type MachineStatus = keyof typeof STATUS_COLORS;

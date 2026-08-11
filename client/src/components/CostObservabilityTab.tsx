@@ -198,7 +198,7 @@ function fmtDbu(v: number | null | undefined): string {
  * Every dollar figure here is DBU multiplied by a rounded list-price guess, so
  * four decimals advertised a precision the number never had — `$341.6100` reads
  * like a settled invoice rather than an estimate that is comfortably ±20%.
- * Sub-cent live line items (a Vector Search query is $0.0001) still need the
+ * Sub-cent live line items (an AI Search query is $0.0001) still need the
  * extra digits or they render as a misleading `$0.00`.
  */
 function fmtUsd(v: number | null | undefined): string {
@@ -514,13 +514,13 @@ export default function CostObservabilityTab({
                   system table.
                 </p>
                 <p>
-                  Counters tracked: rows delivered, Lakebase reads, agent / LLM calls, Vector Search & Genie tool
+                  Counters tracked: rows delivered, Lakebase reads, agent / LLM calls, AI Search & Genie tool
                   invocations, events surfaced. LLM tokens use the model-reported usage when available, otherwise
                   estimated as chars / 4.
                 </p>
                 <p>
                   USD breakdown: per-token LLM × list rates; amortised hourly rate for App / Lakebase / Warehouse /
-                  Producer / Synced / Vector Search endpoint, charged only while the resource is RUNNING; Zerobus ingest
+                  Producer / Synced / AI Search endpoint, charged only while the resource is RUNNING; Zerobus ingest
                   at $0.079/GB (0.143 DBU/GB × $0.55/DBU Jobs Serverless), estimated from in-app event counts × ~1
                   KB/event.
                 </p>
@@ -684,9 +684,9 @@ export default function CostObservabilityTab({
                   </li>
                   <li
                     className="flex items-center justify-between"
-                    {...tip('Vector Search index queries — used by specialists for similar-incident retrieval.')}
+                    {...tip('AI Search index queries — used by specialists for similar-incident retrieval.')}
                   >
-                    <span className="text-muted-foreground">Vector Search queries</span>
+                    <span className="text-muted-foreground">AI Search queries</span>
                     <span className="font-medium tabular-nums">{liveCounters?.vector_search_calls ?? 0}</span>
                   </li>
                   <li
@@ -717,7 +717,7 @@ export default function CostObservabilityTab({
                   <div className="mt-2 rounded border border-border bg-muted/20 p-2 text-[10px] leading-snug">
                     <p className="font-semibold text-muted-foreground mb-1">How to trigger VS / Genie counters</p>
                     <p className="text-muted-foreground">
-                      <strong>Vector Search</strong> ({(liveData.tool_callers.vector_search ?? []).join(', ')})
+                      <strong>AI Search</strong> ({(liveData.tool_callers.vector_search ?? []).join(', ')})
                       <br />
                       Try:{' '}
                       <em>

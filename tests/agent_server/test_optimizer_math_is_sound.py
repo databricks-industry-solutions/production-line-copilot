@@ -134,7 +134,7 @@ class TestTheSolverPathIsReachable:
     def test_it_no_longer_falls_back_on_every_call(self):
         """The bilinear constraint made construction raise every time, so the
         branded result at the end of the solver path was dead code."""
-        assert self.p.plan(_shifts())["method"] == "benders_master"
+        assert self.p.plan(_shifts())["method"] == "milp"
 
     def test_it_claims_optimal_only_when_it_solved(self):
         out = self.p.plan(_shifts())
@@ -182,7 +182,7 @@ class TestTheSolverPathIsReachable:
         assert self.p.plan([])["feasible"] is False
 
     def test_a_single_shift_solves(self):
-        assert self.p.plan(_shifts(n=1))["method"] == "benders_master"
+        assert self.p.plan(_shifts(n=1))["method"] == "milp"
 
 
 class TestTheSpeedGrid:
@@ -197,3 +197,41 @@ class TestTheSpeedGrid:
         levels = _speed_levels(200.0, 450.0)
         assert levels == sorted(levels)
         assert len(set(levels)) == len(levels)
+
+
+# ---------------------------------------------------------------------------
+# What the planner tells the model about itself
+# ---------------------------------------------------------------------------
+
+class TestThePlannerDescribesTheAlgorithmItRuns:
+    """A tool description is prompt text, and the model quotes it to operators.
+
+    Three artefacts described this planner and no two agreed: the class
+    docstring said Benders decomposition, the `@tool` description said
+    "sequential optimization ... calls schedule_recovery per shift", and the
+    result was branded "benders_master". What runs is one monolithic SCIP MILP,
+    so an operator asking how the plan was produced could be told, in fluent
+    prose, about a decomposition that has never executed.
+    """
+
+    def test_the_result_is_labelled_for_what_it_is(self):
+        assert MultiShiftPlanner().plan(_shifts())["method"] == "milp"
+
+    def test_no_artefact_claims_an_algorithm_the_code_does_not_run(self):
+        from agent_server.optimizers import multi_shift_planner as mod
+
+        surfaces = {
+            "class docstring": MultiShiftPlanner.__doc__ or "",
+            "tool description": mod.multi_shift_plan.description or "",
+        }
+        for where, text in surfaces.items():
+            body = text.lower()
+            # Named only where the module explains what it stopped doing, which
+            # is prose about the past, not a claim about the present. The class
+            # docstring earns that; the tool description has no room for it.
+            if where == "tool description":
+                assert "benders" not in body, f"{where} still names Benders"
+            assert "calls schedule_recovery per shift" not in body, (
+                f"{where} says it delegates per shift; the solver path decides "
+                "every shift in one model and only the fallback delegates"
+            )

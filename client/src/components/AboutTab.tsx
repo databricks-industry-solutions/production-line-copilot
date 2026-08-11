@@ -61,8 +61,8 @@ const TOOLS: { id: string; name: string; icon: string; desc: string; platform?: 
     id: 'retrieve_similar_cases',
     name: 'Similar Cases',
     icon: '🔍',
-    desc: 'Vector Search over historical events; falls back to SQL if unavailable',
-    platform: 'Mosaic AI Vector Search',
+    desc: 'AI Search over historical events; falls back to SQL if unavailable',
+    platform: 'Databricks AI Search',
   },
 ];
 
@@ -150,8 +150,17 @@ const PLATFORM = [
     role: 'Optional data-quality checks (freshness / range / referential) flagged into a dqx_warnings audit table; observability-only, never gates the pipeline',
     icon: 'dqx',
   },
-  { name: 'Mosaic AI Model Serving', role: 'LLM inference (GPT-5-mini routing, GPT-5 strategy)', icon: 'serving' },
-  { name: 'Mosaic AI Vector Search', role: 'Similar case retrieval for historical event matching', icon: 'vector' },
+  // Deliberately does not name models. This row said "GPT-5-mini routing,
+  // GPT-5 strategy" long after the router became Gemma 3 12B and strategy
+  // became Claude Opus 5, because nothing here reads the roster. The live
+  // per-role assignments are rendered from /ops/models further down the same
+  // page, so naming them twice only creates a copy that can go stale.
+  {
+    name: 'Mosaic AI Model Serving',
+    role: 'LLM inference for every specialist, the router and synthesis — one endpoint per role',
+    icon: 'serving',
+  },
+  { name: 'Databricks AI Search', role: 'Similar case retrieval for historical event matching', icon: 'vector' },
   {
     name: 'Lakebase',
     role: 'Tier-1 serving (ai_serving.*_history, sub-second producer dual-write) + agent memory',

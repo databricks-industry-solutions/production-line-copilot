@@ -99,6 +99,8 @@ env:
     value: 'SET_ME'
   - name: OPS_SETUP_JOB_ID
     value: 'SET_ME'
+  - name: OPS_DLT_PIPELINE_ID
+    value: 'SET_ME'
   - name: OPS_LAKEBASE_SYNCER_JOB_ID
     value: 'SET_ME'
   - name: OPS_TTL_JOB_ID
@@ -121,3 +123,11 @@ env:
     value: ''
   - name: OPS_VS_ENDPOINT_ALWAYS_ON
     value: 'false'
+  # Written back by scripts/provision_knowledge_assistant.py via
+  # scripts/render_app_yaml.py; see app.yaml for what enabling costs. Empty means
+  # query_plant_docs reports itself unconfigured instead of answering about
+  # procedures it never read.
+  - name: DOCS_KA_ENDPOINT
+    value: ''
+  - name: DOCS_KA_ID
+    value: ''

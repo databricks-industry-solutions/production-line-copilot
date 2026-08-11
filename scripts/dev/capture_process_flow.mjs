@@ -9,8 +9,9 @@
  * downstream — and screenshots it in both colour schemes, since the app follows
  * `prefers-color-scheme` and GitHub serves whichever matches the reader.
  *
- * The schematic canvas itself is dark in both, deliberately; what changes
- * between the two shots is the page around it.
+ * The schematic follows the page rather than holding its own scheme, so the two
+ * shots differ only in the surface it is sitting on. It was drawn on a fixed
+ * near-black canvas at first, which made it a hole in the middle of a white tab.
  *
  * Animation is paused for the capture. The dashes encode rate by moving, so a
  * still frame catches them mid-cycle at whatever offset the clock happened to

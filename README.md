@@ -6,7 +6,7 @@
 
 **AI-powered production line management with real-time simulation.** A compound AI system built on Databricks that gives line managers live visibility, cascading fault simulation, and a GenAI assistant for incident resolution.
 
-**See it in 30 seconds:** open [`docs/media/prodline_copilot_film.html`](docs/media/prodline_copilot_film.html) in a browser for a self-contained animated walkthrough of what ProdLine CoPilot looks like in action. (GitHub's in-browser preview won't run the JS, so clone or download the file and open it locally.)
+**See it in two minutes:** open [`docs/media/prodline_copilot_film.html`](docs/media/prodline_copilot_film.html) in a browser for a self-contained narrated walkthrough of what ProdLine CoPilot looks like in action — one operator, one stoppage, one recovery. It plays offline from the single file, and is rebuilt from `film/src/movie.jsx` with `python3 scripts/build_film.py`. (GitHub's in-browser preview won't run the JS, so clone or download the file and open it locally.)
 
 **Deploy in minutes:** fill `config/project-settings.local.yaml`, then run `./scripts/deploy.sh dev` (or `prod`). See [Getting Started](#getting-started) below, or the full runbook in [`docs/solution-accelerator/DEPLOY.md`](docs/solution-accelerator/DEPLOY.md). Architecture and technical reference live in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
@@ -31,14 +31,14 @@ What the schematic will not draw is how much product is standing between two sta
 
 ## System Map
 
-One app, two branches. The **Control Tower** is what the line is doing right now — streamed and deterministic, with no model in the path. The **Specialist Copilot** is where you ask a question and a router hands it to the one specialist that owns the problem. Each governed Genie space covers one domain of the manufacturing model, because narrow scope is what keeps Genie accurate; a specialist reaches the domain it works in. Some domains serve several specialists — `production` answers for the OEE coach, the schedule optimizer and the strategic advisor — and the shift briefing has no governed space at all, since it reads the live shift rather than the enterprise model. The spaces are opt-in per domain (`GENIE_SPACE_*`); a specialist whose domain is unprovisioned simply has one fewer tool and falls back to direct SQL.
+One app, two branches. The **Control Tower** is what the line is doing right now — streamed and deterministic, with no model in the path. The **Specialist Copilot** is where you ask a question and a router hands it to the one specialist that owns the problem. Each governed Genie space covers one domain of the manufacturing model, because narrow scope is what keeps Genie accurate; a specialist reaches the domain it works in. Some domains serve several specialists — `production` answers for the OEE coach, the schedule optimizer and the strategic advisor — and the shift briefing has no governed space at all, since it reads the live shift rather than the enterprise model. The deploy creates all four (`GENIE_SPACE_*`) and each is independent; a specialist whose domain is unprovisioned simply has one fewer tool and falls back to direct SQL.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/media/system_map_dark.png">
   <img alt="System Map: ProdLine CoPilot splits into a Control Tower branch of four streamed operational tabs, and a Specialist Copilot branch where an orchestrator routes to eight specialist agents, each labelled with the governed Genie domain it works in (where it has one), its optimizers and its model." src="docs/media/system_map.png">
 </picture>
 
-Five Genie spaces in all: four over the governed manufacturing model — `asset`, `quality`, `inventory`, `production` — each curated and permissioned separately, plus **line ops** over the live streaming tables where `line_kpi` lands roughly a row per second. The two specialists that reason across a whole shift read line ops as well, and all eight read the live tables with direct SQL, because Genie is a round trip and a shift is not.
+Five Genie spaces in all: four over the governed manufacturing model — `asset`, `quality`, `inventory`, `production` — each curated and permissioned separately, plus **line ops** over the live streaming tables where `line_kpi` lands roughly a row per second. The three specialists that reason across a whole shift — OEE Coach, Strategic Advisor and Shift Briefing — read line ops as well, and all eight read the live tables with direct SQL, because Genie is a round trip and a shift is not.
 
 Line ops is deliberately the other shape from a governed domain — 14 curated tables against two to four — because the split follows grant boundaries and the live schema has none to follow: it is one schema behind a surface where anyone can ask anything about the current shift.
 

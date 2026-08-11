@@ -259,11 +259,13 @@ only until someone cleans the working tree; re-capture rather than assume.
   Two departures from their version. The counts are derived from the same
   catalogs the rest of the app renders from rather than typed in, because a
   guide is the one screen a presenter reads out loud and a stale number there
-  is said to a customer rather than merely displayed. And it closes with the
-  honest answers to the three questions this demo always provokes — does it
-  write anywhere, is the data real, what is the ROI — since the fastest way to
-  lose a technical room is to be caught overclaiming on the thing it already
-  suspects.
+  is said to a customer rather than merely displayed. And the two limits worth
+  hearing — the telemetry is generated, and nothing here writes to a source
+  system — are stated in the steps that show those things rather than parked in
+  a section of answers to anticipated objections, which is what a guide to a
+  product should read like rather than a guide to a sales conversation. No
+  payback figure appears anywhere, because the value of a downtime minute is
+  specific to a line.
 
   The prerequisite came with it: tab state now lives in the URL
   (`client/src/lib/tabRouting.ts`), so every view is linkable. It rides in the

@@ -1,0 +1,186 @@
+[
+  {
+    "question": "What is the isolation sequence before opening the CAPPER turret guard?",
+    "guidelines": [
+      "Lists the seven steps in order, electrical isolation before pneumatic.",
+      "States that the pneumatic accumulator must be vented, and why: the turret can index once on stored air.",
+      "States that zero energy is verified by attempting a start before the guard is opened.",
+      "Cites SOP-CAP-021."
+    ],
+    "doc": "sop_capper_loto.md"
+  },
+  {
+    "question": "What fill target and low-fill alarm do I set when changing the FILLER over to 1.0 L?",
+    "guidelines": [
+      "Gives 1000 ml target and 988 ml low-fill alarm.",
+      "Mentions restarting at 180 BPM before going to the nominal 420 BPM.",
+      "Mentions the ten verification bottles within 1000 ml plus or minus 6 ml.",
+      "Cites SOP-FILL-014."
+    ],
+    "doc": "sop_filler_changeover.md"
+  },
+  {
+    "question": "The CAPPER application torque is reading 18 Nm. What does that cause downstream?",
+    "guidelines": [
+      "States the working window is 20 to 24 Nm, nominal 22 Nm.",
+      "Explains low torque gives loose caps and leaks seen as under-weight cases at the CHECKWEIGHER.",
+      "Does not claim low torque causes cracked caps; that is the high-torque failure."
+    ],
+    "doc": "sop_capper_loto.md"
+  },
+  {
+    "question": "Why did the LABELLER reject rate spike on the night of 14 March, and what was done about it?",
+    "guidelines": [
+      "Root cause is cold adhesive added mid-shift pulling glue temperature below the 165 to 175 °C window.",
+      "Mentions the logged 158 to 161 °C and the skewed labels.",
+      "Lists the corrective actions including the 163 °C low alarm.",
+      "Cites deviation DEV-2026-03-011."
+    ],
+    "doc": "deviation_2026_03_labeller.md"
+  },
+  {
+    "question": "The line has been stopped at the FILLER for ten minutes. What do I do with the bottles in the PASTEURIZER?",
+    "guidelines": [
+      "States that bottles held longer than four minutes at setpoint exceed 26 PU and must be diverted.",
+      "Says to drop zone 2 to 55 °C and return to 68 °C before restarting.",
+      "Gives the 18 to 26 PU target.",
+      "Cites SPEC-PAS-003."
+    ],
+    "doc": "spec_pasteurizer_pu_hold.md"
+  },
+  {
+    "question": "Did closure lot 2026-04-221 pass, and does it need a torque change on the CAPPER?",
+    "guidelines": [
+      "States every characteristic passed.",
+      "States no machine adjustment is needed; the lot is qualified for 22 Nm.",
+      "Notes liner thickness at 1.17 mm is in the lower half of the window and to check torque heads first if caps are loose."
+    ],
+    "doc": "coa_cap_supplier_lot.md"
+  },
+  {
+    "question": "CONVEYOR_2 accumulation pressure is above 80 % while the FILLER is stopped. Is the conveyor faulty?",
+    "guidelines": [
+      "Says this is the buffer doing its job, not a conveyor fault, and to check the FILLER first.",
+      "Gives the normal 30 to 70 % accumulation range.",
+      "Mentions infeed jams at the FILLER handover as the consequence of sustained high pressure."
+    ],
+    "doc": "maintenance_manual_conveyor.md"
+  },
+  {
+    "question": "How long can a machine be stopped before the line loses cases?",
+    "guidelines": [
+      "States each accumulation conveyor holds about four minutes of production at nominal rate.",
+      "Explains downstream starves and upstream blocks, and that below 60 % buffer level capacity starts to fall.",
+      "Concludes a stop shorter than about four minutes shows as a rate dip rather than lost cases."
+    ],
+    "doc": "pid_filler_line_narrative.md"
+  },
+  {
+    "question": "What zone 2 temperature and PU window should I run the PASTEURIZER at?",
+    "guidelines": [
+      "Answers 68 °C and 18 to 26 PU, from SPEC-PAS-003 revision 3.",
+      "States that technical bulletin TB-2026-05 proposes 69 °C and 20 to 30 PU but is NOT approved, so it does not apply.",
+      "Names the specification as governing where the two disagree.",
+      "Does not present the bulletin's numbers as current."
+    ],
+    "doc": "bulletin_2026_05_pasteurizer_pu_window.md"
+  },
+  {
+    "question": "Why is the 1.0 L format packed at 400 BPM instead of the line nominal 420?",
+    "guidelines": [
+      "Explains the CASE_PACKER is rated to 30 cases per minute and 12-packs at 420 BPM would need 35.",
+      "States the FILLER pacemaker is deliberately slowed to protect the downstream machine.",
+      "Cites SPEC-FILL-021."
+    ],
+    "doc": "spec_fill_volumes_by_format.md"
+  },
+  {
+    "question": "We are changing from cola to the dairy-protein shake. What cleaning is required?",
+    "guidelines": [
+      "Group C to group D requires a full clean in place, the six-phase SOP-CIP-002 sequence, about 64 minutes plus heat-up.",
+      "States that protein verification is required on the way OUT of group D, not into it.",
+      "Mentions that group D is the only allergen-bearing group, milk.",
+      "Cites the cleaning matrix."
+    ],
+    "doc": "matrix_product_changeover_cleaning.md"
+  },
+  {
+    "question": "How long should I plan for a 0.5 L to 1.5 L changeover, and what is on the critical path?",
+    "guidelines": [
+      "Gives 85 minutes as the line critical path.",
+      "States the FILLER is the critical path at 75 minutes, carousel work.",
+      "Notes the CAPPER is not on the critical path because all three formats use the same 28 mm closure.",
+      "Mentions the delivered pasteurisation check before releasing the run."
+    ],
+    "doc": "matrix_changeover_times.md"
+  },
+  {
+    "question": "The EMPTY_INSPECTOR reject rate has climbed to 4 per minute. Where do I look?",
+    "guidelines": [
+      "States normal is below 2 per minute at 420 BPM.",
+      "Directs the reader by reject type: residue film points at BOTTLE_WASHER caustic temperature or concentration, residual liquid at rinse drainage or tunnel speed.",
+      "Mentions rejects concentrated in one lane are mechanical.",
+      "Does not treat a high reject rate as an EMPTY_INSPECTOR fault by default."
+    ],
+    "doc": "sop_empty_inspector_setup.md"
+  },
+  {
+    "question": "What happened on the 18 April day shift, and was any product destroyed?",
+    "guidelines": [
+      "Reports the seven-minute CAPPER cap chute stop at 09:42.",
+      "States 240 bottles in the PASTEURIZER were diverted and destroyed as over-pasteurised, because the four-minute limit was exceeded.",
+      "Mentions zone 2 was dropped to 55 °C and returned to 68 °C before restart.",
+      "Cites batch record BR-2026-0418-A."
+    ],
+    "doc": "batch_record_2026_04_18_shift_a.md"
+  },
+  {
+    "question": "Which checks on this line are critical control points, and what happens if one fails?",
+    "guidelines": [
+      "Names the three: PASTEURIZER delivered PU, CAPPER application torque, EMPTY_INSPECTOR foreign object.",
+      "Gives the critical limits: 18 to 26 PU, 20 to 24 Nm, no object above 2 mm.",
+      "Explains the quarantine boundary is back to the last passed check, so check frequency sets quarantine size.",
+      "Cites the HACCP plan."
+    ],
+    "doc": "haccp_plan_line1_ccps.md"
+  },
+  {
+    "question": "The FILLER fill average looks fine but one group of valves is inconsistent. Does that matter?",
+    "guidelines": [
+      "States valves 13 to 18 were 3.6 ml low as-found with more than double the spread, and two worn valve seals were replaced.",
+      "Explains the spread was the signal rather than the mean, because bowl level control compensates for a weeping seal.",
+      "Mentions the recommendation to shorten the seal interval to four months for that group.",
+      "Cites the calibration certificate."
+    ],
+    "doc": "cal_cert_filler_flowmeters.md"
+  },
+  {
+    "question": "The CASE_PACKER keeps jamming on carton feed. What caused this last time?",
+    "guidelines": [
+      "Root cause was wet lubricant applied at the CONVEYOR_3 discharge, migrating onto carton blanks.",
+      "States the maintenance manual permits dry lubricant at transfer plates only.",
+      "Notes the jam presents three machines away from the cause, which is why it took two weeks to find.",
+      "Cites the root cause analysis."
+    ],
+    "doc": "root_cause_case_packer_jams_2026_02.md"
+  },
+  {
+    "question": "Caustic temperature fell at the BOTTLE_WASHER and zone 2 fell at the PASTEURIZER at the same time. Two faults?",
+    "guidelines": [
+      "States both are fed from the same plant room hot water and steam loop, so one upstream cause is more likely than two faults.",
+      "Says to check the shared supply before treating either machine as faulty.",
+      "May note the same pattern was recorded in the week 16 handover log on 16 April."
+    ],
+    "doc": "sop_bottle_washer_caustic.md"
+  },
+  {
+    "question": "What is the caustic phase temperature and duration in the wet end clean in place?",
+    "guidelines": [
+      "Gives 75 to 80 °C at 1.8 to 2.2 % for 20 minutes.",
+      "States the total circuit is about 64 minutes plus heat-up.",
+      "Notes shortening the caustic phase is the most common cause of a failed hygiene swab.",
+      "Gives the release criteria including swabs below 150 relative light units."
+    ],
+    "doc": "sop_cip_wet_end.md"
+  }
+]

@@ -464,7 +464,7 @@ _LIVE_METRICS: dict[str, float] = {
     "llm_output_tokens": 0.0,
     "llm_calls": 0.0,
     "events_published": 0.0,
-    # Tool-level counters (Vector Search and Genie are wired into specialist agents).
+    # Tool-level counters (AI Search and Genie are wired into specialist agents).
     "vector_search_calls": 0.0,
     "genie_queries": 0.0,
 }
@@ -520,7 +520,7 @@ _LIVE_RATES = {
     # bronze, applies QC, dual-writes to gold_history Delta + ai_serving Postgres.
     "lakebase_syncer_usd_per_hour": 0.55,
     "synced_table_usd_per_hour": 0.30,        # Lakeflow sync pipeline per active table
-    # Vector Search standard endpoint, ~0.5 SCU baseline (~$0.165/h list per SCU).
+    # AI Search standard endpoint, ~0.5 SCU baseline (~$0.165/h list per SCU).
     "vector_search_usd_per_hour": 0.08,
     # Per-call extras — tiny in this app's volume.
     "vector_search_usd_per_query": 0.0001,
@@ -1325,7 +1325,7 @@ async def ops_cost_live(minutes: int = 60):
     prod_usd = round(_LIVE_RATES["producer_job_usd_per_hour"] * win_h, 4) if prod_on else 0.0
     sync_usd = round(_LIVE_RATES["synced_table_usd_per_hour"] * synced_count * win_h, 4) if synced_count else 0.0
     syncer_usd = round(_LIVE_RATES["lakebase_syncer_usd_per_hour"] * win_h, 4) if syncer_on else 0.0
-    # Vector Search: the endpoint is billed HOURLY for as long as it's online
+    # AI Search: the endpoint is billed HOURLY for as long as it's online
     # — query count is a separate, tiny per-call charge. Earlier versions only
     # charged the hourly when ``vs_calls > 0`` in the window which under-
     # reported actual cost (an idle-but-live endpoint still bills). Toggle
@@ -1333,7 +1333,7 @@ async def ops_cost_live(minutes: int = 60):
     # When the flag is absent, read it off VS_ENDPOINT rather than assuming — the
     # same rule render_app_yaml.py applies when it derives the two together (true
     # iff an endpoint is named). The old default was a bare "true", so an app
-    # missing the flag billed ~$58/month of hourly Vector Search against the
+    # missing the flag billed ~$58/month of hourly AI Search against the
     # shipped configuration, which names no endpoint at all. Cost panels are
     # believed, so inventing a line item is worse than omitting one.
     _vs_default = "true" if os.environ.get("VS_ENDPOINT", "").strip() else "false"
@@ -1443,14 +1443,14 @@ async def ops_cost_live(minutes: int = 60):
                      if states.get("lakebase_syncer", {}).get("id")
                      else "streaming sync not configured (set OPS_LAKEBASE_SYNCER_JOB_ID)")),
               on=syncer_on),
-        _line("Vector Search", vs_usd,
+        _line("AI Search", vs_usd,
               # Endpoint is billed HOURLY whether queried or not. ``vs_calls``
               # adds a tiny per-query overhead on top.
               ((f"endpoint live: ${_LIVE_RATES['vector_search_usd_per_hour']}/h × "
                 f"{win_h:.2f}h (~0.5 SCU baseline) + {int(vs_calls)} queries × "
                 f"${_LIVE_RATES['vector_search_usd_per_query']}/query")
                if vs_endpoint_live
-               else "no Vector Search index configured (OPS_VS_ENDPOINT_ALWAYS_ON=false)"),
+               else "no AI Search index configured (OPS_VS_ENDPOINT_ALWAYS_ON=false)"),
               on=vs_endpoint_live),
         _line("Genie",
               # Same value the total uses — this used to be a second copy of the
@@ -1570,7 +1570,7 @@ async def ops_cost_live(minutes: int = 60):
             "Network egress — typically negligible for in-region SSE.",
             "Lakebase Autoscale storage GB-month — small for this workload.",
             "Photon overhead — already included in DBU.",
-            ("Vector Search storage — billed per-vector-month (~$0.04/100k vectors). "
+            ("AI Search storage — billed per-vector-month (~$0.04/100k vectors). "
              "Index-at-rest is small here; endpoint hourly is the dominant cost."),
             ("Genie compute — billed as Serverless SQL Warehouse hours. Folded into "
              "the SQL Warehouse line above unless OPS_GENIE_WAREHOUSE_ID is set to a "
@@ -1637,7 +1637,17 @@ def _ops_to_dict(obj: Any) -> dict[str, Any]:
 
 
 def _ops_user(req: Request) -> str:
-    """Identify the caller for ops audit log (Databricks Apps forwards user via headers)."""
+    """Identify the caller for the ops audit log, from the headers Apps forwards.
+
+    These headers are only worth trusting because Databricks Apps sits in front
+    and sets them itself, overwriting anything the client sent. Serve this app
+    directly — a bare `uvicorn`, a container with the port exposed — and any
+    caller can name themselves. Two things keep that from being an escalation:
+    `_ops_role` grants nothing to an unrecognised identity, so a spoofer has to
+    already know an address on `OPS_ADMIN_EMAILS` or `OPS_OPERATOR_EMAILS`; and
+    the ops actions themselves drive the simulator, not the plant. Worth
+    knowing before this is put behind anything other than Apps.
+    """
     return (
         req.headers.get("x-ops-user")
         or req.headers.get("x-forwarded-email")
@@ -2003,6 +2013,7 @@ async def ops_topology():
         domain_space_id,
         domain_tables,
     )
+    from agent_server.tools.plant_docs_query import docs_assistant_configured
 
     def _read() -> dict:
         domains = []
@@ -2029,6 +2040,12 @@ async def ops_topology():
             # space kept this true while every genie_query against it failed.
             "streaming_space": _streaming_space_available(),
             "mvm_silver_enabled": os.environ.get("MVM_SILVER_ENABLED", "") == "1",
+            # Reported for the same reason as the governed domains: the chat
+            # panel offers document questions, and a deployment that never
+            # provisioned the assistant would answer every one of them with "the
+            # documents could not be read" — a broken feature to anyone who did
+            # not know it was opt-in.
+            "plant_docs": docs_assistant_configured(),
         }
 
     try:

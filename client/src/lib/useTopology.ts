@@ -26,6 +26,9 @@ export interface Topology {
   total: number;
   streaming_space: boolean;
   mvm_silver_enabled: boolean;
+  /** Whether a plant-documents Knowledge Assistant is wired up. Opt-in, and off
+   *  by default, so document questions are only worth offering when it is. */
+  plant_docs?: boolean;
 }
 
 /**

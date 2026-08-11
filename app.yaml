@@ -141,3 +141,19 @@ env:
   # the panel invents roughly $58/month for infrastructure nobody provisioned.
   - name: OPS_VS_ENDPOINT_ALWAYS_ON
     value: 'false'
+  # Knowledge Assistant serving endpoint behind query_plant_docs, the tool that
+  # answers from the plant documents in data/plant_docs/. DERIVED — set
+  # `knowledge_assistant_name` in config/project-settings(.local).yaml and the
+  # deploy provisions the assistant, then writes this and the id below back the
+  # same way VS_ENDPOINT above is written.
+  #
+  # Empty means the tool reports itself unconfigured, which is the point: a
+  # specialist that answers a procedure question without reading the procedure is
+  # worse than one that says the documents were not available. Enabling it costs
+  # an agent endpoint that bills while it is online.
+  - name: DOCS_KA_ENDPOINT
+    value: ''
+  # Carried only so the app can name the assistant it is talking to; the tool
+  # queries DOCS_KA_ENDPOINT above.
+  - name: DOCS_KA_ID
+    value: ''

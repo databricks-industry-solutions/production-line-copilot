@@ -745,10 +745,24 @@ def new_readonly_connection():
         rollback would discard another handler's uncommitted work.
 
     Autocommit means no transaction is left open when the caller is done.
-    Returns None when Lakebase isn't configured. The caller owns the handle and
-    must close it.
+    Returns None when Lakebase isn't configured, or while the circuit breaker is
+    open. The caller owns the handle and must close it.
+
+    The breaker matters more here than on the shared path, not less. This is the
+    slow-scan path, so it is the one most likely to be reached while Lakebase is
+    struggling, and it pays the full ``connect_timeout`` below on every attempt —
+    exactly the cost the breaker exists to skip. It opts in on both sides: it
+    refuses early while the breaker is open, and it reports its own failures, so
+    an outage that only this path notices still trips it for everyone.
+
+    Successes are recorded too, for the cooldown rather than the gate. The
+    breaker closes on a timer without help, but the cooldown doubles on every
+    trip and only a success resets it — a path that reported failures and never
+    successes would ratchet that interval towards its maximum and leave it
+    there. Both paths dial the same host with the same credentials, so a connect
+    that succeeds here is evidence for the shared one as well.
     """
-    if not _is_pg_configured():
+    if not _is_pg_configured() or breaker_is_open():
         return None
     try:
         import psycopg2
@@ -765,8 +779,10 @@ def new_readonly_connection():
             connect_timeout=10,
         )
         conn.autocommit = True
+        _record_connect_success()
         return conn
     except Exception as exc:  # noqa: BLE001
+        _record_connect_failure()
         logger.warning("read-only Lakebase connection failed: %s", str(exc)[:200])
         return None
 

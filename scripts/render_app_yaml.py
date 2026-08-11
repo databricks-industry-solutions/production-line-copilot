@@ -305,6 +305,21 @@ def main() -> None:
         # to invent ~$58/month for an endpoint nobody had provisioned.
         env_to_val["OPS_VS_ENDPOINT_ALWAYS_ON"] = "true" if vs else "false"
 
+    # The Knowledge Assistant follows the same "empty is an instruction" rule as
+    # Vector Search above, for the same reason: an agent endpoint bills while it
+    # is online, so clearing the endpoint is how an operator turns the document
+    # path off, and a skipped empty would leave the app querying an assistant
+    # the settings no longer name.
+    #
+    # Both keys are written back by scripts/provision_knowledge_assistant.py
+    # rather than typed. The id is carried purely so the app can name the
+    # assistant it is talking to; only the endpoint is queried.
+    for field, env_name in (("knowledge_assistant_endpoint", "DOCS_KA_ENDPOINT"),
+                            ("knowledge_assistant_id", "DOCS_KA_ID")):
+        if field in prof:
+            val = str(prof.get(field) or "").strip()
+            env_to_val[env_name] = "" if _is_placeholder(val) else val
+
     role_env = _role_overrides(prof.get("model_roles"))
     env_to_val.update(role_env)
 

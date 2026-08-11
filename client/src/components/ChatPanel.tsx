@@ -15,6 +15,8 @@ import {
   rowSummaryTitle,
   type ToolEvidence,
 } from '../lib/toolEvidence';
+import { availableSuggestions as suggestionsFor } from '../lib/chatSuggestions';
+import { useTopology } from '../lib/useTopology';
 import ActionPanel from './ActionPanel';
 import DataSourceBadge from './DataSourceBadge';
 
@@ -99,33 +101,6 @@ export interface ChatPanelProps {
 
 const SHIFT_BRIEFING_QUERY =
   'Generate a shift start briefing: production plan, carry-over issues, material status, crew, and maintenance schedule.';
-
-const QUICK_QUERIES = [
-  {
-    category: 'Performance',
-    queries: [
-      'What is the current OEE and how can we improve it?',
-      'Which machine is the biggest bottleneck right now?',
-      'How does this shift compare to the plan so far?',
-    ],
-  },
-  {
-    category: 'Issues',
-    queries: [
-      'Summarize the active events and their impact',
-      'Are there any material shortages I should worry about?',
-      'What is the root cause of the latest downtime?',
-    ],
-  },
-  {
-    category: 'Planning',
-    queries: [
-      'Can we still meet the shift target? What needs to change?',
-      'Predict potential issues for the rest of the shift',
-      'What should I brief the next shift about?',
-    ],
-  },
-];
 
 const SPECIALIST_COLORS: Record<string, string> = {
   oee_coach: 'bg-green-500/20 text-green-700 dark:text-green-300',
@@ -366,8 +341,6 @@ function StructuredResponse({ content }: { content: string }) {
   );
 }
 
-const ALL_SUGGESTIONS = QUICK_QUERIES.flatMap((g) => g.queries);
-
 export default function ChatPanel({ shiftId, timestamp, machineId, externalQuery }: ChatPanelProps) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
@@ -386,7 +359,11 @@ export default function ChatPanel({ shiftId, timestamp, machineId, externalQuery
   const conversationIdRef = useRef<string | null>(null);
   const lastExternalIdRef = useRef(0);
 
-  const availableSuggestions = useMemo(() => ALL_SUGGESTIONS.filter((q) => !askedQueries.has(q)), [askedQueries]);
+  const { topology } = useTopology();
+  const availableSuggestions = useMemo(
+    () => suggestionsFor(askedQueries, topology?.plant_docs),
+    [askedQueries, topology?.plant_docs],
+  );
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });

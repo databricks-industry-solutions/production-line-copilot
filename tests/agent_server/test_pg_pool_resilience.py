@@ -219,6 +219,58 @@ class TestAnOutageStopsCostingAConnectTimeout:
         assert pg_pool._breaker_cooldown_s <= pg_pool._BREAKER_COOLDOWN_MAX_S
 
 
+class TestTheSlowScanPathIsBehindTheBreakerToo:
+    """`new_readonly_connection` opens its own socket on every call.
+
+    It was the one connect path outside the breaker: no check on the way in and
+    no failure recorded on the way out. That is the wrong path to leave outside,
+    because it is the slow-scan path — the one most likely to be reached while
+    Lakebase is already struggling — and it pays the full connect_timeout each
+    time, which is the cost the breaker exists to skip.
+    """
+
+    def test_it_does_not_dial_while_the_breaker_is_open(self, monkeypatch):
+        monkeypatch.setattr(pg_pool, "_is_pg_configured", lambda: True)
+        attempted = []
+        monkeypatch.setattr(pg_pool, "_get_pg_user", lambda: attempted.append(1) or "u")
+
+        for _ in range(pg_pool._CONNECT_FAILURES_BEFORE_OPEN):
+            pg_pool._record_connect_failure()
+
+        assert pg_pool.new_readonly_connection() is None
+        assert attempted == [], "no connect should be attempted while open"
+
+    def test_its_failures_count_towards_opening_the_breaker(self, monkeypatch):
+        monkeypatch.setattr(pg_pool, "_is_pg_configured", lambda: True)
+        monkeypatch.setattr(pg_pool, "_get_pg_user", lambda: "u")
+        monkeypatch.setattr(pg_pool, "_get_pg_password", lambda: "p")
+        monkeypatch.setattr(
+            psycopg2, "connect", lambda **_: (_ for _ in ()).throw(psycopg2.OperationalError("down"))
+        )
+
+        for _ in range(pg_pool._CONNECT_FAILURES_BEFORE_OPEN):
+            assert pg_pool.new_readonly_connection() is None
+
+        assert pg_pool.breaker_is_open() is True, (
+            "an outage only this path notices left the breaker closed, so every "
+            "later scan paid the connect timeout again"
+        )
+
+    def test_a_success_resets_the_backoff(self, monkeypatch):
+        monkeypatch.setattr(pg_pool, "_is_pg_configured", lambda: True)
+        monkeypatch.setattr(pg_pool, "_get_pg_user", lambda: "u")
+        monkeypatch.setattr(pg_pool, "_get_pg_password", lambda: "p")
+
+        for _ in range(pg_pool._CONNECT_FAILURES_BEFORE_OPEN):
+            pg_pool._record_connect_failure()
+        pg_pool._breaker_open_until = 0.0  # cooldown elapsed; counter still hot
+
+        monkeypatch.setattr(psycopg2, "connect", lambda **_: FakeConn())
+        assert pg_pool.new_readonly_connection() is not None
+        assert pg_pool._consecutive_failures == 0
+        assert pg_pool._breaker_cooldown_s == pg_pool._BREAKER_COOLDOWN_START_S
+
+
 class TestAPoisonedConnectionIsRolledBackNotRebuilt:
     """Reconnecting costs an OAuth token mint plus a TLS handshake. When the
     only thing wrong is an aborted transaction, a rollback is the fix."""

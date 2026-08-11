@@ -20,7 +20,7 @@
 # --purge-shared is for tearing down EVERY environment, e.g. before re-testing
 # the deploy from scratch. Resources that several profiles point at — the
 # governed MVM schemas, the Lakebase ai_serving/ai_chatbot namespaces, the
-# Vector Search endpoint — are skipped by default precisely so that tearing
+# AI Search endpoint — are skipped by default precisely so that tearing
 # down dev cannot take prod's data with it. This flag says you mean it. It
 # implies --purge-data.
 #
@@ -157,6 +157,11 @@ if [[ -n "$MVM_SHARED_WITH" && "$PURGE_SHARED" != "1" ]]; then
 fi
 WAREHOUSE_ID=$(_field sql_warehouse_id)
 GENIE_ID=$(_field genie_space_id)
+# Legacy. deploy.sh no longer creates the combined MVM space — nothing in the
+# app ever called it — but an environment deployed before that removal still
+# has one, and its id still sits in that operator's settings file. Teardown
+# keeps reading the key so those spaces get collected instead of orphaned; it
+# resolves to empty on any environment provisioned since.
 MVM_GENIE_ID=$(_field mvm_genie_space_id)
 
 # The four per-domain governed spaces deploy.sh creates (step 7c). These were
@@ -168,10 +173,16 @@ for _d in asset quality inventory production; do
   DOMAIN_GENIE_IDS+=("$(_field "genie_space_${_d}")")
 done
 
-# Vector Search. The endpoint bills hourly and takes 15-40 minutes to rebuild,
+# AI Search. The endpoint bills hourly and takes 15-40 minutes to rebuild,
 # so it is only removed under --purge-shared. Indexes live inside the schema
 # being dropped and go either way.
 VS_ENDPOINT=$(_field vector_search_endpoint)
+
+# The Knowledge Assistant. Not gated on --purge-shared: it is created per
+# profile from `knowledge_assistant_name`, exactly like the Genie spaces, and it
+# serves from an agent endpoint that bills while it is online. The document
+# volume it reads lives inside the schema this script drops.
+KA_ID=$(_field knowledge_assistant_id)
 
 # Lakebase. The instance is a prerequisite and survives; its schemas are ours.
 # ai_serving is shared across environments by design (shift_id is what isolates
@@ -207,9 +218,9 @@ if [[ "$PURGE_DATA" == "1" ]]; then
   warn "   • UC SCHEMA ${UC_CATALOG}.${UC_SCHEMA} (CASCADE — tables AND checkpoints)"
   if [[ "$PURGE_SHARED" == "1" ]]; then
     warn "   • SHARED: Lakebase schemas ai_serving + ai_chatbot on ${LAKEBASE_PG_HOST:-?}"
-    [[ -n "$VS_ENDPOINT" ]] && warn "   • SHARED: Vector Search endpoint '${VS_ENDPOINT}' and its indexes (15-40 min to rebuild)"
+    [[ -n "$VS_ENDPOINT" ]] && warn "   • SHARED: AI Search endpoint '${VS_ENDPOINT}' and its indexes (15-40 min to rebuild)"
   else
-    info "   • Lakebase schemas and the Vector Search endpoint are KEPT (--purge-shared to drop)"
+    info "   • Lakebase schemas and the AI Search endpoint are KEPT (--purge-shared to drop)"
   fi
   if [[ -n "$MVM_PURGE_CATALOG" ]]; then
     warn "   • Governed MVM schemas in ${MVM_PURGE_CATALOG} (asset/production/quality/inventory)"
@@ -249,6 +260,47 @@ for space in "$GENIE_ID" "$MVM_GENIE_ID" "${DOMAIN_GENIE_IDS[@]}"; do
       || warn "Could not delete Genie space $space (already gone?) — check manually."
   fi
 done
+
+# ── AI Search indexes: this environment's always, before the schema goes ─────
+# An index is a UC object inside the schema, but DROP SCHEMA CASCADE removes it
+# without telling the serving side, so it has to go through the API *first* —
+# which is why this runs above the purge and not with the endpoint below.
+#
+# The index is not shared either, and gating it on --purge-shared alongside the
+# endpoint meant a dev teardown left a dev index serving over a table it had
+# just dropped. The next "fresh" deploy then found an index already there,
+# created nothing, and proved nothing. So this environment's own indexes — the
+# ones inside the schema this script drops — go on every run.
+if [[ -n "$VS_ENDPOINT" ]]; then
+  _vs_indexes() {
+    databricks vector-search-indexes list-indexes "$VS_ENDPOINT" --profile "$PROFILE" --output json 2>/dev/null \
+      | python3 -c "
+import json,sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+prefix = '$1'
+for i in (d if isinstance(d, list) else d.get('vector_indexes', [])):
+    name = i.get('name','')
+    if name and name.startswith(prefix):
+        print(name)
+" 2>/dev/null || echo ""
+  }
+  if [[ "$PURGE_SHARED" == "1" ]]; then
+    info "Deleting ALL AI Search indexes on '$VS_ENDPOINT' ..."
+    VS_INDEXES=$(_vs_indexes "")
+  else
+    info "Deleting AI Search indexes under ${UC_CATALOG}.${UC_SCHEMA} on '$VS_ENDPOINT' ..."
+    VS_INDEXES=$(_vs_indexes "${UC_CATALOG}.${UC_SCHEMA}.")
+  fi
+  while IFS= read -r idx; do
+    [[ -z "$idx" ]] && continue
+    databricks vector-search-indexes delete-index "$idx" --profile "$PROFILE" >/dev/null 2>&1 \
+      && success "  index $idx deleted." \
+      || warn "  could not delete index $idx — check manually."
+  done <<< "$VS_INDEXES"
+fi
 
 # ── Unity Catalog data (opt-in) ──────────────────────────────────────────────
 # DROP SCHEMA ... CASCADE, deliberately not table-by-table: the streaming
@@ -321,33 +373,26 @@ PY
   fi
 fi
 
-# ── Vector Search (opt-in, shared) ───────────────────────────────────────────
-# Indexes are UC objects inside the schema, but DROP SCHEMA CASCADE leaves the
-# serving side of a Delta Sync index behind, so delete them through the API
-# first. The endpoint is the expensive part to rebuild — 15-40 minutes — and is
-# shared with any other profile naming it, hence --purge-shared.
-if [[ "$PURGE_SHARED" == "1" && -n "$VS_ENDPOINT" ]]; then
-  info "Deleting Vector Search indexes on '$VS_ENDPOINT' ..."
-  VS_INDEXES=$(databricks vector-search-indexes list-indexes "$VS_ENDPOINT" --profile "$PROFILE" --output json 2>/dev/null \
-    | python3 -c "
-import json,sys
-try:
-    d = json.load(sys.stdin)
-except Exception:
-    sys.exit(0)
-for i in (d if isinstance(d, list) else d.get('vector_indexes', [])):
-    print(i.get('name',''))
-" 2>/dev/null || echo "")
-  while IFS= read -r idx; do
-    [[ -z "$idx" ]] && continue
-    databricks vector-search-indexes delete-index "$idx" --profile "$PROFILE" >/dev/null 2>&1 \
-      && success "  index $idx deleted." \
-      || warn "  could not delete index $idx — check manually."
-  done <<< "$VS_INDEXES"
+# ── Knowledge Assistant (opt-in) ─────────────────────────────────────────────
+# Deleting the assistant takes its knowledge sources and its serving endpoint
+# with it. Left behind, the next deploy finds an assistant whose corpus volume
+# was dropped underneath it, and re-syncs an empty knowledge base.
+if [[ -n "$KA_ID" && "$KA_ID" != "SET_ME" ]]; then
+  info "Deleting Knowledge Assistant 'knowledge-assistants/$KA_ID' ..."
+  databricks knowledge-assistants delete-knowledge-assistant \
+    "knowledge-assistants/$KA_ID" --profile "$PROFILE" >/dev/null 2>&1 \
+    && success "Knowledge Assistant deleted." \
+    || warn "Could not delete knowledge-assistants/$KA_ID (already gone, or the CLI predates the command group) — check the Agents page."
+fi
 
-  info "Deleting Vector Search endpoint '$VS_ENDPOINT' ..."
+# ── AI Search endpoint (shared) ──────────────────────────────────────────────
+# The indexes on it went earlier, before the schema drop. The endpoint itself is
+# the expensive part to rebuild — 15-40 minutes — and is shared with any other
+# profile naming it, hence --purge-shared.
+if [[ "$PURGE_SHARED" == "1" && -n "$VS_ENDPOINT" ]]; then
+  info "Deleting AI Search endpoint '$VS_ENDPOINT' ..."
   databricks vector-search-endpoints delete-endpoint "$VS_ENDPOINT" --profile "$PROFILE" >/dev/null 2>&1 \
-    && success "Vector Search endpoint deleted." \
+    && success "AI Search endpoint deleted." \
     || warn "Could not delete endpoint '$VS_ENDPOINT' (already gone?) — check manually."
 fi
 
@@ -455,11 +500,18 @@ import re, sys, yaml
 
 path, target = sys.argv[1], sys.argv[2]
 KEYS = (
-    "app_client_id", "lakebase_pg_user", "genie_space_id", "mvm_genie_space_id",
+    "app_client_id", "lakebase_pg_user", "genie_space_id",
+    # Legacy, kept so a settings file written before the combined MVM space was
+    # removed does not keep a dangling id for a space this teardown deleted.
+    "mvm_genie_space_id",
     # deploy.sh writes these back too (step 7c). Leaving them behind made the
     # next deploy "refresh" four spaces it had just deleted.
     "genie_space_asset", "genie_space_quality",
     "genie_space_inventory", "genie_space_production",
+    # The assistant this teardown just deleted. Left behind, the next deploy
+    # points the app at an endpoint that no longer exists and syncs an assistant
+    # that is gone — while reporting the document path as configured.
+    "knowledge_assistant_endpoint", "knowledge_assistant_id",
 )
 
 lines = open(path, encoding="utf-8").read().split("\n")

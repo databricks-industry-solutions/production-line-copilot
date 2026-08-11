@@ -58,6 +58,39 @@ class TestTheAgentFrameworkIsDescribedCorrectly:
             f"ARCHITECTURE.md says {claim.group(1)}, the code defaults to {limit}"
         )
 
+    def test_the_documented_specialist_timeout_is_the_one_in_the_code(self):
+        # The sibling above pinned the recursion limit but not the timeout, so
+        # when the default was raised from 90 to 150 the prose kept saying 90
+        # and nothing noticed. Any sentence naming a second count next to
+        # "specialist timeout" has to agree with the constant.
+        m = re.search(
+            r'SPECIALIST_TIMEOUT_SECONDS = int\(os\.environ\.get\("SPECIALIST_TIMEOUT_SECONDS", "(\d+)"\)\)',
+            AGENT,
+        )
+        assert m, "could not find SPECIALIST_TIMEOUT_SECONDS in agent.py"
+        timeout = m.group(1)
+
+        # Positive pin: the doc names the constant and the number beside it has
+        # to be the real default. Without this the test passes vacuously the
+        # moment someone rewords the sentence.
+        stated = re.search(r"SPECIALIST_TIMEOUT_SECONDS`?,?\s*(\d+)\s*s", ARCHITECTURE)
+        assert stated, "ARCHITECTURE.md no longer states the specialist timeout"
+        assert stated.group(1) == timeout, (
+            f"ARCHITECTURE.md says {stated.group(1)} s, the code defaults to {timeout}"
+        )
+
+        # And the older phrasing, which is what actually drifted: a bare
+        # "90-second specialist timeout" with no constant named beside it.
+        stale = [
+            found
+            for found in re.findall(r"(\d+)[\s-]?second specialist timeout", ARCHITECTURE)
+            if found != timeout
+        ]
+        assert not stale, (
+            f"ARCHITECTURE.md names a {stale} second specialist timeout; the code "
+            f"defaults to {timeout}"
+        )
+
 
 class TestTheGovernedDomainMappingIsDescribedCorrectly:
     """Genie spaces are per DOMAIN; specialists map onto them many-to-one."""

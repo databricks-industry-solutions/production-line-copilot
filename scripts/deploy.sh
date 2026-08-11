@@ -5,6 +5,9 @@
 #   ./scripts/deploy.sh dev            # deploy to line_manager_dev (production-line-copilot-dev)
 #   ./scripts/deploy.sh prod           # deploy to line_manager_prod (production-line-copilot-prod)
 #   ./scripts/deploy.sh dev --skip-app # bundle deploy only, skip ``databricks apps deploy``
+#   ./scripts/deploy.sh dev --capabilities  # print what would be built, deploy nothing
+#   MINIMAL=1 ./scripts/deploy.sh dev  # skip the two capabilities that bill hourly
+#   VS_WAIT=1 ./scripts/deploy.sh dev  # block until AI Search is online (15-40 min)
 #
 # Layered deploy:
 #   1. ``python3 scripts/sync_project_settings.py``  → bundle-targets.yaml
@@ -31,9 +34,15 @@ case "$ENV" in
     : ;;
   *)
     cat >&2 <<EOF
-Usage: $0 <dev|prod> [--skip-app]
+Usage: $0 <dev|prod> [--skip-app] [--capabilities]
   dev   → bundle target line_manager_dev,  app production-line-copilot-dev
   prod  → bundle target line_manager_prod, app production-line-copilot-prod
+
+  --capabilities  print which capabilities this env would build, then exit
+  MINIMAL=1       skip the two capabilities that bill hourly (AI Search,
+                  Knowledge Assistant); everything else still deploys
+  VS_WAIT=1       block until the AI Search endpoint is online (15-40 min)
+                  instead of letting the next deploy build the index
 
 Profile: \$DATABRICKS_PROFILE (default: DEFAULT)
 EOF
@@ -45,10 +54,22 @@ EXTRA=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --skip-app) SKIP_APP=1; shift ;;
+    --capabilities) CAPABILITIES_ONLY=1; shift ;;
     --) shift; EXTRA+=("$@"); break ;;
     *)  EXTRA+=("$1"); shift ;;
   esac
 done
+
+# Read-only inventory, before anything below can touch a file or a workspace:
+# someone asking what a deploy would build has not asked for a deploy.
+# No array: this runs under bash 3.2, where `set -u` treats an empty "${a[@]}"
+# as an unbound variable and aborts.
+if [[ "${CAPABILITIES_ONLY:-0}" == "1" ]]; then
+  if [[ "${MINIMAL:-0}" == "1" ]]; then
+    exec python3 scripts/capabilities.py "$ENV" --minimal
+  fi
+  exec python3 scripts/capabilities.py "$ENV"
+fi
 
 PROFILE="${DATABRICKS_PROFILE:-DEFAULT}"
 
@@ -99,6 +120,16 @@ else
   PROJECT_SETTINGS_YAML="config/project-settings.yaml"
 fi
 echo "=== PROJECT_SETTINGS_YAML=$PROJECT_SETTINGS_YAML ==="
+
+# The plan, before the work: which capabilities this run builds, what each one
+# costs, and which of them are slow. Printed here rather than only at the end
+# because the timings are worth knowing before the wait, not during it.
+if [[ "${MINIMAL:-0}" == "1" ]]; then
+  python3 scripts/capabilities.py "$ENV" --settings "$PROJECT_SETTINGS_YAML" --minimal || true
+else
+  python3 scripts/capabilities.py "$ENV" --settings "$PROJECT_SETTINGS_YAML" || true
+fi
+echo
 
 # Optional preflight: set RUN_PREFLIGHT=1 to run scripts/preflight.py before deploy.
 if [[ "${RUN_PREFLIGHT:-0}" == "1" ]]; then
@@ -224,6 +255,71 @@ if [[ -z "$DEPLOY_USER" ]]; then
   exit 1
 fi
 export DEPLOYER_EMAIL="$DEPLOY_USER"
+
+# ── Auth pre-flight against the path Terraform uses ──────────────────────────
+# `current-user me` above proves the CLI can authenticate. It does not prove
+# `bundle deploy` can, because that spawns Terraform, whose provider resolves
+# credentials itself — from a filtered environment holding only DATABRICKS_HOST,
+# DATABRICKS_ACCOUNT_ID, DATABRICKS_WORKSPACE_ID and DATABRICKS_CONFIG_PROFILE.
+# Two consequences, both of which have broken a deploy here:
+#
+#   * The provider reads the DEFAULT (OS keyring) token cache, because
+#     DATABRICKS_AUTH_STORAGE is not among the variables it is handed. Setting
+#     it changes where the CLI looks and not where the provider looks — so a
+#     `DATABRICKS_AUTH_STORAGE=plaintext` login makes things worse: it mints a
+#     session that invalidates the refresh token in the keyring copy Terraform
+#     is still using. Log in on one storage and stay there.
+#   * A U2M OAuth session is shared. Anything else on the profile (an IDE, an
+#     MCP server, a second deploy) refreshes it, the refresh token rotates, and
+#     the copy Terraform holds goes invalid — "the refresh token is invalid".
+#     Where the keyring is unreachable altogether ("OS keyring unreachable: exit
+#     status 44" — CI, ssh, headless shells), the credential has to be one the
+#     provider can resolve from the profile itself: a PAT, or a service
+#     principal client id + secret. Neither rotates, which is what a 20-45
+#     minute deploy wants regardless.
+#
+# All of it used to surface deep inside a later bundle pass, on whatever resource
+# Terraform read first, tens of minutes in — after the setup job had run and the
+# billing endpoints were up. `bundle plan` runs the same provider against the
+# same state and costs seconds, so the failure lands here instead.
+#
+# Only an auth signature is fatal. A plan can fail for reasons that a deploy
+# then fixes, and this is a probe for one blind spot, not a new gate.
+_auth_failure_in() {
+  grep -qiE "keyring unreachable|refresh token is invalid|cannot get access token|default auth: " "$1"
+}
+_explain_auth_failure() {
+  echo "" >&2
+  echo "This is an authentication failure inside Terraform, not a problem with the" >&2
+  echo "bundle. The CLI authenticates fine; the provider it spawns resolves its own" >&2
+  echo "credential from profile '$PROFILE' and the DEFAULT token cache." >&2
+  echo "" >&2
+  echo "  • Stale or rotated OAuth session — re-login on the default storage, which" >&2
+  echo "    is the one the provider reads:" >&2
+  echo "      databricks auth login --profile $PROFILE" >&2
+  echo "    Do NOT set DATABRICKS_AUTH_STORAGE for this: the provider never sees it," >&2
+  echo "    and logging in elsewhere invalidates the copy it is using." >&2
+  echo "  • Keyring unreachable (CI, ssh, headless), or a session that keeps being" >&2
+  echo "    rotated by other tools on this profile — give the profile a credential" >&2
+  echo "    that does not rotate: a PAT (token = …) or a service principal" >&2
+  echo "    (client_id + client_secret) in ~/.databrickscfg." >&2
+  echo "" >&2
+}
+PREFLIGHT_LOG="$(mktemp -t bundle_plan.XXXXXX)"
+if databricks bundle plan --target "$BUNDLE_TARGET" --profile "$PROFILE" > "$PREFLIGHT_LOG" 2>&1; then
+  echo "=== Auth pre-flight: Terraform can authenticate (bundle plan) ==="
+elif _auth_failure_in "$PREFLIGHT_LOG"; then
+  echo "ERROR: auth pre-flight failed — 'bundle plan' cannot authenticate as $PROFILE." >&2
+  sed -n '1,12p' "$PREFLIGHT_LOG" >&2
+  _explain_auth_failure
+  echo "Nothing has been deployed. Fix the credential and re-run." >&2
+  rm -f "$PREFLIGHT_LOG"
+  exit 1
+else
+  echo "=== Auth pre-flight: 'bundle plan' did not succeed, but not on auth — continuing ==="
+  sed -n '1,6p' "$PREFLIGHT_LOG"
+fi
+rm -f "$PREFLIGHT_LOG"
 
 # Trap setup: working copies of app.yaml + bundle-targets.yaml get the
 # resolved deployer email substituted in before bundle/apps deploy. The
@@ -482,6 +578,14 @@ for prof in (d.get('profiles') or {}).values():
 
 PRODUCER_SP_ID=$(_profile_field producer_client_id)
 
+# What each optional capability actually did, collected as the deploy goes and
+# printed together at the end. The skip lines below are true when they print and
+# then scroll past hundreds of other lines, so the question they answer — "did I
+# get the whole product or a subset?" — was unanswerable by the time anyone
+# thought to ask it.
+CAPABILITY_OUTCOMES=()
+note_capability() { CAPABILITY_OUTCOMES+=("$1"); }
+
 register_sp() {
   local sp_id="$1"
   local label="$2"
@@ -562,8 +666,10 @@ PY
 # Write a genie space id for the deploy target's profile into
 # project-settings.local.yaml (same line-based, profile-scoped rewrite as
 # write_app_client_id). Used after auto-creating a Genie space on a fresh env.
-# $1 = space id; $2 = key to write (default genie_space_id; the governed MVM
-# space uses mvm_genie_space_id).
+# $1 = value; $2 = key to write (default genie_space_id; the per-domain spaces
+# use genie_space_<domain>, and the Knowledge Assistant step writes
+# knowledge_assistant_endpoint / knowledge_assistant_id through the same
+# helper — the rewrite is key-agnostic, only the name is historical).
 write_genie_space_id() {
   local space_id="$1"
   local key="${2:-genie_space_id}"
@@ -606,8 +712,9 @@ for line in lines:
         else:
             if line.strip() and item_indent is None:
                 item_indent = cur_indent
-            # Match the exact key only (mvm_genie_space_id must NOT be caught by
-            # the genie_space_id write and vice versa).
+            # Match the exact key only. Several keys here share a prefix
+            # (genie_space_id, genie_space_asset, knowledge_assistant_id …),
+            # so a loose match would write the value into a sibling field.
             pk = re.match(rf"^(\s+)({re.escape(key)}):\s*.*$", line)
             if pk:
                 out.append(f'{pk.group(1)}{pk.group(2)}: "{space_id}"')
@@ -678,6 +785,18 @@ run_bundle_deploy() {
     rm -f "$logf"
     databricks "${deploy_args[@]}" --force-lock
     return $?
+  fi
+  # An OAuth session can go invalid mid-deploy — it is shared, and a refresh
+  # elsewhere rotates it. Terraform then prints one stanza per resource it could
+  # not read, which buries both the cause and the fact that re-running is the
+  # whole fix: every step of this deploy is idempotent, so a second run skips the
+  # setup job and reuses the spaces, the index and the assistant.
+  if (( rc != 0 )) && _auth_failure_in "$logf"; then
+    echo "ERROR: bundle deploy lost its credential part-way through." >&2
+    _explain_auth_failure
+    echo "Then re-run the same command. The deploy resumes: it detects what already" >&2
+    echo "exists and rebuilds nothing — but until it finishes, the app is running one" >&2
+    echo "pass behind, without the env this deploy was about to write." >&2
   fi
   rm -f "$logf"
   return $rc
@@ -1123,13 +1242,20 @@ else
   fi
 fi
 
-# ── 7b. Governed MVM Genie space (only when streaming silver is on) ────────
-# The governed space is a SEPARATE Genie space over the MVM silver model
-# (asset/production/quality/inventory). It only makes sense when the model is
-# populated, i.e. mvm_silver_enabled=true. Same create-or-refresh pattern as
-# the streaming space, but it does NOT rewire the app (the in-app agent keeps
-# using the streaming/mobile space; this governed space is a standalone
-# analyst/auditor surface). Grants the app SP CAN_RUN idempotently.
+# ── 7b. Governed Genie spaces over the MVM model (only when silver is on) ──
+# These sit over the MVM silver model (asset/production/quality/inventory), so
+# they only make sense when the model is populated, i.e. mvm_silver_enabled=true.
+# They do NOT rewire the streaming space: the in-app agent keeps using
+# genie_space_id for live line questions and reaches the governed model through
+# the per-domain tool instead.
+#
+# A single combined space over all twelve MVM tables used to be created here
+# too, as a standalone analyst surface. It was removed because nothing ever
+# called it: no env var carried its id into the app, so it cost a space and a
+# grant on every deploy and answered no one. The per-domain spaces below cover
+# the same tables, and genie_space_config_mvm.py argues narrow scope is the
+# more accurate shape anyway.
+#
 # mvm_silver_enabled is a YAML boolean, so _profile_field (which calls .strip())
 # can't read it — coerce to a lowercase "true"/"false" string inline instead.
 MVM_SILVER=$(python3 -c "
@@ -1141,42 +1267,22 @@ for prof in (d.get('profiles') or {}).values():
         print(str(prof.get('mvm_silver_enabled', False)).lower()); break
 " 2>/dev/null || echo "false")
 MVM_CAT=$(_profile_field mvm_catalog)
-MVM_GENIE_ID=$(_profile_field mvm_genie_space_id)
+# Empty mvm_catalog means "the live catalog", which is what sync_project_settings
+# does with it and what the settings comment promises. Requiring it here instead
+# meant the shipped default — silver on, catalog blank — created no domain spaces
+# at all, and said nothing about it.
+if [[ -z "$MVM_CAT" || "$MVM_CAT" == "SET_ME" ]]; then
+  MVM_CAT=$(_profile_field uc_catalog)
+fi
 if [[ "$MVM_SILVER" == "true" && -n "$WAREHOUSE_ID" && -n "$MVM_CAT" && "$MVM_CAT" != "SET_ME" ]]; then
   # Same name-collision rule as the streaming space above.
   MVM_GENIE_ARGS=(--profile "$PROFILE" --warehouse-id "$WAREHOUSE_ID" --catalog "$MVM_CAT")
   [[ "$ENV" != "prod" ]] && MVM_GENIE_ARGS+=(--title-suffix "$ENV")
-  if [[ -z "$MVM_GENIE_ID" || "$MVM_GENIE_ID" == "SET_ME" ]]; then
-    echo "=== Creating governed MVM Genie space (fresh) ==="
-    MVM_GENIE_OUT=$(python3 scripts/genie_space_config_mvm.py "${MVM_GENIE_ARGS[@]}" \
-      --parent-path "/Users/$DEPLOY_USER" 2>&1) || {
-      echo "$MVM_GENIE_OUT" >&2
-      echo "WARN: governed MVM Genie space create failed — governed analytics unavailable until fixed." >&2
-      MVM_GENIE_OUT=""
-    }
-    [[ -n "$MVM_GENIE_OUT" ]] && echo "$MVM_GENIE_OUT"
-    NEW_MVM_GENIE_ID=$(printf '%s\n' "$MVM_GENIE_OUT" | awk -F= '/^GENIE_SPACE_ID=/{print $2; exit}')
-    if [[ -n "$NEW_MVM_GENIE_ID" ]]; then
-      write_genie_space_id "$NEW_MVM_GENIE_ID" mvm_genie_space_id
-      MVM_GENIE_ID="$NEW_MVM_GENIE_ID"
-    fi
-  else
-    echo "=== Refreshing governed MVM Genie space $MVM_GENIE_ID (curated config) ==="
-    python3 scripts/genie_space_config_mvm.py "${MVM_GENIE_ARGS[@]}" --space-id "$MVM_GENIE_ID" \
-      || echo "WARN: governed MVM Genie refresh failed — space kept its previous config." >&2
-  fi
-  if [[ -n "$MVM_GENIE_ID" && "$MVM_GENIE_ID" != "SET_ME" && -n "${APP_SP_ID:-}" ]]; then
-    echo "=== Granting app SP $APP_SP_ID CAN_RUN on governed MVM Genie space $MVM_GENIE_ID ==="
-    MVM_GENIE_PERMS_JSON=$(printf '{"access_control_list":[{"service_principal_name":"%s","permission_level":"CAN_RUN"}]}' "$APP_SP_ID")
-    databricks api patch "/api/2.0/permissions/genie/$MVM_GENIE_ID" --profile "$PROFILE" \
-      --json "$MVM_GENIE_PERMS_JSON" >/dev/null \
-      || echo "WARN: could not grant app SP CAN_RUN on governed MVM Genie space — grant manually." >&2
-  fi
 
   # ── 7c. Per-domain governed Genie spaces ────────────────────────────────
-  # One narrow space per schema of the governed model. Unlike the combined
-  # space above, these ARE wired into the app: each specialist is handed the
-  # tool for its own domain (agent_server/tools/governed_domain_query.py).
+  # One narrow space per schema of the governed model. These ARE wired into
+  # the app: each specialist is handed the tool for its own domain
+  # (agent_server/tools/governed_domain_query.py).
   # Same create-or-refresh-then-grant pattern, run per domain. A domain that
   # fails to provision leaves its id empty, and the specialist simply falls
   # back to sql_query rather than getting a tool that always errors.
@@ -1230,6 +1336,22 @@ if [[ "$MVM_SILVER" == "true" && -n "$WAREHOUSE_ID" && -n "$MVM_CAT" && "$MVM_CA
       ${APP_SRC_PATH:+--source-code-path "$APP_SRC_PATH"} \
       || echo "WARN: app redeploy after domain Genie wiring failed — re-run deploy to pick up the space ids." >&2
   fi
+  note_capability "Governed model:       4 domain Genie spaces over $MVM_CAT"
+elif [[ "$MVM_SILVER" != "true" ]]; then
+  # This branch did not exist, so the four governed Genie spaces — and the
+  # per-domain tools the specialists get from them — were the one capability a
+  # fresh deploy never mentioned in any form. It read as a product that does not
+  # have them rather than one that was switched off.
+  echo "Skipping the governed model (mvm_silver_enabled is false)."
+  echo "    The domain specialists fall back to sql_query on the raw tables, and the"
+  echo "    four governed Genie spaces (asset, quality, inventory, production) are"
+  echo "    not created. To enable: set mvm_silver_enabled: true in"
+  echo "    config/project-settings.local.yaml. Costs nothing beyond the queries."
+  note_capability "Governed model:       off (mvm_silver_enabled is false)"
+else
+  echo "WARN: mvm_silver_enabled is true but catalog/warehouse are not resolvable" >&2
+  echo "      (catalog='$MVM_CAT' warehouse='$WAREHOUSE_ID') — no governed Genie spaces." >&2
+  note_capability "Governed model:       MISCONFIGURED — see the warning above"
 fi
 
 # ── 8. Idempotent app-SP UC grants (self-heal on every deploy) ──────────
@@ -1314,16 +1436,20 @@ else
   echo "WARN: skipping prompt registration (catalog='$UC_CATALOG_PROMPTS', schema='$UC_SCHEMA_PROMPTS')." >&2
 fi
 
-# Vector Search for retrieve_similar_cases. Opt in by setting
-# `vector_search_endpoint` in config/project-settings(.local).yaml, which
-# render_app_yaml turns into VS_ENDPOINT below; empty means the tool ranks past
-# events by keyword overlap instead, which is a real fallback and not an error.
+# AI Search for retrieve_similar_cases. Controlled by `vector_search_endpoint`
+# in config/project-settings(.local).yaml, which render_app_yaml turns into
+# VS_ENDPOINT below; empty means the tool ranks past events by keyword overlap
+# instead, which is a real fallback and not an error.
 #
-# Two reasons it is opt-in rather than on: an endpoint bills hourly whether or
-# not anything queries it, and the run that first creates one is SLOW — 15-40
-# minutes, against seconds for everything else in this script. Idempotent after
-# that: the endpoint and index are created once and later runs only re-sync the
-# case library, so the wait is a one-time cost per environment, not per deploy.
+# Ships ON, and does NOT block: creating an endpoint takes 15-40 minutes against
+# seconds for everything else here, so this starts it and moves on, and the index
+# is built by the next deploy — by which time the endpoint is online and that run
+# costs seconds. Until the index exists the tool keeps using keyword overlap.
+# VS_WAIT=1 blocks for the endpoint instead, for the deploy that has to come out
+# of it fully working. MINIMAL=1 skips the step: an endpoint bills hourly whether
+# or not anything queries it.
+# Idempotent either way: endpoint and index are created once, later runs re-sync
+# the case library, so the wait is one-time per environment, not per deploy.
 # Read the file this deploy actually ships ($APP_SOURCE_YAML), not app.yaml.
 # app.yaml is the committed prod template and is kept deliberately blank here,
 # so a hardcoded read of it reported "not enabled" for every environment —
@@ -1344,8 +1470,13 @@ except Exception:
 VS_CATALOG=$(_profile_field uc_catalog)
 VS_SCHEMA=$(_profile_field uc_schema)
 
-if [[ -n "$VS_ENDPOINT_NAME" && -n "$WAREHOUSE_ID" && -n "$VS_CATALOG" && "$VS_CATALOG" != "SET_ME" ]]; then
-  echo "=== Provisioning Vector Search ($VS_ENDPOINT_NAME) ==="
+if [[ "${MINIMAL:-0}" == "1" && -n "$VS_ENDPOINT_NAME" ]]; then
+  echo "Skipping AI Search (MINIMAL=1) — '$VS_ENDPOINT_NAME' is configured but not built."
+  echo "    retrieve_similar_cases uses keyword overlap, and logs a warning per call"
+  echo "    because the app still names the endpoint. Deploy without MINIMAL to build it."
+  note_capability "AI Search:            SKIPPED by MINIMAL=1 (keyword retrieval in use)"
+elif [[ -n "$VS_ENDPOINT_NAME" && -n "$WAREHOUSE_ID" && -n "$VS_CATALOG" && "$VS_CATALOG" != "SET_ME" ]]; then
+  echo "=== Provisioning AI Search ($VS_ENDPOINT_NAME) ==="
   # Say up front which kind of run this is. Without it the deploy looks hung:
   # `--wait` blocks with no output while the endpoint comes up, and someone
   # watching a script that has printed a line every few seconds until now will
@@ -1361,34 +1492,173 @@ except Exception:
     print('unknown')
 " 2>/dev/null || echo "unknown")
   if [[ "$VS_EXISTS" == "yes" ]]; then
-    echo "    (endpoint already exists — re-syncing the case library, a few seconds)"
-  else
+    echo "    (endpoint already exists — building or re-syncing the index, a few seconds)"
+  elif [[ "${VS_WAIT:-0}" == "1" ]]; then
     # Includes the unknown case on purpose: warning about a wait that does not
     # happen costs nothing, while staying quiet through a 40-minute silence
     # gets the deploy killed half way through creating an endpoint.
-    if [[ "$VS_EXISTS" == "no" ]]; then
-      echo "    NOTE: this endpoint does not exist yet, so this step will take 15-40"
-    else
-      echo "    NOTE: could not tell whether this endpoint exists. If it does not,"
-      echo "          creating it takes 15-40"
-    fi
-    echo "          minutes while Databricks provisions it. That is a one-time cost —"
-    echo "          later deploys re-use the endpoint and finish in seconds. Leave it"
-    echo "          running; --wait prints nothing until it is ready."
+    echo "    NOTE: VS_WAIT=1, so this step blocks until the endpoint is online —"
+    echo "          15-40 minutes if it has to be created. It prints nothing while"
+    echo "          it waits. Leave it running."
+  else
+    echo "    NOTE: creating the endpoint takes 15-40 minutes on Databricks' side, so"
+    echo "          this deploy starts it and moves on. The index is built by your"
+    echo "          NEXT deploy; until then retrieve_similar_cases uses keyword"
+    echo "          overlap. Pass VS_WAIT=1 to block here instead. Either way it is a"
+    echo "          one-time cost per environment, not per deploy."
   fi
+  # No --wait by default: see the block comment above. Exit 3 is the script's
+  # "endpoint created, still coming up" — not a failure, and reporting it as one
+  # is how a deploy teaches people that its warnings can be ignored.
+  VS_WAIT_FLAG=""
+  [[ "${VS_WAIT:-0}" == "1" ]] && VS_WAIT_FLAG="--wait"
+  VS_RC=0
   DATABRICKS_CONFIG_PROFILE="$PROFILE" \
     "${PROJECT_PY[@]}" scripts/provision_vector_search.py \
       --catalog "$VS_CATALOG" --schema "$VS_SCHEMA" \
-      --warehouse-id "$WAREHOUSE_ID" --endpoint "$VS_ENDPOINT_NAME" --wait \
-    || echo "  WARN: Vector Search provisioning failed — retrieve_similar_cases falls back to keyword search." >&2
+      --warehouse-id "$WAREHOUSE_ID" --endpoint "$VS_ENDPOINT_NAME" \
+      ${VS_WAIT_FLAG} \
+    || VS_RC=$?
+  if [[ "$VS_RC" == "0" ]]; then
+    note_capability "AI Search:            index provisioned on '$VS_ENDPOINT_NAME'"
+  elif [[ "$VS_RC" == "3" ]]; then
+    echo "  Endpoint '$VS_ENDPOINT_NAME' is still coming up — nothing is wrong."
+    echo "  Re-run this deploy once it is online to build the index over the cases."
+    note_capability "AI Search:            endpoint starting; re-run the deploy to build the index"
+  else
+    echo "  WARN: AI Search provisioning failed — retrieve_similar_cases falls back to keyword search." >&2
+    note_capability "AI Search:            FAILED (keyword retrieval in use)"
+  fi
 elif [[ -z "$VS_ENDPOINT_NAME" ]]; then
-  echo "Skipping Vector Search provisioning (not enabled — keyword retrieval will be used)."
+  echo "Skipping AI Search provisioning (not enabled — keyword retrieval will be used)."
   echo "    To enable: set vector_search_endpoint in config/project-settings.local.yaml"
-  echo "    (adds 15-40 min to the next deploy, then bills hourly while it is online)."
+  echo "    (starts a 15-40 min endpoint build, then bills hourly while it is online)."
+  note_capability "AI Search:            off (vector_search_endpoint not set)"
 else
+  note_capability "AI Search:            MISCONFIGURED — see the warning above"
   echo "WARN: VS_ENDPOINT='$VS_ENDPOINT_NAME' is set but catalog/warehouse are not" >&2
   echo "      (catalog='$VS_CATALOG' warehouse='$WAREHOUSE_ID') — index NOT provisioned," >&2
   echo "      yet the app will try the semantic path. Blank VS_ENDPOINT or fix settings." >&2
+fi
+
+# ── Knowledge Assistant over the plant documents ───────────────────────────
+# Controlled by `knowledge_assistant_name`. Empty is a supported state, not an
+# error: the four specialists still carry `query_plant_docs`, and it reports that
+# no document assistant is configured — deliberately, so a question about an SOP
+# is answered with "the documents were not read" rather than from the model's
+# general knowledge of packaging lines.
+#
+# Ships ON, and like AI Search it does NOT block: indexing the corpus takes from
+# minutes to a couple of hours, the assistant is usable the moment it is built,
+# and nothing else in the deploy waits on it — the endpoint name is picked up by a
+# later deploy. MINIMAL=1 skips it, because the assistant serves from an agent
+# endpoint that bills while it is online.
+#
+# Idempotent: the script looks the assistant up by display name and only creates
+# one when absent, then re-uploads the corpus and asks for a sync so edited
+# documents actually reach it.
+KA_NAME=$(_profile_field knowledge_assistant_name)
+KA_CATALOG=$(_profile_field uc_catalog)
+KA_SCHEMA=$(_profile_field uc_schema)
+KA_VOLUME=$(_profile_field knowledge_docs_volume)
+# What the RUNNING app was deployed with, read from the rendered template steps
+# 3-5 deployed it from — not from settings. Settings is the wrong side of the
+# comparison: provisioning writes the endpoint there, so anyone who ran
+# provision_knowledge_assistant.py by hand (or whose earlier redeploy failed
+# after the write-back) has settings already agreeing with the new endpoint while
+# the app itself has never seen it. The re-wire below would then be skipped on
+# every future deploy and the tool would stay inert with no warning.
+KA_ENDPOINT_IN_APP=$(awk '/^  - name: DOCS_KA_ENDPOINT/{getline; gsub(/[ '"'"'"]/,""); sub(/^value:/,""); print; exit}' "$ROOT_DIR/$APP_SOURCE_YAML")
+[[ -z "$KA_VOLUME" || "$KA_VOLUME" == "SET_ME" ]] && KA_VOLUME="plant_docs"
+
+if [[ "${MINIMAL:-0}" == "1" && -n "$KA_NAME" && "$KA_NAME" != "SET_ME" ]]; then
+  echo
+  echo "Skipping the Knowledge Assistant (MINIMAL=1) — '$KA_NAME' is configured but"
+  echo "    not built, so query_plant_docs reports no assistant and the specialists say"
+  echo "    the documents were not read. Deploy without MINIMAL to build it."
+  note_capability "Knowledge Assistant:  SKIPPED by MINIMAL=1 (documents not readable)"
+elif [[ -n "$KA_NAME" && "$KA_NAME" != "SET_ME" && -n "$KA_CATALOG" && "$KA_CATALOG" != "SET_ME" ]]; then
+  echo
+  echo "=== Provisioning the Knowledge Assistant ($KA_NAME) ==="
+  KA_ARGS=(--catalog "$KA_CATALOG" --schema "$KA_SCHEMA" --display-name "$KA_NAME"
+           --volume "$KA_VOLUME")
+  # The app queries the assistant as its own service principal, and a principal
+  # with no grant gets a 403 that surfaces to an operator as "no answer".
+  [[ -n "${APP_SP_ID:-}" ]] && KA_ARGS+=(--grant-principal "$APP_SP_ID")
+  KA_FAILED=0
+  KA_OUT=$(DATABRICKS_CONFIG_PROFILE="$PROFILE" \
+    "${PROJECT_PY[@]}" scripts/provision_knowledge_assistant.py "${KA_ARGS[@]}" 2>&1) || {
+    echo "$KA_OUT" >&2
+    echo "  WARN: Knowledge Assistant provisioning failed — query_plant_docs stays" >&2
+    echo "        unavailable and the specialists say the documents were not read." >&2
+    KA_OUT=""
+    KA_FAILED=1
+  }
+  [[ -n "$KA_OUT" ]] && echo "$KA_OUT"
+
+  KA_ENDPOINT_NEW=$(printf '%s\n' "$KA_OUT" | awk -F= '/^knowledge_assistant_endpoint=/{print $2; exit}')
+  KA_ID_NEW=$(printf '%s\n' "$KA_OUT" | awk -F= '/^knowledge_assistant_id=/{print $2; exit}')
+  KA_STATE=$(printf '%s\n' "$KA_OUT" | awk -F= '/^knowledge_assistant_state=/{print $2; exit}')
+  [[ -n "$KA_ID_NEW" ]] && write_genie_space_id "$KA_ID_NEW" knowledge_assistant_id
+  if [[ -n "$KA_ENDPOINT_NEW" ]]; then
+    write_genie_space_id "$KA_ENDPOINT_NEW" knowledge_assistant_endpoint
+    # Steps 3-5 deployed the app before this ran, so on the deploy that first
+    # provisions the assistant the running app has no DOCS_KA_ENDPOINT and the
+    # tool would report itself unconfigured until someone deployed again. Only
+    # re-wire when the app is not already serving this endpoint; a re-provision of
+    # the same assistant needs no redeploy.
+    KA_WIRED=1
+    if [[ "$KA_ENDPOINT_NEW" != "$KA_ENDPOINT_IN_APP" ]]; then
+      echo "=== Re-wiring DOCS_KA_ENDPOINT into the app + redeploying ==="
+      python3 scripts/render_app_yaml.py "$ENV" --settings "$ROOT_DIR/$PROJECT_SETTINGS_YAML" \
+        || echo "  WARN: re-render failed — the tool stays inert until the next deploy." >&2
+      do_app_yaml_swap
+      if ! run_bundle_deploy; then KA_WIRED=0; fi
+      if (( KA_WIRED == 1 )); then
+        databricks apps deploy "$APP_NAME" --profile "$PROFILE" \
+          ${APP_SRC_PATH:+--source-code-path "$APP_SRC_PATH"} \
+          || { KA_WIRED=0; echo "  WARN: app redeploy after wiring the assistant failed." >&2; }
+      fi
+    fi
+    # Reporting "serving" when the pass that tells the app about it failed is the
+    # one thing this summary must not do. That pass is last, so it is the one an
+    # expiring credential kills, and the result is invisible from the outside: an
+    # agent endpoint that is up and billing, an app that never queries it, and a
+    # green deploy above. Re-read the rendered template rather than trusting the
+    # write — this reports what the app was actually given.
+    if (( KA_WIRED == 1 )) && grep -q "$KA_ENDPOINT_NEW" "$ROOT_DIR/$APP_SOURCE_YAML" 2>/dev/null; then
+      # "Serving" was measured to be too generous: on a first deploy the endpoint
+      # answers within seconds while the corpus indexes for the best part of an
+      # hour, and one such run reported serving over an assistant whose ingest had
+      # failed outright. Say which of the two this is, since only the second one
+      # means a question about the documents gets a documented answer.
+      if [[ "$KA_STATE" == "indexing" ]]; then
+        note_capability "Knowledge Assistant:  built on $KA_ENDPOINT_NEW, still indexing the documents — questions come back ungrounded until it finishes"
+      else
+        note_capability "Knowledge Assistant:  answering on $KA_ENDPOINT_NEW"
+      fi
+    else
+      note_capability "Knowledge Assistant:  BUILT on $KA_ENDPOINT_NEW but the app was not given it — re-run the deploy (it bills meanwhile)"
+    fi
+  elif (( KA_FAILED == 1 )); then
+    # Distinct from "no endpoint yet": waiting fixes the second and not the first.
+    note_capability "Knowledge Assistant:  provisioning FAILED — see the warning above"
+  else
+    echo "    (no endpoint yet — the assistant is still being built. Re-run the"
+    echo "     deploy once it reports one; nothing else here depends on it.)"
+    note_capability "Knowledge Assistant:  building; re-run the deploy to wire the endpoint"
+  fi
+elif [[ -z "$KA_NAME" || "$KA_NAME" == "SET_ME" ]]; then
+  echo
+  echo "Skipping the Knowledge Assistant (not enabled — the specialists answer from"
+  echo "    telemetry only and say so when asked about documents)."
+  echo "    To enable: set knowledge_assistant_name in config/project-settings.local.yaml"
+  echo "    (uploads data/plant_docs/ to a volume; the agent endpoint bills while online)."
+  note_capability "Knowledge Assistant:  off (knowledge_assistant_name not set)"
+else
+  echo "WARN: knowledge_assistant_name='$KA_NAME' is set but uc_catalog is not" >&2
+  echo "      (catalog='$KA_CATALOG') — the assistant was NOT provisioned." >&2
+  note_capability "Knowledge Assistant:  MISCONFIGURED — see the warning above"
 fi
 
 # ── Restart the continuous streaming jobs onto the code just deployed ──────
@@ -1443,4 +1713,15 @@ if [[ -n "$TRACE_WARNING" ]]; then
   echo "       SET_ME in config/project-settings.local.yaml. Fix, then re-run this deploy." >&2
   echo "       A UC link is permanent, so a half-linked experiment is scrap; the script" >&2
   echo "       moves to the next name (-2, -3) rather than reusing it." >&2
+fi
+
+# What you actually got. Each of these was reported at the moment it happened,
+# hundreds of lines ago, which is not where the question gets asked.
+if ((${#CAPABILITY_OUTCOMES[@]} > 0)); then
+  echo
+  echo "=== Capabilities ==="
+  for outcome in "${CAPABILITY_OUTCOMES[@]}"; do
+    echo "    $outcome"
+  done
+  echo "    (full inventory, including what is off and why: $0 $ENV --capabilities)"
 fi

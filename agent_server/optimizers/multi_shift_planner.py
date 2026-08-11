@@ -45,10 +45,19 @@ def _speed_levels(min_bpm: float, max_bpm: float) -> list[float]:
 
 
 class MultiShiftPlanner:
-    """Coordinate production across multiple shifts using Benders decomposition.
+    """Coordinate production across shifts with one mixed-integer program.
 
-    Master: decides per-shift speed targets, overtime, CIP/maintenance slots.
-    Sub: evaluates feasibility and returns dual values (cuts) for each shift.
+    Every shift's speed target, overtime, CIP slot and maintenance slot are
+    decided together in a single SCIP model, which is what lets it trade one
+    shift against another — run shift 1 hot to buy shift 2 the downtime for a
+    CIP. Speed is discretised into levels so that speed x time linearises
+    exactly; see the comment in `plan`.
+
+    This was designed as a Benders decomposition, and the docstring described
+    one long after the code stopped being one. There is no master/sub split and
+    no cut generation: the decomposition never ran, because the bilinear
+    constraint made the model fail to build and every call fell through to
+    `_sequential_fallback`. What replaced it is the monolithic model above.
     """
 
     def plan(self, shifts: list[dict]) -> dict:
@@ -180,7 +189,7 @@ class MultiShiftPlanner:
             status = solver.Solve()
 
             if status not in (pywraplp.Solver.OPTIMAL, pywraplp.Solver.FEASIBLE):
-                return {"feasible": False, "method": "benders_master", "reason": "Infeasible across shifts"}
+                return {"feasible": False, "method": "milp", "reason": "Infeasible across shifts"}
 
             plan_result = []
             total_cases = 0
@@ -210,7 +219,10 @@ class MultiShiftPlanner:
 
             return {
                 "feasible": True,
-                "method": "benders_master",
+                # Was "benders_master", naming a decomposition this has never
+                # run. The model sees this field, so it is agent-facing text.
+                # "milp" matches what schedule_recovery calls its solver path.
+                "method": "milp",
                 "solver_status": "optimal" if status == pywraplp.Solver.OPTIMAL else "feasible",
                 "shifts": plan_result,
                 "total_projected_cases": total_cases,
@@ -256,14 +268,17 @@ _planner = MultiShiftPlanner()
 
 @tool
 def multi_shift_plan(shifts_data: list[dict]) -> dict:
-    """Optimize production plan across multiple shifts using sequential optimization.
+    """Optimize a production plan across several shifts at once.
 
     Input: list of shift dicts, each with keys:
         shift_id, planned_cases, remaining_minutes, current_speed_bpm,
         min_speed_bpm, max_speed_bpm, allow_overtime, max_overtime_min,
         needs_cip, needs_maintenance.
 
-    Calls schedule_recovery per shift to coordinate speed targets, overtime,
-    CIP placement, and maintenance slots. Returns per-shift recommendations
-    and total projected output."""
+    Solves one mixed-integer program over all the shifts together, choosing
+    every shift's speed target, overtime, CIP placement and maintenance slot in
+    the same model. Because the shifts are decided jointly it can trade one
+    against another — running one hot to open a maintenance window in the next —
+    which is what distinguishes it from calling schedule_recovery per shift.
+    Returns per-shift recommendations and total projected output."""
     return _planner.plan(shifts_data)

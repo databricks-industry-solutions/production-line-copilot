@@ -19,75 +19,20 @@
       : new URL('prodline_copilot_film_vo/', window.location.href).href;
 
   const MANIFEST = {
-    version: 8,
+    version: 11,
     persistKey: PERSIST_KEY,
     segments: [
-      {
-        id: '01',
-        start: 0.2,
-        end: 9.4,
-        text: 'This is Maya, who runs Packaging Line Four: nineteen machines moving toward one shift target, with plenty that can change along the way.',
-      },
-      {
-        id: '02',
-        start: 9.5,
-        end: 22.1,
-        text: "Her real challenge isn't more data; it's that alarms, production, quality, and maintenance sit in different systems — so answers used to arrive in the next-morning report, long after the recovery call.",
-      },
-      {
-        id: '03',
-        start: 22.3,
-        end: 35.6,
-        text: 'That is why her day starts in the control tower, where those systems come together on Databricks, in one governed live view — letting her follow the line as a whole instead of piecing the shift together screen by screen.',
-      },
-      {
-        id: '04',
-        start: 36.3,
-        end: 48.8,
-        text: 'At eleven forty-seven, Filler Three stops and downstream machines begin to starve; each OEE point is worth about three hundred thousand euros a year, so Maya has minutes to make the recovery call.',
-      },
-      {
-        id: '05',
-        start: 50.2,
-        end: 57.4,
-        text: 'Maya asks exactly that, in the same language she would use with her team: can we still hit the shift target?',
-      },
-      {
-        id: '06',
-        start: 57.8,
-        end: 67.4,
-        text: 'The copilot reads the live line state, carries that context forward, and hands the problem to the right specialist from a whole roster built for the line.',
-      },
-      {
-        id: '07',
-        start: 67.7,
-        end: 78.4,
-        text: 'Behind the scenes, it runs real solvers, testing the plan against a thousand scenarios of speed, overtime, and CIP timing — not just guessing.',
-      },
-      {
-        id: '08',
-        start: 78.6,
-        end: 86.2,
-        text: 'The recommendation returns with assumptions, cost, and trade-offs in view, so Maya can review the plan — and approve it.',
-      },
-      {
-        id: '08mcp',
-        start: 86.2,
-        end: 94.4,
-        text: 'On the roadmap, MCP connections carry approved work orders, holds, and schedule updates into the systems that own them.',
-      },
-      {
-        id: '09',
-        start: 94.4,
-        end: 101.7,
-        text: 'As the filler comes back online, the control tower closes the loop, showing the line recover in real time.',
-      },
-      {
-        id: '10',
-        start: 102.3,
-        end: 109.9,
-        text: 'That is ProdLine CoPilot: one connected picture, clearer options, and Maya still firmly in control.',
-      },
+      { id: '01', start: 0.2, end: 9.456 },
+      { id: '02', start: 9.5, end: 21.804 },
+      { id: '03', start: 22.3, end: 35.588 },
+      { id: '04', start: 36.3, end: 48.46 },
+      { id: '05', start: 50.2, end: 57.368 },
+      { id: '06', start: 57.8, end: 67.344 },
+      { id: '07', start: 67.7, end: 78.348 },
+      { id: '08', start: 78.6, end: 86.2 },
+      { id: '08mcp', start: 86.2, end: 94.4 },
+      { id: '09', start: 94.4, end: 101.712 },
+      { id: '10', start: 102.3, end: 109.78 }
     ],
   };
 
@@ -96,7 +41,9 @@
   let activeId = null;
   let unlocked = false;
   let lastTime = 0;
-  let lastWall = performance.now();
+  // Wall clock of the last tick that saw the film's time actually move — not
+  // the last tick of any kind. See the note on tick().
+  let lastAdvance = performance.now();
   let playing = true;
   let started = false;
 
@@ -190,14 +137,22 @@
     };
   }
 
+  // There is no pause event to listen for: the film publishes its clock to
+  // localStorage and this player infers the rest. "Paused" means the clock has
+  // not moved for a moment, which has to be measured from the last time it
+  // *did* move. Measured from the previous frame instead — tick() runs on rAF,
+  // so the gap was always ~16ms — the test never fired, and pausing looped the
+  // last quarter second of narration for as long as the film sat paused.
   function tick() {
     const t = readTime();
     const now = performance.now();
-    const dt = (now - lastWall) / 1000;
-    lastWall = now;
 
-    if (Math.abs(t - lastTime) > 0.015) playing = true;
-    else if (dt > 0.12) playing = false;
+    if (Math.abs(t - lastTime) > 0.015) {
+      playing = true;
+      lastAdvance = now;
+    } else if (now - lastAdvance > 120) {
+      playing = false;
+    }
     if (t + 0.05 < lastTime) {
       stopAudio();
       finished.clear();

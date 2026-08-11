@@ -15,6 +15,7 @@ and the System Map drew the connection anyway.
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -174,9 +175,36 @@ class TestTheDeployCanRepairAMissingSpace:
         # RUN_SETUP history this test exists to keep out.
         source = self._source()
         streaming = source.index("# ── 7a. Genie space provisioning")
-        governed = source.index("# ── 7b. Governed MVM Genie space")
+        governed = source.index("# ── 7b. Governed Genie spaces over the MVM model")
         code = "\n".join(
             line for line in source[streaming:governed].splitlines()
             if not line.lstrip().startswith("#")
         )
         assert "RUN_SETUP" not in code
+
+    def test_every_governed_space_it_creates_is_scoped_to_one_domain(self):
+        # genie_space_config_mvm.py builds a combined space over all twelve MVM
+        # tables when it is called without --domain, and a narrow one when it is
+        # called with. Deploy used to do both. The combined space was never
+        # wired into the app — no env var carried its id — so it cost a space
+        # and a CAN_RUN grant per deploy and answered nobody. Only the
+        # per-domain spaces reach the agent, via governed_domain_query.
+        # Backslash continuations are folded first so each invocation is one
+        # string. Matching the raw text instead lets a lazy pattern run from the
+        # first call to the second and read them as a single --domain'd call,
+        # which is precisely the regression this is here to catch.
+        source = re.sub(r"\\\n\s*", " ", self._source())
+        calls = [
+            line.strip()
+            for line in source.splitlines()
+            if "python3 scripts/genie_space_config_mvm.py" in line
+            and not line.lstrip().startswith("#")
+        ]
+        assert len(calls) >= 2, (
+            f"expected the create and refresh invocations, found {len(calls)}: {calls}"
+        )
+        undomained = [c for c in calls if "--domain" not in c]
+        assert not undomained, (
+            "deploy.sh calls genie_space_config_mvm.py without --domain, which "
+            f"builds the unused combined space again: {undomained}"
+        )

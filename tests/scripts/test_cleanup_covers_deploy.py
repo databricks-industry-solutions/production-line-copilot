@@ -130,3 +130,36 @@ class TestSharedResourcesNeedAnExplicitFlag:
 
     def test_the_flag_implies_purge_data(self):
         assert re.search(r"--purge-shared\)\s*PURGE_SHARED=1;\s*PURGE_DATA=1", CLEANUP)
+
+    def test_this_environments_search_index_goes_without_the_flag(self):
+        """The endpoint is shared; an index inside the dropped schema is not.
+
+        Gating both on --purge-shared left a dev teardown with a live index over a
+        table it had just dropped, so the next "fresh" deploy found an index
+        already there, created nothing, and proved nothing.
+        """
+        before_delete = CLEANUP[: CLEANUP.index("delete-index")]
+        opener = before_delete.rindex("if [[ ")
+        assert 'PURGE_SHARED" == "1" && -n "$VS_ENDPOINT"' not in before_delete[opener:], (
+            "index deletion is back behind the shared gate"
+        )
+        assert 'if [[ -n "$VS_ENDPOINT" ]]' in before_delete, (
+            "index deletion should run whenever this environment names an endpoint"
+        )
+
+    def test_a_dev_teardown_only_deletes_its_own_indexes(self):
+        assert '_vs_indexes "${UC_CATALOG}.${UC_SCHEMA}."' in CLEANUP, (
+            "an unscoped delete would take prod's index off the shared endpoint"
+        )
+        assert '_vs_indexes ""' in CLEANUP, "--purge-shared should still take them all"
+
+    def test_the_index_goes_before_the_schema_it_lives_in(self):
+        """CASCADE removes the index without telling the serving side.
+
+        Ordered the other way round, the API delete finds nothing to delete —
+        the schema drop already took the index out of the listing — and the
+        serving half is left behind with no way to see it.
+        """
+        assert CLEANUP.index("delete-index") < CLEANUP.index(
+            "DROP SCHEMA IF EXISTS {schema} CASCADE"
+        ), "the index must be deleted through the API before the schema drop"

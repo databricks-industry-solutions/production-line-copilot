@@ -289,3 +289,69 @@ class TestAnExistingIndexIsAskedToSync:
             "cat.sch.event_case_library", "emb", dry_run=False)
         assert idx.created == ["cat.sch.event_case_index"]
         assert idx.synced == [], "creation performs the first sync itself"
+
+
+class TestTheIndexHasToBeOnTheEndpointTheAppQueries:
+    """Index names are unique per metastore, not per endpoint.
+
+    Measured while moving dev between endpoints: an index left on the old
+    endpoint answered `get_index` perfectly well, so the deploy reported it as
+    provisioned on the configured endpoint, the app queried an endpoint holding
+    nothing, and `retrieve_similar_cases` reported `retrieval: vector_search` —
+    the healthy path — over an empty result. An index cannot be re-pointed.
+    """
+
+    class _Indexes:
+        def __init__(self, served_from: str | None):
+            self.served_from = served_from
+            self.synced: list[str] = []
+            self.created: list[tuple[str, str]] = []
+            self.deleted: list[str] = []
+
+        def get_index(self, fqn):
+            if self.served_from is None:
+                raise RuntimeError("not found")
+            return type("I", (), {
+                "endpoint_name": self.served_from,
+                "status": type("S", (), {"ready": True, "indexed_row_count": 24})(),
+            })()
+
+        def delete_index(self, index_name):
+            self.deleted.append(index_name)
+            self.served_from = None
+
+        def create_index(self, **kw):
+            self.created.append((kw["name"], kw["endpoint_name"]))
+
+        def sync_index(self, index_name):
+            self.synced.append(index_name)
+
+    def _client(self, indexes):
+        return type("W", (), {"vector_search_indexes": indexes})()
+
+    def test_an_index_on_another_endpoint_is_rebuilt_where_it_is_needed(self, provisioner):
+        idx = self._Indexes(served_from="the-old-endpoint")
+        provisioner.ensure_index(
+            self._client(idx), "the-configured-endpoint", "cat.sch.event_case_index",
+            "cat.sch.event_case_library", "emb", dry_run=False)
+        assert idx.deleted == ["cat.sch.event_case_index"]
+        assert idx.created == [("cat.sch.event_case_index", "the-configured-endpoint")]
+        assert idx.synced == [], "syncing it would have left it on the wrong endpoint"
+
+    def test_an_index_already_in_the_right_place_is_only_synced(self, provisioner):
+        idx = self._Indexes(served_from="the-configured-endpoint")
+        provisioner.ensure_index(
+            self._client(idx), "the-configured-endpoint", "cat.sch.event_case_index",
+            "cat.sch.event_case_library", "emb", dry_run=False)
+        assert idx.deleted == [] and idx.created == []
+        assert idx.synced == ["cat.sch.event_case_index"]
+
+    def test_a_dry_run_deletes_nothing(self, provisioner, capsys):
+        idx = self._Indexes(served_from="the-old-endpoint")
+        provisioner.ensure_index(
+            self._client(idx), "the-configured-endpoint", "cat.sch.event_case_index",
+            "cat.sch.event_case_library", "emb", dry_run=True)
+        assert idx.deleted == [] and idx.created == []
+        assert "the-old-endpoint" in capsys.readouterr().out, (
+            "a dry run is where you want to be told the index is in the wrong place"
+        )

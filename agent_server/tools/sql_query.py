@@ -17,6 +17,7 @@ deliberately:
 
 import logging
 import os
+import re
 import threading
 import time
 
@@ -221,6 +222,13 @@ def _close_quietly(connection, reason: str) -> None:
 
 _DANGEROUS_KEYWORDS = {"INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE", "TRUNCATE", "MERGE", "GRANT", "REVOKE"}
 
+# Quoted spans are data, not statements. Removing them before the keyword scan
+# is what lets the scan tokenise on word boundaries instead of whitespace: a
+# machine note reading 'PENDING UPDATE' stops being a forbidden keyword, and
+# `SELECT 1;DROP TABLE x` stops hiding one inside the token "1;DROP".
+_STRING_LITERAL = re.compile(r"'[^']*'|\"[^\"]*\"")
+_WORD = re.compile(r"[A-Z_]+")
+
 
 @tool
 def sql_query(query: str) -> list[dict]:
@@ -232,14 +240,15 @@ def sql_query(query: str) -> list[dict]:
     if not upper.startswith("SELECT") and not upper.startswith("WITH"):
         return [{"error": "Only SELECT queries are allowed"}]
 
-    # Token-set check — catches DDL/DML keywords appearing as standalone words
-    # anywhere in the query (e.g. "SELECT 1; DROP TABLE x"). Not a SQL parser:
-    # an attacker who quotes keywords inside string literals could bypass it,
+    # Token-set check — catches DDL/DML keywords appearing anywhere outside a
+    # string literal (e.g. "SELECT 1; DROP TABLE x"). Splitting on whitespace
+    # missed the version without the space, because "1;DROP" is one token and
+    # matches no keyword; word boundaries catch both. Still not a SQL parser,
     # but combined with the SELECT/WITH prefix gate and read-only warehouse
     # permissions for the App SP this is the right belt-and-braces level for
     # an LLM-emitted query.
-    first_word_set = set(upper.split())
-    dangerous = first_word_set & _DANGEROUS_KEYWORDS
+    tokens = set(_WORD.findall(_STRING_LITERAL.sub(" ", upper)))
+    dangerous = tokens & _DANGEROUS_KEYWORDS
     if dangerous:
         return [{"error": f"Forbidden SQL keywords detected: {dangerous}"}]
 

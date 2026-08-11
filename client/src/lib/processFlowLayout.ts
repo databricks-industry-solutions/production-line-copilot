@@ -28,7 +28,6 @@ export const STATION_H = 74;
  *  that two machines are joined and which way. */
 const CONVEYOR_GAP = 104;
 const PLAIN_GAP = 44;
-const ROW_GAP = 104;
 
 /** Half the gap between a belt's two rails. Shared so a feed stub lands on it. */
 export const BELT_HALF_HEIGHT = 7;
@@ -37,9 +36,24 @@ export const BELT_HALF_HEIGHT = 7;
  *  the first and last stations rather than inside the grid. */
 const MARGIN_LEFT = 92;
 const MARGIN_RIGHT = 96;
-/** Room above the first row for its supply chips, which hang over the station. */
-const MARGIN_TOP = 104;
-const MARGIN_BOTTOM = 34;
+
+/**
+ * The vertical rhythm is set by the two things that live outside a station: a
+ * supply chip hangs `CHIP_CLEARANCE` above the station it feeds (see
+ * `supplyAnchor`, 20 of chip and 26 of connector) and two lines of instrument
+ * text sit below it. Every band is those two plus a little, rather than a round
+ * number — the schematic is embedded in a tab beside other cards, so empty
+ * canvas is not restful, it is the rest of the page being pushed down.
+ */
+const CHIP_CLEARANCE = 46;
+const LABEL_CLEARANCE = 30;
+const BREATHING = 12;
+
+const MARGIN_TOP = CHIP_CLEARANCE + BREATHING;
+const MARGIN_BOTTOM = LABEL_CLEARANCE;
+/** Between rows: the row above's text, the row below's chips, and the
+ *  row-change conveyor running down through both. */
+const ROW_GAP = LABEL_CLEARANCE + CHIP_CLEARANCE + BREATHING;
 
 const ROW_PITCH = STATION_H + ROW_GAP;
 

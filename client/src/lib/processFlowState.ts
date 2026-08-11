@@ -16,7 +16,7 @@ import type { InventoryItem } from './useSSELiveData';
  */
 export const FLOW_STATE_COLORS = {
   ...STATUS_COLORS,
-  blocked: '#f97316',
+  blocked: '#ea580c',
 } as const;
 
 export type FlowMachineStatus = keyof typeof FLOW_STATE_COLORS;
@@ -85,10 +85,7 @@ export const FLOW_TONE_COLORS: Record<FlowTone, string> = {
  * than the back for no physical reason. Percent of design rate is the one
  * quantity that means the same thing at every station.
  */
-export function flowBetween(
-  upstream: LiveStation | undefined,
-  downstream: LiveStation | undefined,
-): EdgeFlow {
+export function flowBetween(upstream: LiveStation | undefined, downstream: LiveStation | undefined): EdgeFlow {
   if (!upstream || !downstream) {
     return { moving: false, speedPct: 0, ratePerMin: null, tone: 'unknown', reason: 'No live state for this section.' };
   }
@@ -96,10 +93,7 @@ export function flowBetween(
   const up = asFlowStatus(upstream.status);
   const down = asFlowStatus(downstream.status);
   const rate = Math.min(upstream.throughput_per_min ?? 0, downstream.throughput_per_min ?? 0);
-  const pct = Math.max(
-    0,
-    Math.min(100, Math.min(upstream.speed_pct ?? 100, downstream.speed_pct ?? 100)),
-  );
+  const pct = Math.max(0, Math.min(100, Math.min(upstream.speed_pct ?? 100, downstream.speed_pct ?? 100)));
 
   if (up === 'stopped' || down === 'stopped') {
     return {
@@ -111,13 +105,25 @@ export function flowBetween(
     };
   }
   if (up === 'blocked') {
-    return { moving: false, speedPct: 0, ratePerMin: rate, tone: 'blocked', reason: 'Backed up — downstream cannot take it.' };
+    return {
+      moving: false,
+      speedPct: 0,
+      ratePerMin: rate,
+      tone: 'blocked',
+      reason: 'Backed up — downstream cannot take it.',
+    };
   }
   if (up === 'starved' || down === 'starved') {
     return { moving: false, speedPct: 0, ratePerMin: rate, tone: 'starved', reason: 'Nothing arriving from upstream.' };
   }
   if (rate <= 0) {
-    return { moving: false, speedPct: 0, ratePerMin: rate, tone: 'unknown', reason: 'No measured output on this section.' };
+    return {
+      moving: false,
+      speedPct: 0,
+      ratePerMin: rate,
+      tone: 'unknown',
+      reason: 'No measured output on this section.',
+    };
   }
 
   const slowed = up === 'degraded' || down === 'degraded' || pct < 85;
@@ -155,7 +161,7 @@ const TONE_SEVERITY: Record<FlowTone, number> = {
 export function flowThrough(
   upstream: LiveStation | undefined,
   via: LiveStation | undefined,
-  downstream: LiveStation | undefined,
+  downstream: LiveStation | undefined
 ): EdgeFlow {
   if (!via) return flowBetween(upstream, downstream);
 
@@ -188,10 +194,16 @@ export function dashDurationSeconds(speedPct: number): number {
 
 export type SupplyUrgency = 'ok' | 'low' | 'critical';
 
+/**
+ * Material feeds, in violet so they read as a different kind of thing from the
+ * machine states they hang over. One step darker than the tints the schematic
+ * used while its canvas was near-black: the same hues on a near-white canvas
+ * were washed out, and a chip saying a material is nearly out has to be read.
+ */
 export const SUPPLY_COLORS: Record<SupplyUrgency, string> = {
-  ok: '#a78bfa',
-  low: '#f59e0b',
-  critical: '#ef4444',
+  ok: '#7c3aed',
+  low: '#d97706',
+  critical: '#dc2626',
 };
 
 export interface SupplyFeed {
@@ -222,7 +234,7 @@ function urgencyOf(item: InventoryItem): SupplyUrgency {
  */
 export function supplyFeedsByMachine(
   inventory: InventoryItem[],
-  stations: Map<string, LiveStation>,
+  stations: Map<string, LiveStation>
 ): Map<string, SupplyFeed[]> {
   const byMachine = new Map<string, SupplyFeed[]>();
 

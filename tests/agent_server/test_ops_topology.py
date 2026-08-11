@@ -110,6 +110,20 @@ def test_streaming_space_is_reported_separately(client, monkeypatch):
     assert client.get("/ops/topology").json()["streaming_space"] is True
 
 
+def test_the_plant_documents_assistant_is_reported(client, monkeypatch):
+    """The chat panel offers document questions only when they can be answered.
+
+    Without this the suggestions would read as a broken feature on every
+    deployment that left the assistant off, which is the default.
+    """
+    from agent_server.tools import plant_docs_query
+
+    monkeypatch.setattr(plant_docs_query, "_ENDPOINT", "")
+    assert client.get("/ops/topology").json()["plant_docs"] is False
+    monkeypatch.setattr(plant_docs_query, "_ENDPOINT", "ka-plant-docs-endpoint")
+    assert client.get("/ops/topology").json()["plant_docs"] is True
+
+
 def test_a_deleted_streaming_space_is_not_reported_as_present(client, monkeypatch):
     """Set is not the same as live.
 

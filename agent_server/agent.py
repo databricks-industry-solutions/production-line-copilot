@@ -235,15 +235,19 @@ SPECIALIST_RECURSION_LIMIT = int(os.environ.get("SPECIALIST_RECURSION_LIMIT", "1
 # A specialist run holds a worker until it finishes, which is NOT the same as
 # "up to SPECIALIST_TIMEOUT_SECONDS". `future.result(timeout=…)` stops the
 # caller waiting; it cannot interrupt the callable, because nothing in Python
-# can interrupt a thread mid-call. The streaming path narrows this by checking
-# a cancellation flag between ReAct super-steps, so an abandoned run stops
-# after the model or tool call already in flight. The synchronous path
-# (`_run_specialist`, one blocking `agent.invoke`) has no such seam and can
-# hold its worker well past the timeout the user already saw.
+# can interrupt a thread mid-call. Both paths therefore narrow it cooperatively:
+# they drive the graph with `stream()` and check a cancellation flag between
+# ReAct super-steps, so an abandoned run stops after the model or tool call
+# already in flight rather than running to completion for nobody.
 #
-# So the recursion limit, not the timeout, is what actually bounds resource
-# use. Sizing follows from that: at two workers a third simultaneous question
-# waited behind two runs that can each last 90s and the gateway returned 502
+# The synchronous path used to be the exception — one blocking `agent.invoke`
+# with no seam to check — so a timed-out question kept its worker for as long
+# as the model and tools took. Six of those starved the pool. It now streams in
+# `values` mode, whose last emission is what `invoke` returned anyway.
+#
+# The overrun is bounded but not zero, so the recursion limit still matters as
+# much as the timeout. Sizing follows from that: at two workers a third
+# simultaneous question waited behind two long runs and the gateway returned 502
 # before the app ever answered — which is what a room full of people asking at
 # once looks like. These threads are almost entirely blocked on the serving
 # endpoint and the warehouse, so the cost of more of them is concurrent load on
@@ -993,21 +997,41 @@ def _run_specialist(specialist_name: str, query: str, context: dict) -> str:
         HumanMessage(content=f"Context:\n{context_str}\n\nUser query: {query}"),
     ]
 
+    # Same cooperative cancellation as the streaming path. `future.result(timeout)`
+    # only stops the CALLER waiting; the worker keeps running the ReAct loop and
+    # holds one of SPECIALIST_WORKERS slots until the model and its tools finish
+    # on their own. Six of those and the pool is starved for everyone. Python
+    # cannot kill a thread, so the loop below checks this between super-steps,
+    # which bounds the overrun to the one model or tool call already in flight.
+    cancelled = threading.Event()
+
     def _invoke() -> str:
         # Open a named span in the WORKER thread (where mlflow.langchain.autolog
         # creates the ReAct spans) so every tool/LLM span nests under a single
         # "specialist.<name>" parent instead of appearing as loose siblings.
         with mlflow.start_span(name=f"specialist.{specialist_name}", span_type="AGENT") as span:
             span.set_inputs({"query": query, "specialist": specialist_name})
-            result = agent.invoke(
+            # `stream(stream_mode="values")` yields the whole graph state after
+            # each super-step, so the last one is exactly what `invoke` would
+            # have returned — but with a gap between steps to notice a timeout.
+            result: Mapping | None = None
+            for state in agent.stream(
                 {"messages": input_messages},
                 {"recursion_limit": SPECIALIST_RECURSION_LIMIT},
-            )
+                stream_mode="values",
+            ):
+                if cancelled.is_set():
+                    logger.warning(
+                        "Specialist %s abandoned after timeout; releasing the worker",
+                        specialist_name,
+                    )
+                    break
+                result = state
             # Extracted here rather than in the caller so the answer is known
             # while the span is still open. Returning the raw message list and
             # picking the answer out afterwards is what left these spans with
             # no outputs at all.
-            answer = _final_answer_text(result)
+            answer = _final_answer_text(result) if result is not None else NO_ANSWER
             _record_answer(span, answer)
             return answer
 
@@ -1015,6 +1039,9 @@ def _run_specialist(specialist_name: str, query: str, context: dict) -> str:
         future = _executor.submit(_invoke)
         return future.result(timeout=SPECIALIST_TIMEOUT_SECONDS)
     except FuturesTimeout:
+        # Tell the worker to stop at its next super-step. Without this it runs
+        # to completion against a result nobody is waiting for.
+        cancelled.set()
         logger.error("Specialist %s timed out after %ds", specialist_name, SPECIALIST_TIMEOUT_SECONDS)
         return (
             f"The {specialist_name.replace('_', ' ')} analysis timed out. "
@@ -1078,23 +1105,73 @@ def _synthesize_response(specialist_name: str, specialist_response: str, context
     _tag_confidence(answer)
     return answer
 
+# The headings ChatPanel folds into expandable cards (ALL_KNOWN_SECTIONS in
+# client/src/components/ChatPanel.tsx). Synthesis exists to produce these, so
+# they are also how we tell whether it has anything left to do.
+_UI_SECTIONS = (
+    "Root Cause",
+    "Impact",
+    "Priority Actions",
+    "Estimated Recovery",
+    "Confidence",
+    "Situation",
+    "Key Risks",
+    "Outlook",
+    "Current State",
+    "Recommendation",
+    "Expected Outcome",
+)
+
+# Above this, a synthesis pass costs real tokens and tends to truncate rather
+# than restructure, so an unstructured answer this long is better shown whole.
+_SYNTHESIS_CEILING = 6000
+
+
+def _already_structured(text: str) -> bool:
+    """Whether the UI can already fold this into cards.
+
+    Two headings rather than one: a specialist that happens to write a single
+    "## Impact" has not produced the template, and treating it as though it had
+    is what leaves an answer rendering as a wall of text.
+    """
+    return sum(f"## {section}" in text for section in _UI_SECTIONS) >= 2
+
+
 def _should_skip_synthesis(specialist_name: str, specialist_response: str) -> bool:
     """Return True when the synthesis LLM call would waste tokens.
 
     We skip when:
       * the routing fell through to "general" — that path is already a
         short, structured chat call, no second pass needed
-      * the specialist already produced a long answer (>800 chars) — likely
-        already in the right shape, second pass tends to over-truncate
-      * the response is a timeout or explicit error — synthesis would just
-        re-emit the same apology
+      * the answer already carries the headings the UI parses — a second pass
+        would rewrite text that is already in the right shape
+      * the answer is unstructured but very long — see `_SYNTHESIS_CEILING`
+      * the response is this module's own timeout or error sentinel —
+        synthesis would just re-emit the same apology
+
+    Length used to stand in for the structure test, at 800 characters. It is a
+    poor proxy in the direction that matters: a long ReAct answer with no
+    headings is exactly the one the reader wants folded into cards, and it was
+    the one guaranteed to skip. The failure test used to be a substring search
+    for "timed out" anywhere in the text, which also caught real answers that
+    merely mentioned a timeout — a downtime analysis of a PLC that timed out
+    would skip its own formatting.
     """
     if specialist_name == "general":
         return True
-    if len(specialist_response) > 800:
+    if _already_structured(specialist_response):
         return True
-    low = specialist_response.lower()
-    return "timed out" in low or "encountered an error" in low
+    if len(specialist_response) > _SYNTHESIS_CEILING:
+        return True
+    # Matched against the sentences the timeout and error handlers above build,
+    # anchored at the start rather than searched for anywhere. Both the sync
+    # and streaming timeouts are covered: they continue differently ("timed
+    # out." and "timed out before it reached an answer"), so the marker stops
+    # at the words they share.
+    prefix = f"The {specialist_name.replace('_', ' ')} "
+    return specialist_response.startswith(
+        (f"{prefix}analysis timed out", f"{prefix}encountered an error:")
+    )
 
 
 def _extract_actions(specialist_name: str, context: dict) -> list[dict]:

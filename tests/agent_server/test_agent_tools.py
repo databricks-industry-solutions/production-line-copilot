@@ -298,6 +298,23 @@ class TestSQLQueryGuards:
         assert "error" in r[0]
         assert "Forbidden SQL keywords" in r[0]["error"]
 
+    def test_a_keyword_glued_to_punctuation_does_not_slip_past(self):
+        # Splitting on whitespace made "1;DROP" a single token that matched no
+        # keyword, so only the spaced version was caught.
+        r = sql_query.invoke({"query": "SELECT 1;DROP TABLE t"})
+        assert "error" in r[0]
+        assert "DROP" in r[0]["error"]
+
+    def test_a_keyword_inside_a_string_literal_is_data_not_a_statement(self, monkeypatch):
+        # A machine note can legitimately contain one of these words. Rejecting
+        # the query would be a false positive; the literal cannot execute.
+        cur = _FakeCursor(description=[("reason",)], rows=[("PENDING UPDATE",)])
+        monkeypatch.setattr(sqm, "_get_connection", lambda: _FakeConn(cur))
+        r = sql_query.invoke(
+            {"query": "SELECT reason FROM event_log WHERE reason = 'PENDING UPDATE'"}
+        )
+        assert r == [{"reason": "PENDING UPDATE"}]
+
 
 class TestSQLQueryExecution:
     def test_auto_appends_limit_and_parses_rows(self, monkeypatch):

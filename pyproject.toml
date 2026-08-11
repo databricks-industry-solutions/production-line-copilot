@@ -1,6 +1,6 @@
 [project]
 name = "productionline-copilot-agent-server"
-version = "0.3.9"
+version = "0.4.0"
 description = "LangGraph agent server for ProdLine CoPilot — multi-specialist GenAI system for production line operations"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.11"
@@ -41,6 +41,21 @@ dqx = [
 
 [project.scripts]
 start-server = "agent_server.start_server:main"
+
+# Security floors on packages we never import directly, so a resolver that is
+# free to pick an older-but-compatible version does not quietly reintroduce a
+# fixed advisory. The npm side of this is `overrides` in package.json; this is
+# the same idea, and it is a constraint rather than a dependency because the
+# project does not depend on these — it only cares which version arrives.
+#
+# cryptography>=49 closes an exponential certificate path-building DoS
+# (GHSA-jwv3-5hgf-82ww) and a wildcard-DNS escape from permittedSubtrees
+# (GHSA-m2h6-j472-rp4c). It reaches us through databricks-sdk and mlflow, and it
+# pulls mlflow to >=3.15.1 with it, because that is the release that relaxed
+# mlflow's `cryptography<49` pin. Drop this line once mlflow's own floor is
+# past 49. See SECURITY.md for what remains and why.
+[tool.uv]
+constraint-dependencies = ["cryptography>=49"]
 
 [tool.ruff]
 line-length = 120

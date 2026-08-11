@@ -4,11 +4,8 @@ Optimizers should call ``get_constraints()`` to retrieve constraint values
 instead of relying on hardcoded defaults or LLM parameter passing.
 """
 import logging
-import os
 import threading
 import time
-
-from agent_server.uc import DEFAULT_UC_SCHEMA
 
 logger = logging.getLogger(__name__)
 
@@ -17,8 +14,10 @@ _cache: dict[str, str] = {}
 _cache_ts: float = 0.0
 _CACHE_TTL = 300.0  # 5 min
 
-_CATALOG = os.environ.get("UC_CATALOG", "main")
-_SCHEMA = os.environ.get("UC_SCHEMA", DEFAULT_UC_SCHEMA)
+# No catalog or schema here on purpose. The query below is unqualified because
+# `sql_query` sets both on the connection, so naming them again in this module
+# only creates a second place to keep them right. There were two such constants
+# here, read from the environment and used by nothing.
 
 
 def _refresh_cache() -> dict[str, str]:

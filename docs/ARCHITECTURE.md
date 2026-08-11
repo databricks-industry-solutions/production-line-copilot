@@ -44,7 +44,7 @@ Aligned with the Databricks reference architecture for Industrial AI, GenAI agen
 ├─────────────────────────────────────────────────────────────┤
 │  Databricks Platform                                        │
 │  Unity Catalog · SQL Warehouse · Model Serving · MLflow     │
-│  Lakebase · Vector Search · Mosaic AI                       │
+│  Lakebase · AI Search · Mosaic AI                       │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -85,13 +85,13 @@ Each role runs on the model that suits its work rather than on one shared endpoi
 
 | Specialist              | Model                        | Vendor      | Tools                                                                                                                  |
 | ----------------------- | ---------------------------- | ----------- | ---------------------------------------------------------------------------------------------------------------------- |
-| `downtime_analyst`      | Claude Sonnet 5              | Anthropic   | sql_query, load_plan_and_constraints, calculator, retrieve_similar_cases, detect_anomalies                             |
-| `quality_specialist`    | GLM-5.2                      | Zhipu AI    | sql_query, load_plan_and_constraints, calculator, retrieve_similar_cases, detect_anomalies, quality_risk_assessment    |
-| `supply_chain_advisor`  | Llama 4 Maverick             | Meta        | sql_query, load_plan_and_constraints, calculator, retrieve_similar_cases                                               |
-| `oee_coach`             | GPT-5.4                      | OpenAI      | sql_query, genie_query, calculator, load_plan_and_constraints, oee_loss_analysis, production_forecast                  |
-| `schedule_optimizer`    | GPT-OSS 120B                 | open weights| sql_query, load_plan_and_constraints, calculator, schedule_recovery, production_forecast, stochastic_schedule_recovery |
-| `maintenance_predictor` | Qwen 3.5 122B                | Alibaba     | sql_query, load_plan_and_constraints, calculator, retrieve_similar_cases, detect_anomalies, estimate_rul               |
-| `strategic_advisor`     | **Claude Opus 5**            | Anthropic   | sql_query, genie_query, calculator, load_plan_and_constraints, retrieve_similar_cases, multi_shift_plan                |
+| `downtime_analyst`      | Claude Sonnet 5              | Anthropic   | sql_query, governed_asset_query, load_plan_and_constraints, calculator, retrieve_similar_cases, detect_anomalies, query_plant_docs |
+| `quality_specialist`    | GLM-5.2                      | Zhipu AI    | sql_query, governed_quality_query, load_plan_and_constraints, calculator, retrieve_similar_cases, detect_anomalies, quality_risk_assessment, query_plant_docs |
+| `supply_chain_advisor`  | Llama 4 Maverick             | Meta        | sql_query, governed_inventory_query, load_plan_and_constraints, calculator, retrieve_similar_cases                     |
+| `oee_coach`             | GPT-5.4                      | OpenAI      | sql_query, genie_query, governed_production_query, calculator, load_plan_and_constraints, oee_loss_analysis, production_forecast |
+| `schedule_optimizer`    | GPT-OSS 120B                 | open weights| sql_query, governed_production_query, load_plan_and_constraints, calculator, schedule_recovery, production_forecast, stochastic_schedule_recovery, query_plant_docs |
+| `maintenance_predictor` | Qwen 3.5 122B                | Alibaba     | sql_query, governed_asset_query, load_plan_and_constraints, calculator, retrieve_similar_cases, detect_anomalies, estimate_rul, query_plant_docs |
+| `strategic_advisor`     | **Claude Opus 5**            | Anthropic   | sql_query, genie_query, governed_production_query, calculator, load_plan_and_constraints, retrieve_similar_cases, multi_shift_plan |
 | `shift_briefing`        | Claude Haiku 4.5             | Anthropic   | sql_query, genie_query, calculator, load_plan_and_constraints, retrieve_similar_cases                                  |
 | intent router           | Gemma 3 12B                  | Google      | — (single-shot classification, no tools)                                                                               |
 | general / synthesis     | GPT-5 mini                   | OpenAI      | — (no tools)                                                                                                           |
@@ -111,7 +111,7 @@ The governed manufacturing model is organised into four schemas, and each one is
 
 The split follows the model's own schemas rather than the agent list, which matters for two reasons. Genie accuracy falls off as table count and instruction length grow, so a two-table Quality space with its own examples answers more reliably than a twelve-table space that also has to explain inventory reorder rules. And because the boundary is a Unity Catalog schema, per-domain grants are a real permission story — the Quality Specialist can be given quality without inventory.
 
-`scripts/genie_space_config_mvm.py` is the single source of truth for all five spaces (the four domains plus the combined analyst/auditor space). `--domain <name>` filters the tables to that schema, keeps only the instruction facts and join rules whose every side is in scope, and drops any example SQL that reaches outside it. Cross-checked by tests: an example that joins a table the space cannot see would teach Genie broken SQL, and the tool's advertised entity list is asserted against the tables actually registered.
+`scripts/genie_space_config_mvm.py` is the single source of truth for all four governed spaces. `--domain <name>` filters the tables to that schema, keeps only the instruction facts and join rules whose every side is in scope, and drops any example SQL that reaches outside it. Cross-checked by tests: an example that joins a table the space cannot see would teach Genie broken SQL, and the tool's advertised entity list is asserted against the tables actually registered.
 
 These tools **augment** `sql_query`; they do not replace it. Genie is poll-based and nondeterministic, so it earns its place on open-ended and governed-phrasing questions while the fixed analytical paths a specialist runs every shift stay on direct SQL. Shift Briefing has no governed domain at all — its subject is the shift that just happened, so it reads the **line ops** space.
 
@@ -145,7 +145,7 @@ Because a Genie space plans, this app runs two planners in series: a specialist'
 | --- | --- | --- |
 | Unity Catalog function (Genie trusted asset) | Deterministic business definitions expressible in SQL that must be identical everywhere — OEE formula, stock cover days, PM adherence | One definition serves both Genie and `sql_query`; two copies drift |
 | App optimizer (`agent_server/optimizers/`) | Solver and simulation work that is not SQL — MILP recovery, Monte Carlo forecast, Bayesian CPT quality risk | No SQL expression exists for it |
-| App orchestrator + specialists | Cross-domain routing, live streaming data, human-in-the-loop approval | No equivalent inside a Genie space |
+| App orchestrator + specialists | Cross-domain routing, live streaming data, operator-facing action proposals (copy-to-handoff; approval and write-back are unimplemented) | No equivalent inside a Genie space |
 
 Today the four domain spaces carry instructions, example SQL and tables, and **no trusted assets** — so the overlap is theoretical rather than live. Before adopting them, note one integration cost: the chat's evidence trail extracts Genie's generated SQL, and a function-answered response deliberately withholds it, surfacing the function's comment instead. `agent_server/tool_evidence.py` would then report a row count with no query, weakening exactly the surface it exists to provide.
 
@@ -198,7 +198,8 @@ land.
 
 A silent run gets a keep-alive. A question that calls no tools produces no
 frames at all between `status` and `answer` — one model call, potentially the
-full 90-second specialist timeout — and the app sits behind a proxy entitled to
+full specialist timeout (`SPECIALIST_TIMEOUT_SECONDS`, 150 s by default) — and
+the app sits behind a proxy entitled to
 drop an idle connection, which surfaces to the user as a spinner that never
 resolves. The drain loop already woke once a second, so it now emits an SSE
 comment on each idle tick. Comments are skipped by the client's reader and are
@@ -255,16 +256,18 @@ Three things about it are worth knowing before you trust what you see in the reg
 
 The catalogue is the guard against prompts going unversioned, in two directions. A prompt constant absent from it would never be registered, and a system prompt built from string literals anywhere outside `agent_server/prompts/` is a prompt no registry can see; `tests/agent_server/test_prompt_catalog.py` fails on either.
 
-### Similar-case retrieval runs on Vector Search, optionally
+### Similar-case retrieval runs on AI Search, which the deploy starts and does not wait for
 
-`retrieve_similar_cases` answers "have we seen this before" by embedding the description an operator gave and searching past resolved events. It is wired into six of the eight specialists, and it is the one tool whose infrastructure is opt-in:
+`retrieve_similar_cases` answers "have we seen this before" by embedding the description an operator gave and searching past resolved events. It is wired into six of the eight specialists, and it is the one tool whose infrastructure takes longer to build than the rest of the deploy:
 
 ```bash
 python3 scripts/provision_vector_search.py --catalog <cat> --schema <schema> \
     --warehouse-id <id> --wait [--dry-run]
 ```
 
-You do not normally run it by hand. Set `vector_search_endpoint` in `config/project-settings(.local).yaml` and `scripts/deploy.sh` provisions the endpoint and index, then re-syncs the case library on every later deploy. It is off by default for two reasons, and the second one surprises people: an endpoint bills by the hour whether or not anything queries it, and **the deploy that first creates one takes 15–40 minutes** — it is a one-time cost per environment, but it is long enough that the deploy looks hung, so the script now says which kind of run it is before it starts waiting. Clear the setting and the tool falls back to keyword matching over the same corpus, which is a real answer rather than an error.
+You do not normally run it by hand. `vector_search_endpoint` ships set, and `scripts/deploy.sh` provisions the endpoint and index, then re-syncs the case library on every later deploy. What is worth knowing is the timing: **creating an endpoint takes 15–40 minutes** on Databricks' side, against seconds for everything else in the deploy. So the deploy starts the endpoint and moves on, and the index is built by the next deploy — by which time the endpoint is online and that run costs seconds. Until the index exists the tool falls back to keyword matching over the same corpus, which is a real answer rather than an error. `VS_WAIT=1` blocks for the endpoint instead, for the deploy that has to come out of it complete; the script says which kind of run it is before it starts waiting, because a silent 40-minute wait looks like a hang and gets killed.
+
+The endpoint bills by the hour whether or not anything queries it, so it is one of the two capabilities `MINIMAL=1` skips and `scripts/cleanup.sh` removes. `./scripts/deploy.sh <env> --capabilities` prints the whole inventory — what is on, what each one costs, what the app does without it — without deploying anything.
 
 Everything above describes infrastructure. Whether the app can *use* it is a separate question, and for a long time the answer was no, invisibly. Two independent defects had to be fixed before a single semantic query ran in the deployed app:
 
@@ -273,12 +276,34 @@ Everything above describes infrastructure. Whether the app can *use* it is a sep
 
 Both failures were survivable-looking by construction: the fallback returns sensible, well-formed results, so nothing downstream looked wrong while the endpoint sat online and billed. That is the argument for the `retrieval` field on every returned row — `vector_search` or `keyword` — and for the warning the fallback now logs.
 
-The shape follows current Databricks AI Search guidance (Vector Search was renamed in June 2026). A **standard** endpoint is correct here — the guidance points to storage-optimized only at 10M+ vectors, where 250–500ms query latency is an acceptable trade; a standard endpoint answers in 20–50ms and this corpus is 27 rows. A **Delta Sync index with managed embeddings** is the recommended option whenever the corpus already lives in a Delta table, which is why the fallback to a Direct Access index does not apply: Direct Access cannot use managed embeddings at all and would put embedding on us at both write and query time. Queries run as `query_type="HYBRID"` rather than pure ANN, because the guidance calls for hybrid "where domain-specific keywords are important" and an operator typing "capper misfeed" is exactly that case. Only the columns the tool reads are synced, and sync is triggered rather than continuous.
+The shape follows current Databricks AI Search guidance (renamed from Vector Search in June 2026; the `vector_search()` SQL function, the old API prefix and our own `VS_ENDPOINT` / `vector_search_endpoint` identifiers all still carry the former name). A **standard** endpoint is correct here — the guidance points to storage-optimized only at 10M+ vectors, where 250–500ms query latency is an acceptable trade; a standard endpoint answers in 20–50ms and this corpus is 27 rows. A **Delta Sync index with managed embeddings** is the recommended option whenever the corpus already lives in a Delta table, which is why the fallback to a Direct Access index does not apply: Direct Access cannot use managed embeddings at all and would put embedding on us at both write and query time. Queries run as `query_type="HYBRID"` rather than pure ANN, because the guidance calls for hybrid "where domain-specific keywords are important" and an operator typing "capper misfeed" is exactly that case. Only the columns the tool reads are synced, and sync is triggered rather than continuous.
 
 Two details make the index buildable at all:
 
 - **It indexes a purpose-made table, not the event log.** The tool's whole value is `resolution_minutes`, `outcome_oee_impact` and `outcome_description` — what fixed it, how long it took, what it cost. Those are written to `event_log_bronze` and dropped by the quality gate before they reach `gold_history_event_log`, so an index over gold, the obvious source, fails on the column list. `event_case_library` joins the gated event back to its outcome fields, is written by `MERGE` so Change Data Feed stays coherent, and carries a `case_text` column concatenating description, root cause and corrective action — a Delta Sync index embeds exactly one column, and relevance lives across all three.
-- **The column list is a contract split across two files.** Vector Search fails a query outright if you request a column the index does not carry; there is no partial result. `tests/scripts/test_provision_vector_search.py` asserts the tool's list is a subset of what the provisioner syncs.
+- **The column list is a contract split across two files.** AI Search fails a query outright if you request a column the index does not carry; there is no partial result. `tests/scripts/test_provision_vector_search.py` asserts the tool's list is a subset of what the provisioner syncs.
+
+### Document retrieval is a Knowledge Assistant, and it is the other half of memory
+
+`query_plant_docs` answers "what does the procedure say" against the plant's engineering documents — SOPs, specifications and lookup tables, the line process narrative, a deviation report, a certificate of analysis, a batch record, a maintenance manual extract. It is wired into the four specialists whose answers get quoted back at a supervisor: `downtime_analyst`, `quality_specialist`, `maintenance_predictor` and `schedule_optimizer`.
+
+The chat panel offers three document questions as suggestion chips, but only when `/api/ops/topology` reports `plant_docs` true — the assistant can be switched off, and in a deployment without one those chips would answer every click with "the documents could not be read" and read as a bug rather than as a feature nobody enabled. The flag is read from the app's own env at request time, so provisioning or tearing the assistant down changes the chips without rebuilding the client.
+
+`schedule_optimizer` was added after the deployed app was measured getting it wrong. Asked how long a 0.5 L to 1.0 L changeover takes, it answered "≈20 min (per matrix)" at HIGH confidence; the matrix says 45 minutes for the filler and 55 for the line critical path, and the role had no way to read it. Changeover minutes, cleaning-group crossings and planned maintenance windows are written down and are nowhere in telemetry, so a role that schedules around them needs the documents even though the rest of its work is arithmetic.
+
+It exists as a separate tool because it is a separate corpus. `retrieve_similar_cases` searches resolved *events*; this searches *documents*. That distinction is load-bearing enough that the tool returns an error when the assistant is unavailable rather than falling back to anything: the event library answers in fluent, plausible prose, so a silent substitution would read as a correct answer to a question about an isolation sequence. Both tool docstring and error text tell the model to say the documents could not be read instead of answering from memory.
+
+Retrieval itself is not ours. `scripts/provision_knowledge_assistant.py` creates an [Agent Bricks Knowledge Assistant](https://docs.databricks.com/aws/en/generative-ai/agent-bricks/knowledge-assistant), points it at a Unity Catalog volume of documents, and Agent Bricks owns parsing, chunking, embedding, retrieval, grounding and citations behind one agent serving endpoint. That is why **you will find no `ai_parse_document` call in this repo** — the parse happens inside the managed service, and adding our own would mean maintaining a second, worse copy of it. The app's whole share of the work is one POST to `/serving-endpoints/{name}/invocations`, which is also why the tool is 200 lines rather than a pipeline.
+
+Three things about the setup are worth knowing:
+
+- **It ships on, and it bills.** `knowledge_assistant_name` ships set and `scripts/deploy.sh` provisions the assistant (`knowledge_docs_volume` names the volume under `uc_catalog.uc_schema`, default `plant_docs`); blank the name and the tool reports itself unconfigured. The name has to differ between dev and prod, because the assistant is looked up by display name and a shared one would point both environments at a single corpus. An assistant serves from an agent endpoint that bills while it is online, so it is one of the two capabilities `MINIMAL=1` skips, and `scripts/cleanup.sh` deletes it and clears both written-back keys — a teardown that dropped the corpus volume and left the assistant running would leave a billing endpoint answering from an empty knowledge base.
+- **The corpus is in Git, not in the workspace.** `data/plant_docs/*.md` is checked in and uploaded to the volume on every provision run, so a demo's answers are reproducible from a clone and a document change is reviewable as a diff — markdown rather than PDF for the same reason. Editing a document is not enough on its own: a files-based knowledge source does not notice changed files, which is why the script asks for a sync every run. `tests/data/test_the_plant_doc_corpus_is_answerable.py` holds the corpus to the machine vocabulary the rest of the app uses, because a document naming a machine the line does not have yields a confidently cited answer about equipment that does not exist. To answer from real documents instead, pass `--corpus <dir>` at your own document directory; the script refuses to run against one with nothing ingestible in it rather than building an assistant that knows nothing.
+- **The endpoint answers before it knows anything, which is the state to plan for.** Measured against a live workspace: the assistant returns an `endpoint_name` and serves requests within seconds of creation, while its `state` is still `CREATING` and its index is still building — for well over five minutes. So the app gets wired up on the first deploy and, until indexing finishes, every question comes back as a fluent "I have no documents to answer from". That is the right answer and it is the corpus instructions doing their job, but it is not a working demo, so check `state` is `ACTIVE` before showing anyone. `provision_knowledge_assistant.py` prints the endpoint and assistant id, deploy writes them back to the local settings profile as `knowledge_assistant_endpoint` / `knowledge_assistant_id`, and `render_app_yaml.py` turns them into `DOCS_KA_ENDPOINT` / `DOCS_KA_ID`. The app was already deployed by that point, so the deploy re-renders and redeploys when the endpoint *changes* — the same second pass the Genie space ids need.
+
+  The same delay is why the example questions are registered on a *later* run. While the state is `CREATING`, every call to the examples API is rejected with `TEMPORARILY_UNAVAILABLE` because the internal index is not there yet, so the script does not ask: it says how many examples are waiting and registers them once the assistant is active. Retrying inside the deploy was tried and measured as pure dead time.
+
+**Multi-Agent Supervisor is the composition layer above this, later.** Agent Bricks MAS would let the KA sit alongside the Genie spaces under a managed supervisor instead of under our orchestrator. Nothing here blocks that; the KA is deliberately reachable as an endpoint, so it is already a component a supervisor could be handed.
 
 ## Incident Scenarios
 
@@ -311,7 +336,6 @@ The following scenario IDs are recognised by the routing layer (`INCIDENT_TO_SPE
 │   ├── sim/                 # Incident command store (Lakebase) + recovery lookup
 │   │   ├── commands.py      # scenario_commands CRUD (ai_serving.*)
 │   │   └── recovery.py      # map machine_id → active command_ids
-│   ├── hitl/                # Human-in-the-loop action tracking
 │   ├── specialists/         # 8 LangGraph ReAct agents
 │   ├── prompts/             # Specialist system prompts
 │   ├── tools/               # sql_query, calculator, anomaly_detector, and more

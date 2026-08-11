@@ -28,31 +28,30 @@ your own deployment. It ships with placeholder configuration and synthetic data
 
 ## Known advisories in dependencies
 
-Checked at the v0.3.6 release against [OSV](https://osv.dev): all 938 packages
-in the npm tree are clean. No dependency changed in v0.3.7 or v0.3.8, and
-`package-lock.json` is still untouched, so the npm side of the review stands.
+Checked at the v0.4.0 release against [OSV](https://osv.dev), across both
+locked trees. Three npm packages had moved into an advisory since v0.3.9 and
+each had a fix available, so each is pinned forward through `overrides` in
+`package.json`: `js-yaml` 4.3.1 (quadratic CPU on `!!omap`), `dompurify` 3.4.13
+(a detached subtree left executable by `IN_PLACE` hook removal), and `nanoid`
+3.3.18 (an infinite loop on a zero size, fixed in 3.3.17). All three reach us transitively; with
+those overrides the npm tree is clean.
 
-One Python package has moved since: `gitpython` 3.1.57 → 3.1.58, which closes
-six advisories in the 3.1.58 release — argument injection through
-`GitConfigParser.set_value`, code execution through a `Repo.init` template
-directory, and path traversal through submodule names. It reaches us only
-transitively, through `mlflow-skinny`, and none of those paths take input this
-application controls: mlflow uses it to read commit metadata, not to init
-repositories or write config. Taken anyway, because it was free — nothing pins
-`gitpython` below its fix, which is exactly what separates it from the two
-below.
+On the Python side `cryptography` moved 48.0.1 → 49.0.0, which closes an
+exponential path-building denial of service and a wildcard-DNS escape from
+`permittedSubtrees`. That upgrade only became reachable because `mlflow` relaxed
+its pin in 3.15.1, which this release also takes.
 
-Those two remain, both pulled in transitively and both held below their fix by
-an upstream pin, so neither can be resolved from this repository:
+Two advisories remain, both pulled in transitively and both held below their fix
+by an upstream pin, so neither can be resolved from this repository:
 
-| Package | Version | Advisories | Fixed in | Held back by |
+| Package | Version | Advisory | Fixed in | Held back by |
 |---|---|---|---|---|
-| `cryptography` | 48.0.1 | GHSA-g6cj-pr64-35w5, GHSA-jwv3-5hgf-82ww (high), GHSA-m2h6-j472-rp4c (moderate) | 49.0.0 | `mlflow` requires `cryptography<49` |
+| `cryptography` | 49.0.0 | GHSA-g6cj-pr64-35w5 (high) | 50.0.0 | `mlflow` requires `cryptography<50` |
 | `protobuf` | 6.31.1 | GHSA-7gcm-g887-7qv7 (high) | 6.33.5 | `ortools` requires `protobuf<6.32` |
 
-The accelerator does not exercise the affected code paths — it does no PKCS#7
-decryption, builds no X.509 chains of its own, and parses no untrusted protobuf
-JSON — so the practical exposure here is low. That is a statement about this
+The accelerator does not exercise either affected code path — it does no PKCS#7
+decryption and parses no untrusted protobuf JSON — so the practical exposure
+here is low. That is a statement about this
 application, not about the advisories: if you build on this and add any of
 those, re-run the check. Both resolve on their own once mlflow and ortools relax
 their pins, so re-running `uv lock --upgrade` periodically is worthwhile.

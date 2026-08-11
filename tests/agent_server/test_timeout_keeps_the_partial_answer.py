@@ -18,7 +18,7 @@ import threading
 import time
 
 import pytest
-from langchain_core.messages import AIMessageChunk
+from langchain_core.messages import AIMessage, AIMessageChunk
 
 from agent_server import agent as agent_mod
 
@@ -199,3 +199,74 @@ def test_the_worker_is_released_rather_than_left_running(
         release.set()
     # The caller returns on the timeout rather than waiting for the agent.
     assert time.monotonic() - start < 10
+
+
+class _FakeSyncAgent:
+    """Yields whole graph states, blocking partway through.
+
+    `stream_mode="values"` emits the full state after each super-step, so this
+    stands in for the shape `_run_specialist` drives. The block holds the run
+    open past the caller's patience, which is the state a real cut catches a
+    specialist in. What happens *after* the release is the point.
+    """
+
+    def __init__(self, release: threading.Event):
+        self._release = release
+        self.ran_to_completion = False
+
+    def stream(self, _inputs, _config, stream_mode=None):
+        assert stream_mode == "values", (
+            "the sync path needs whole states, not per-node updates, or the "
+            "last emission is not what invoke() would have returned"
+        )
+        yield {"messages": [AIMessage(content="first")]}
+        self._release.wait(timeout=30)
+        yield {"messages": [AIMessage(content="second")]}
+        yield {"messages": [AIMessage(content="third")]}
+        self.ran_to_completion = True
+
+
+class TestTheSyncPathLetsGoOfItsWorker:
+    """`future.result(timeout=…)` frees the caller, never the thread.
+
+    The pool holds six workers. A timed-out run that keeps going holds one of
+    them for as long as its model and tools take, so a handful of slow questions
+    starved the pool for everyone — while the people who asked them had already
+    been told the analysis timed out.
+    """
+
+    def test_a_timed_out_run_stops_instead_of_finishing_for_nobody(
+        self, short_timeout, no_context, monkeypatch
+    ):
+        release = threading.Event()
+        fake = _FakeSyncAgent(release)
+        monkeypatch.setattr(agent_mod, "_get_specialists", lambda: {"downtime_analyst": fake})
+
+        answer = agent_mod._run_specialist("downtime_analyst", "why?", {})
+        assert "timed out" in answer
+
+        # Let the blocked super-step finish. A cancelled run takes the next
+        # seam and stops; an uncancelled one runs the remaining states.
+        release.set()
+        deadline = time.monotonic() + 10
+        while not release.is_set() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        time.sleep(0.5)
+
+        assert not fake.ran_to_completion, (
+            "the worker ran the whole ReAct loop after the caller gave up, "
+            "holding a pool slot for an answer nobody is waiting for"
+        )
+
+    def test_a_run_that_finishes_in_time_still_returns_its_last_state(
+        self, no_context, monkeypatch
+    ):
+        """The cancel seam replaced `invoke` with `stream`; same answer either way."""
+
+        class _Finishes:
+            def stream(self, _inputs, _config, stream_mode=None):
+                yield {"messages": [AIMessage(content="working")]}
+                yield {"messages": [AIMessage(content="the actual answer")]}
+
+        monkeypatch.setattr(agent_mod, "_get_specialists", lambda: {"downtime_analyst": _Finishes()})
+        assert agent_mod._run_specialist("downtime_analyst", "why?", {}) == "the actual answer"

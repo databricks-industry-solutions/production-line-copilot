@@ -110,15 +110,17 @@ describe('the guide does not overclaim', () => {
   });
 
   it('tells the presenter that actions do not write anywhere', () => {
-    // The single most likely thing to be overclaimed live.
-    expect(script).toContain('proposal');
-    expect(script.toLowerCase()).toContain('write-back');
+    // The single most likely thing to be overclaimed live, so it belongs in the
+    // step that shows the actions rather than in an answer held back for
+    // questions that may never be asked.
+    const copy = DEMO_STEPS.map((step) => step.script).join(' ');
+    expect(copy).toContain('proposal');
+    expect(copy.toLowerCase()).toContain('write-back');
   });
 
-  it('keeps the pushback answers on the page', () => {
-    expect(script).toContain('HONEST_ANSWERS');
-    expect(script).toContain('synthetic');
-    expect(tab).toContain('HONEST_ANSWERS');
+  it('says out loud that the telemetry is generated', () => {
+    const copy = DEMO_STEPS.map((step) => step.script).join(' ');
+    expect(copy).toContain('synthetic');
   });
 });
 

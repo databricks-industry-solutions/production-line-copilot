@@ -11,7 +11,7 @@
  * only the rendering of it.
  */
 import { MACHINE_LAYOUT } from '../lib/constants';
-import { DEMO_STEPS, HONEST_ANSWERS, totalMinutes } from '../lib/demoScript';
+import { DEMO_STEPS, totalMinutes } from '../lib/demoScript';
 import { OPTIMIZER_METHODS, SPECIALISTS } from '../lib/specialistCatalog';
 import { GOVERNED_DOMAINS } from '../lib/topologyCopy';
 import type { TabId } from '../lib/tabRouting';
@@ -112,21 +112,6 @@ export default function DemoGuideTab({ onOpenTab }: { onOpenTab: (tab: TabId) =>
           </li>
         ))}
       </ol>
-
-      <div className="rounded-lg border bg-card p-5">
-        <h3 className="text-sm font-semibold uppercase tracking-wider text-muted-foreground">When they push back</h3>
-        <p className="mt-1 max-w-3xl text-xs leading-relaxed text-muted-foreground">
-          Three questions come up almost every time. None of them has a defensive answer, which is the point.
-        </p>
-        <div className="mt-3 space-y-3">
-          {HONEST_ANSWERS.map((item) => (
-            <div key={item.question}>
-              <div className="text-xs font-semibold text-foreground">{item.question}</div>
-              <p className="mt-0.5 text-xs leading-relaxed text-muted-foreground">{item.answer}</p>
-            </div>
-          ))}
-        </div>
-      </div>
     </div>
   );
 }

@@ -1,6 +1,6 @@
 """Anomaly detection on machine telemetry using Z-score and IQR methods.
 
-Queries `machine_telemetry` (raw sensor time-series) and returns
+Queries `telemetry_bronze` (raw sensor time-series) and returns
 anomalous readings grouped by sensor.
 """
 import logging

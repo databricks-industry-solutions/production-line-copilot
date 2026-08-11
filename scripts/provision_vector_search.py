@@ -39,6 +39,11 @@ which Delta refuses outright.
 Usage:
   python3 scripts/provision_vector_search.py --catalog C --schema S \\
       --warehouse-id W [--profile P] [--dry-run] [--wait]
+
+Exit codes, because "did not finish" and "went wrong" are different outcomes and
+the deploy reports them differently: 0 provisioned, 2 bad arguments, 3 the
+endpoint was created and is still coming up so the index is not built yet
+(re-run later — nothing is broken), 1 anything genuinely wrong.
 """
 from __future__ import annotations
 
@@ -246,13 +251,40 @@ def ensure_endpoint(w: WorkspaceClient, name: str, dry_run: bool, wait: bool) ->
     return False
 
 
-def ensure_index(w: WorkspaceClient, endpoint: str, index_fqn: str, source_fqn: str,
-                 embedding: str, dry_run: bool) -> bool:
+def existing_index(w: WorkspaceClient, index_fqn: str, endpoint: str, dry_run: bool):
+    """The index if it is usable as it stands, else None to build it.
+
+    An index name is unique per metastore, not per endpoint, so finding one says
+    nothing about where it is served from. Moving an environment between
+    endpoints found that out: the deploy reported the index as provisioned on the
+    configured endpoint while it was still attached to the old one, so the app
+    queried an endpoint holding nothing and the retriever went on reporting the
+    good path. An index cannot be re-pointed, so honouring the configured
+    endpoint means building it there.
+    """
     try:
         idx = w.vector_search_indexes.get_index(index_fqn)
-        indexed = idx.status.indexed_row_count if idx.status else None
-        print(f"  index {index_fqn}: exists, ready={idx.status.ready if idx.status else '?'}"
-              f", indexed_rows={indexed}")
+    except Exception:
+        return None
+
+    indexed = idx.status.indexed_row_count if idx.status else None
+    print(f"  index {index_fqn}: exists, ready={idx.status.ready if idx.status else '?'}"
+          f", indexed_rows={indexed}")
+
+    serving = getattr(idx, "endpoint_name", None)
+    if serving and serving != endpoint:
+        print(f"    served from {serving!r}, not the configured {endpoint!r}"
+              f" — rebuilding it there")
+        if dry_run:
+            return None
+        w.vector_search_indexes.delete_index(index_name=index_fqn)
+        return None
+    return idx
+
+
+def ensure_index(w: WorkspaceClient, endpoint: str, index_fqn: str, source_fqn: str,
+                 embedding: str, dry_run: bool) -> bool:
+    if existing_index(w, index_fqn, endpoint, dry_run) is not None:
         # A TRIGGERED index syncs when it is asked to and at no other time. This
         # branch used to return here, so every run after the first refreshed the
         # case library and left the index on whatever it had captured at
@@ -267,8 +299,6 @@ def ensure_index(w: WorkspaceClient, endpoint: str, index_fqn: str, source_fqn: 
             except Exception as e:  # a sync already running is not a failure
                 print(f"    sync not triggered: {str(e)[:120]}")
         return True
-    except Exception:
-        pass
 
     if dry_run:
         print(f"  [dry-run] would create index {index_fqn} over {source_fqn}")
@@ -336,7 +366,10 @@ def main() -> int:
               f"  VS_ENDPOINT={args.endpoint} python3 {sys.argv[0]} "
               f"--catalog {args.catalog} --schema {args.schema} "
               f"--warehouse-id {args.warehouse_id} --wait")
-        return 0 if args.dry_run else 1
+        # 3, not 1: an endpoint that is still provisioning is the expected
+        # outcome of a first run that chose not to block for 40 minutes, and a
+        # deploy that reports it as a failure teaches people to ignore failures.
+        return 0 if args.dry_run else 3
 
     ensure_index(w, args.endpoint, index_fqn, source_fqn, args.embedding_model, args.dry_run)
     print(f"\nSet VS_ENDPOINT={args.endpoint} in the app config for the tool to use it.")

@@ -41,6 +41,39 @@ flowchart LR
 
 `deploy.sh` supports **only** `dev` and `prod`. Override CLI auth with `DATABRICKS_PROFILE` (default `DEFAULT`).
 
+### Pick a credential that outlives the deploy
+
+A first deploy of a fresh workspace runs 30-45 minutes, most of it the one-time
+setup job. Two things about `bundle deploy` make that duration matter, and both
+have bitten this project:
+
+- **It authenticates twice, and the second one is not yours.** `bundle deploy`
+  spawns Terraform, whose provider resolves credentials itself from a filtered
+  environment — only `DATABRICKS_HOST`, `DATABRICKS_ACCOUNT_ID`,
+  `DATABRICKS_WORKSPACE_ID` and `DATABRICKS_CONFIG_PROFILE` reach it. So it reads
+  the **default** (OS keyring) token cache, and `DATABRICKS_AUTH_STORAGE` does
+  not apply to it. Log in on one storage and stay there: a
+  `DATABRICKS_AUTH_STORAGE=plaintext` login mints a session that **invalidates**
+  the keyring copy Terraform is still using, and the deploy then dies with
+  `the refresh token is invalid` while the CLI itself keeps working.
+
+- **A U2M OAuth session is shared.** Anything else on that profile — an IDE, an
+  MCP server, a second deploy — refreshes it, the refresh token rotates, and the
+  copy Terraform holds goes invalid part-way through. Where the keyring is
+  unreachable at all (CI, ssh, headless shells: `OS keyring unreachable: exit
+  status 44`), the credential has to be one the provider can resolve from the
+  profile itself. For both cases, prefer something that does not rotate — a PAT
+  (`token =`) or a service principal (`client_id` + `client_secret`) in
+  `~/.databrickscfg` — which is what you want for CI anyway.
+
+`deploy.sh` probes the Terraform path with `bundle plan` before it touches
+anything, so a credential that cannot get there fails in seconds instead of
+after the setup job. If a deploy does die mid-run, **re-run the same command**:
+every step is idempotent, so the second run skips the setup job and reuses the
+Genie spaces, the search index and the assistant. Until it finishes, the app
+runs one pass behind — with the last thing the deploy was about to give it (on a
+first deploy, the assistant endpoint) still missing.
+
 ---
 
 ## Deploy steps
@@ -143,6 +176,66 @@ Optional: `RUN_PREFLIGHT=1 ./scripts/deploy.sh dev` runs preflight first; `RUN_E
 
 Branch guard: **prod** requires `main` (override `DEPLOY_IGNORE_BRANCH=1`); **dev** warns if not on `dev` but does not block forks without a `dev` branch.
 
+### Capabilities: all on, and how to build fewer
+
+Everything ships **on**, so a fresh clone deploys the whole accelerator rather than a subset you would have to discover. Ask what a deploy would build without building it:
+
+```bash
+./scripts/deploy.sh dev --capabilities    # prints the inventory, deploys nothing
+```
+
+| Capability | Key | Cost | First deploy |
+| --- | --- | --- | --- |
+| Genie space over the live shift | `genie_space_id` | per query | ~1 min, created automatically |
+| Zerobus ingest | `zerobus_ingest_enabled` | free | none |
+| DQX quality checks | `dqx_enabled` | free — runs inside the streaming job | none |
+| Governed model + 4 domain Genie spaces | `mvm_silver_enabled` | free beyond the queries | ~5 min for the four spaces |
+| AI Search over the case history | `vector_search_endpoint` | **bills hourly** while online | endpoint takes 15-40 min; the deploy does not wait |
+| Knowledge Assistant over plant documents | `knowledge_assistant_name` | **bills hourly** while online | indexing takes minutes to hours; the deploy does not wait |
+
+The two slow ones do not block the deploy. It starts them, finishes, and each is picked up by your next deploy: the AI Search index is built once the endpoint is online, and the assistant's endpoint is wired into the app once it exists. Until then `retrieve_similar_cases` falls back to keyword overlap and `query_plant_docs` says the documents were not read — both stated in the deploy's closing **Capabilities** summary, which lists what actually got built.
+
+Two switches:
+
+```bash
+MINIMAL=1 ./scripts/deploy.sh dev   # skip the two that bill; deploy everything else
+VS_WAIT=1 ./scripts/deploy.sh dev   # block until AI Search is online (15-40 min)
+```
+
+`MINIMAL=1` is the deploy that costs nothing hourly — useful for CI, for a first look, or while waiting on a budget approval. `VS_WAIT=1` is for the deploy that has to come out of it fully working, at the price of the wait. `./scripts/cleanup.sh` removes both billing endpoints when you are done.
+
+To turn a capability off for good, clear its key in `config/project-settings.local.yaml`. The deploy then says what it skipped and what the app does instead, rather than going quiet.
+
+#### Plant documents via a Knowledge Assistant
+
+On by default. It lets four specialists (downtime, quality, maintenance, scheduling) answer from the plant's engineering documents with citations, through `query_plant_docs`. Two config fields, one of them optional:
+
+| Config field                | Meaning                                                                          |
+| --------------------------- | -------------------------------------------------------------------------------- |
+| `knowledge_assistant_name`  | Display name of the assistant. Ships set; blank turns the feature off. Dev and prod must differ — the assistant is looked up by display name. |
+| `knowledge_docs_volume`     | Volume under `uc_catalog.uc_schema` holding the documents. Defaults to `plant_docs`. |
+
+The first deploy after setting the name creates the volume, uploads `data/plant_docs/*.md`, creates an [Agent Bricks Knowledge Assistant](https://docs.databricks.com/aws/en/generative-ai/agent-bricks/knowledge-assistant) over it, registers the example questions, and grants the app service principal `CAN_QUERY`. Later deploys re-upload the corpus and request a sync, so an edited document reaches the assistant — unless an ingest is still running, in which case the edit waits for the deploy after it. Two ingests at once exceed the organisation's embedding quota, and that failure is not retried by the platform: it fails the build.
+
+Two expectations to set before you run it:
+
+- **It answers immediately, and it knows nothing for the first several minutes.** The endpoint exists and responds within seconds, while indexing is still running — so the app is wired up on the first deploy but every answer is "I have no documents to answer from" until the index is built. The **Capabilities** summary says which of the two you have: `still indexing the documents` rather than `answering on <endpoint>`. Check the assistant is `ACTIVE` on the Agents page before demonstrating it:
+
+```bash
+databricks api get /api/2.1/knowledge-assistants --profile <profile> | grep -E 'display_name|state'
+```
+
+  The endpoint bills while it is online, whether or not it has finished indexing; `./scripts/cleanup.sh` deletes it. Run the deploy once more after it goes active — that run registers the example questions, which are rejected while the index is provisioning.
+- **A `FAILED` state is usually a quota, and re-running fixes it.** If `error_info` names `REQUEST_LIMIT_EXCEEDED` or `RESOURCE_EXHAUSTED`, the ingest ran out of the organisation's embedding quota; the next deploy re-syncs the corpus and it recovers, keeping whatever was already indexed. Only a failure naming the documents themselves calls for deleting the assistant and building again — the deploy says which one you have.
+- **Until it is wired up, the tool says so.** An unconfigured or failed assistant makes the specialists report that the documents could not be read, rather than answering from the model's general knowledge of packaging lines. A failure here never fails the deploy.
+
+To answer from your own documents instead of the shipped corpus, run the script directly with a corpus directory of your own:
+
+```bash
+python3 scripts/provision_knowledge_assistant.py --catalog <cat> --schema <schema> \
+    --display-name "Plant documents" --corpus /path/to/docs [--dry-run]
+```
+
 ### 4b. Alternative: guided notebook path (in-workspace)
 
 `scripts/deploy.sh` is the primary, one-command path. If you prefer to provision from inside the workspace (for a workshop or a serverless-only environment without a laptop), the `notebooks/` folder walks through the same underlying scripts step by step. Import the repo as a **Git folder** (or Workspace Files) and run, in order:
@@ -184,8 +277,11 @@ See **[`GETTING_STARTED.md`](./GETTING_STARTED.md)** for KPI migrations, app reb
 | Intent                                 | Command                                           |
 | -------------------------------------- | ------------------------------------------------- |
 | Preflight                              | `python3 scripts/preflight.py dev`                |
+| What would this build?                 | `./scripts/deploy.sh dev --capabilities`          |
 | Dev deploy                             | `./scripts/deploy.sh dev`                         |
 | Prod deploy                            | `./scripts/deploy.sh prod`                        |
+| Deploy nothing that bills hourly       | `MINIMAL=1 ./scripts/deploy.sh dev`               |
+| Wait for AI Search to come online      | `VS_WAIT=1 ./scripts/deploy.sh dev`               |
 | Force re-provision (UC + seed + Genie) | `RUN_SETUP=1 ./scripts/deploy.sh dev`             |
 | CI drift check                         | `python scripts/sync_project_settings.py --check` |
 

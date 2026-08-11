@@ -25,15 +25,23 @@ from agent_server.tools.governed_domain_query import (
     governed_domain_tools,
 )
 from agent_server.tools.plan_constraints_loader import load_plan_and_constraints
+from agent_server.tools.plant_docs_query import query_plant_docs
 from agent_server.tools.sql_query import sql_query
 
 
 def create_schedule_optimizer():
     """Build the ReAct agent registered as 'schedule_optimizer'."""
     llm = ChatDatabricks(endpoint=resolve("schedule_optimizer"))
+    # query_plant_docs: changeover minutes, cleaning-group crossings and the
+    # planned maintenance windows this role schedules around are all written down
+    # in the plant documents and nowhere in telemetry. Without the tool this role
+    # was measured answering "≈20 min changeover (per matrix)" with HIGH
+    # confidence for a transition the matrix puts at 45 — citing a document it
+    # could not read.
     tools = [
         sql_query, load_plan_and_constraints, calculator,
         schedule_recovery, production_forecast, stochastic_schedule_recovery,
+        query_plant_docs,
         *governed_domain_tools("production"),
     ]
 

@@ -6,6 +6,755 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-11
+
+### Added
+
+- **The specialists can read the plant's documents, with citations.** Everything
+  they knew was measured — telemetry, and past events through
+  `retrieve_similar_cases`. Nothing they knew was *written down*, so "what is the
+  isolation sequence before opening the capper guard" was a question about a
+  procedure answered from a model's general knowledge of packaging lines, which
+  is the failure mode you cannot see: it reads exactly like an answer.
+
+  `query_plant_docs` asks an [Agent Bricks Knowledge
+  Assistant](https://docs.databricks.com/aws/en/generative-ai/agent-bricks/knowledge-assistant)
+  over a Unity Catalog volume of documents and returns the answer with the
+  documents it cited. Downtime, quality, maintenance and scheduling get it.
+  Retrieval is not
+  ours: parsing, chunking, embedding, grounding and citations happen inside the
+  managed service behind one agent endpoint, which is why **there is no
+  `ai_parse_document` call anywhere in this repo** and why the tool is one POST.
+
+  Two decisions are the substance of it. **The tool errors rather than falls
+  back** — the event library answers in fluent prose about a different corpus, so
+  a silent substitution would look like a correct answer about an SOP; tool
+  docstring and error text both tell the model to say the documents were not
+  read. And **the corpus is in Git**: seven markdown documents in
+  `data/plant_docs/` (SOPs, the line process narrative, a deviation report, a
+  certificate of analysis, a spec, a maintenance manual extract), uploaded at
+  provision time so a demo's answers are reproducible from a clone and a
+  document edit is a reviewable diff. Twenty-two of them, including lookup tables
+  a supervisor actually reads off (fill volumes by format, torque by closure,
+  changeover minutes), a batch record, a calibration certificate, a HACCP plan,
+  and one deliberate disagreement: an unapproved technical bulletin proposing a
+  pasteurisation window the governing specification does not allow, so the
+  reconciliation is visible rather than asserted. A corpus test holds them to the
+  machine vocabulary the rest of the app uses, because a document naming a machine
+  the line does not have produces a confidently cited answer about equipment that
+  does not exist.
+
+  On by default (see the capability entry below): `knowledge_assistant_name` ships
+  set and `scripts/deploy.sh` provisions the volume, the assistant, its examples
+  and the app's `CAN_QUERY` grant, then re-uploads and re-syncs on later deploys because
+  a files-based source does not notice edited files. The endpoint bills while
+  online, so `scripts/cleanup.sh` deletes it. Provisioning goes through the REST
+  API rather than the SDK, which grew a `knowledge_assistants` client after the
+  version the App runtime ships.
+
+  The timing was measured against a live workspace rather than assumed, and it is
+  not what the documentation implies. The endpoint exists and answers within
+  seconds of creation while the assistant's state is still `CREATING` and its
+  index is still building — so the app is wired on the first deploy and every
+  answer is a fluent "I have no documents to answer from" until indexing
+  finishes. Correct behaviour, and exactly what the corpus instructions ask for,
+  but not a demo: check the state is `ACTIVE` first. The same delay rejects every
+  example registration with `TEMPORARILY_UNAVAILABLE`, so the deploy does not ask
+  while the state is `CREATING`; it reports how many examples are waiting and a
+  later run writes them. Retrying inside the deploy was tried, measured as dead
+  time, and cut back to a single short retry for the seconds-long race.
+
+  Four things only the deployed app could find, all of which had the same shape —
+  a success message covering for a broken answer. **The assistant and its serving
+  endpoint keep separate access control lists**, and the app talks to the
+  endpoint: granting `CAN_QUERY` on the assistant alone printed a successful grant
+  and produced 403 on every question, which the specialist then reported as the
+  documents being unavailable — indistinguishable from the feature being off. The
+  deploy now grants both, addressing the endpoint by the id its permissions API
+  demands. **The re-wire that puts the endpoint into the app compared settings**,
+  which provisioning writes itself, so anyone who provisioned outside a full
+  deploy had the comparison agree with itself forever while the app never received
+  the variable; it now compares what the running app was built with. **Citations
+  were counted per sentence**, so one specification arrived seven times with seven
+  deep links and read as seven sources; they are de-duplicated by document.
+  **`sources_used` means the sources were searched, not that the answer came from
+  them** — an off-corpus question returns that flag set, no citations, and a
+  correct refusal, so grounding is now judged on whether anything was cited.
+
+  Scheduling was added to the tool's roles for the same reason. Asked how long a
+  0.5 L to 1.0 L changeover takes, it answered "≈20 min (per matrix)" at HIGH
+  confidence; the matrix says 45 for the filler and 55 for the line. Changeover
+  minutes, cleaning-group crossings and planned maintenance windows are written
+  down and are nowhere in telemetry, so a role that plans around them was citing a
+  document it had no way to read.
+
+- **Chapters in the film's playback bar.** A chapters button opens an agenda
+  that seeks, and the scrub track carries a tick per chapter, so a film can be
+  navigated rather than sat through. Chapters are declared once and drive the
+  ticks, the button label and the clickable list, so a seek by any route cannot
+  leave the label out of step. A chapter can be marked as roadmap, which badges
+  it in the agenda — the convention the film already used on screen for MCP
+  write-back, now legible from the timeline.
+
+### Changed
+
+- **The demo guide states the product's limits in the steps that show them,
+  instead of answering objections at the end.** The guide closed with a "When
+  they push back" section — three anticipated questions with replies to give a
+  room that doubts them. The content was honest, but the framing made a page
+  about a product read as a page about a sales conversation, and two of the
+  three items were facts a viewer should hear whether or not they think to ask.
+  So they are now said where they are demonstrated: the line status beat says
+  the telemetry is generated by a cascade model and everything carrying it is
+  real, and the beat that shows the action chips says there is no write path
+  into a CMMS, SAP or a scheduler. The ROI answer is gone rather than moved —
+  the guide asserts no payback figure, which is what the README already does and
+  what a test still enforces.
+
+- **A search index is now checked against the endpoint the app queries, not just
+  by name.** Index names are unique per metastore rather than per endpoint, so an
+  index left on an endpoint the environment no longer uses answers a lookup
+  perfectly well. Moving dev between endpoints proved what that costs: the deploy
+  reported `index provisioned on <configured endpoint>` over an index still
+  attached to the old one, the app queried an endpoint holding nothing, and
+  `retrieve_similar_cases` reported `retrieval: vector_search` — the healthy path
+  — over an empty result. An index cannot be re-pointed, so the deploy now says
+  where it found one and rebuilds it where the app will look.
+
+- **The deploy stopped calling the document assistant "serving" when it was not,
+  and stopped being the reason it failed.** Destroying every dev asset and
+  deploying the product cold — new schema, new search endpoint, new assistant —
+  found three faults that a warm deploy cannot show, all in the same place.
+
+  The assistant's ingest failed. Attaching the corpus starts one, and the second
+  deploy pass (the documented way to build the search index) asked for another
+  seven minutes later; together they exceeded the organisation's embedding quota.
+  `REQUEST_LIMIT_EXCEEDED` is not queued and not retried — it failed the whole
+  build. So a sync is no longer stacked onto an ingest that is already running,
+  while the run that first attaches the corpus still asks for one.
+
+  Then the failure was reported as success. The summary said `Knowledge
+  Assistant: serving on ka-…-endpoint`, which was true of the endpoint and false
+  of the assistant: it was up, it was billing, the app had been wired to it, and
+  every question about a document came back ungrounded. Wiring was the sufficient
+  condition this summary checked, and it is not one. The provisioning script now
+  reports whether the corpus is indexed, and the summary distinguishes *built*
+  from *answering* — a first build reports an endpoint within seconds and then
+  indexes for the best part of an hour, so those are hours apart even when
+  nothing goes wrong.
+
+  Then the remedy was wrong. A failed build was described as permanent — delete
+  it and re-run, because "re-running against a failed assistant reuses the
+  failure". For a quota it is the opposite: a re-sync clears it (measured —
+  `FAILED` returned to `CREATING` and the error emptied), while deleting throws
+  away an hour of indexing to rebuild the same thing. Quota and capacity failures
+  are now re-synced automatically; a failure in the corpus itself still stops the
+  run and still says to delete.
+
+- **A deploy that cannot authenticate now says so in seconds, not in forty
+  minutes.** `bundle deploy` authenticates twice: the CLI as you, then the
+  Terraform provider it spawns, which resolves its own credential from a filtered
+  environment holding four variables — `DATABRICKS_AUTH_STORAGE` is not one of
+  them, so the provider always reads the default OS keyring cache. Two failures
+  follow from that, and both cost a real deploy here. A
+  `DATABRICKS_AUTH_STORAGE=plaintext` login looks like the fix for a keyring
+  problem and is the opposite: it mints a session that invalidates the keyring
+  copy Terraform is still using. And a U2M OAuth session is shared, so anything
+  else on the profile refreshes it, the refresh token rotates, and the copy
+  Terraform holds goes invalid.
+
+  Both used to surface deep inside a later bundle pass, on whatever resource
+  Terraform happened to read first — 37 minutes into a 40-minute run, after the
+  setup job had finished and the billing endpoints were up. The deploy now runs
+  `bundle plan` first, which exercises the same provider against the same state
+  in seconds, and only an auth signature is treated as fatal. When a credential
+  does expire mid-run the failure explains both causes with their fixes, and says
+  the part that Terraform's per-resource error stanzas bury: every step here is
+  idempotent, so re-running resumes and rebuilds nothing.
+
+- **A fresh clone now deploys the whole product, and can say what that is.** Four
+  capabilities were switched on by one settings key each — semantic retrieval over
+  the case history, the plant-document assistant, the governed industry model with
+  its four domain Genie spaces, the DQX quality checks — and all four shipped off.
+  Two of them announced themselves in a skip line buried in a log hundreds of lines
+  long; the governed model announced itself nowhere at all, because its gate had no
+  else branch. So the accelerator's default was a subset of itself, and the way to
+  discover the rest was to already know.
+
+  All four now ship on. `./scripts/deploy.sh <env> --capabilities` prints the
+  inventory — what is on, what each costs, how long the slow ones take, and what
+  the app does without each one — and deploys nothing; the same view opens every
+  deploy as the plan, and the deploy closes with a **Capabilities** summary of what
+  actually got built. `MINIMAL=1` skips exactly the two that bill hourly and keeps
+  everything else, because a cheap deploy should not also be a lesser one.
+
+  The slow one no longer blocks. Creating an AI Search endpoint takes 15-40 minutes
+  against seconds for the rest of the deploy, so the deploy starts it and moves on,
+  and the index is built by the next run — `VS_WAIT=1` restores the blocking
+  behaviour for the deploy that has to come out of it complete. "Endpoint still
+  provisioning" gets its own exit code so it stops being reported as a failure,
+  which is how a deploy teaches people that its warnings can be ignored.
+
+  Two bugs fell out of turning things on. The governed model's gate required
+  `mvm_catalog` to be non-empty while the settings comment promises that empty means
+  the live catalog — so silver-on with the shipped blank created no domain spaces at
+  all, silently. And dev and prod had drifted: `OPS_DLT_PIPELINE_ID` existed in one
+  app template and not the other, and the Genie ids shipped as `SET_ME` in prod and
+  empty strings in dev, the same behaviour by luck while the file contradicted its
+  own documentation. Both are now held by a test that compares the two profiles and
+  the two templates by shape rather than by value, since a key on one side only is a
+  capability that works in one environment and quietly does not in the other.
+
+- **Databricks renamed Vector Search to AI Search in June 2026, so the prose
+  follows.** Forty-two mentions across the README, the architecture doc, the
+  About and Cost tabs, the deploy and cleanup scripts, the retriever's docstrings
+  and both films. Identifiers deliberately do not move: `VS_ENDPOINT`,
+  `vector_search_endpoint`, `provision_vector_search.py` and the `vector_search()`
+  SQL function keep the old name, because Databricks kept the SQL function and the
+  `/api/2.0/mcp/vector-search/` prefix working and renaming a settings key would
+  break every existing `project-settings.local.yaml` for a cosmetic gain. The one
+  sentence in `ARCHITECTURE.md` that documents the rename says so explicitly.
+
+- **Both films are narrated by a conversational voice, and the deep dive stopped
+  saying two things that were not true.**
+
+  *The delivery was flat because the voice was the wrong one.* Microsoft classes
+  `en-US-JennyNeural` as a **General** voice; the ones that read like someone
+  talking are in its **Conversation** tier. Both films moved to
+  `en-US-AndrewMultilingualNeural`. The two-minute film had to move with the deep
+  dive, because it *is* the deep dive's introduction and a voice change halfway
+  through the first chapter is worse than a flat one throughout. Its cues are
+  pinned to scene beats rather than packed, so `build_film_vo.py --short` keeps
+  the authored starts and re-renders any line that no longer fits its window
+  slightly faster — two of eleven needed it, at +8% and +10%.
+
+  *A panel heading arrived up to fifty seconds before the rows it captioned.*
+  `ListPanel` revealed its heading from the panel's own `at`, which is only the
+  first row's timing when the rows do not carry their own. Three panels had since
+  been given per-row timings, so their headings kept the default of 2.0 and sat
+  alone on an empty panel — chapter 5 showed "WHAT THAT DOES AND DOES NOT MEAN"
+  captioning nothing from its second second to its fifty-second. The heading now
+  derives from the earliest row however the rows are timed.
+
+  *Two claims were stale.* Chapter 5 said the document assistant "ships switched
+  off"; `knowledge_assistant_name` is set in the shipped profile and `deploy.sh`
+  builds it unless `MINIMAL=1`. Chapter 8 said the roster was picked by a
+  head-to-head, when the only head-to-head is one briefing comparison — it now
+  describes what the repository actually carries: selection by endpoint
+  capability, job shape and cost, then measurement against the 33-scenario
+  evaluation set and its judges, which is also how a viewer would check a roster
+  change of their own. The rationale for keeping frontier models on two roles
+  changed from "they have to argue" to what is actually true of them: they reason
+  over conflicting evidence, and they run a handful of times a day.
+
+  *Chapter 13 was one roadmap where there are two.* Writing back is now framed as
+  the human-in-the-loop question it is, with both routes named: a ticket raised in
+  ServiceNow, Maximo or SAP PM, which is what most plants want because nothing
+  inbound reaches the floor; or a direct MCP call for those that do want it.
+  Either way the tool is a granted object rather than a buried credential. Its ML
+  entry is retitled from "Where a model would go" to "Where machine learning
+  fits", and chapter 10's forward reference now names the chapter it lands in.
+
+  *And it mispronounced things.* "Gemma" came out with a hard g, "MLflow" as one
+  mangled word, and the two-minute film — which predates the convention of
+  spacing initialisms in the script — read "OEE" and "MCP" as words. Worst was
+  "line K P Is", where the voice took the plural for the verb and said "kay pee
+  is". A `SAID_AS` table in `build_film_vo.py` now respells those for the
+  synthesiser and **only** for the synthesiser: the script and the manifest keep
+  the real spelling, because they are the record of what the film says and the
+  tests read them. Two tests hold that line — one that every entry is applied,
+  one that no respelling has leaked back into a script. The KPI stream is renamed
+  in the narration rather than respelled, since `line_kpi` is singular anyway, and
+  chapter 8 now says "the Gemma model does the routing" so the name is heard as a
+  model and not as a person. `--only` re-renders named lines, so a wording fix
+  costs seconds instead of the eight minutes a full render takes.
+
+  Cutting the connection-pool backoff from chapter 2 (implementation detail a
+  viewer does not need) and the two stale notes changed every duration, so all
+  fourteen chapter windows were re-fitted to their measured narration and 105
+  reveals re-aligned. The film is **21.9 minutes and 93% narrated**, from 22.7 and
+  90%. The playback bar gained what a twenty-minute film needs: chapter numbers
+  that agree with the eyebrow on screen, five-second skips on buttons and on J/L,
+  and an introduction that is called one.
+
+- **The voice stopped spelling initialisms one laboured letter at a time.** The
+  script writes them spaced — "S Q L", "C M M S" — because that is how you read a
+  line out loud while editing it, but the synthesiser takes the spaces literally
+  and pauses between every character. A line carrying two of them sounds like
+  someone fighting the words. Spaced capitals are now hyphenated on the way to the
+  voice and nowhere else, which keeps the letters and drops the pauses: measured
+  in the same carrier sentence, "C-M-M-S" is 0.8s shorter than "C M M S" and
+  "ML-flow" 0.6s shorter than "M L flow". `LIMS` had the opposite fault — spelled
+  out when it is a word — and is respelled "Limz"; `CIP` needed spelling and was
+  not getting it. `SCADA` is deliberately left alone, because it was already being
+  read as a word and every attempt to help it made it slower. A test asserts that
+  no line reaches the synthesiser with spaced capitals still in it, so the next
+  initialism someone writes into the script is covered without being listed
+  anywhere.
+
+- **Chapter 8's roster arrived after the voice had already named it.** Every row
+  of the model table was revealed four to eight seconds late, and the lag grew
+  down the list, so "the Gemma model does the routing" played over an empty panel
+  and each row landed on a name the viewer had already heard. The seven rows and
+  four cards are re-aligned against measured phrase times rather than estimates,
+  so a row appears as its model is spoken.
+
+  The narration was also describing a different table from the one on screen. It
+  named eight models where the panel shows ten roles, and never accounted for the
+  bottom row at all, which is the row holding the other four. It now walks the six
+  individual roles and hands the last four to the row that carries them. Naming
+  each one *as a model* — "the G-P-T model" rather than a bare "G P T" — is what
+  makes a fast list of vendor names parse as English. The line runs five seconds
+  longer, so chapter 8 gained six seconds and the chapters after it moved to
+  match: the film is **22.1 minutes**, from 21.9.
+
+- **Chapter 9's roster was revealed on a metronome the narration does not
+  follow.** Its eight specialists came up on a single even 4.3s step, but the
+  voice does not introduce them evenly — the first four get a clause each and the
+  last four are rattled off — so the error accumulated to 3.7s by the eighth name.
+  Each row is now timed to the moment its specialist is named, which is what
+  chapter 8 already did and what an even step cannot express. Chapter 10 had the
+  same fault from the other direction: its seven solver rows ran 1.8s to 3.9s
+  *ahead* of the voice, with the gap widening down the list, so the last row had
+  been on screen for three seconds before it was mentioned.
+
+  Both were made worse by the re-render above. Shorter audio pulled the narration
+  earlier underneath reveals that stayed put, which is a hazard of hand-timing
+  against measured durations: any change to the voice moves the thing the numbers
+  were fitted to. The per-chapter drift is now measured against the previous
+  manifest after every render, so a chapter that has moved is reported rather
+  than found by watching.
+
+- **A closing note printed a chapter's punchline before the voice reached it.**
+  Chapter 1 ends on "the telemetry is synthetic, the platform underneath it is
+  real", set up by "one more thing before we start, because it changes how you
+  read everything else". An earlier pass had pulled that note back to 69.8s,
+  which put the answer on screen 4.2 seconds before the voice delivered it and
+  spent the set-up on a line the viewer had already read. It now waits for its
+  sentence.
+
+  It was found by measuring, not by watching. Every line was re-synthesised for
+  its phrase boundaries, the stage was stepped a quarter-second at a time to
+  record the moment each element actually reaches the screen, and the two were
+  matched so that each reveal could be compared with the phrase that introduces
+  it — 309 reveals against 249 phrases, across all fourteen chapters rather than
+  a sample. Everything else the pass flagged turned out to be sound on
+  inspection: a card timed to the phrase that opens its topic rather than the
+  clause that names it, a summary grid that recaps points made earlier, a code
+  comment that lands on the end of a long sentence instead of its start. Those
+  are how the film is meant to read, so they were left alone.
+
+- **The rendered MP4s carry chapter markers.** The playback bar is deliberately
+  kept out of the frame, which left a viewer of the video with no way to see the
+  shape of a twenty-minute film or move around it. MP4 has chapter tracks, so the
+  marks the stage already knows about are now written into the mux — QuickTime,
+  VLC and IINA give you a chapter list to jump with, and the same list is the one
+  you paste into a description. It is free: the marks exist, and the mux was a
+  stream copy either way.
+
+  `--remux` reuses the silent render instead of re-rendering twenty thousand
+  frames, which is what the script was already keeping that file for. Adding
+  chapters to both films took eleven seconds rather than half an hour.
+
+- **A film can now be folded into one file you can send someone.**
+  `scripts/build_film_standalone.py` inlines the narration as `data:` URIs, so the
+  deep dive becomes a single **10.6 MB** HTML that plays offline with its chapter
+  agenda and skip controls intact — against 35 MB for the MP4, which has neither.
+  The sidecar layout is right for the repository and wrong for email: someone
+  sent an HTML file and a folder of MP3s opens the one that does not talk.
+
+  It is derived, so it is written to `output/` and nothing depends on it.
+  `scripts/dev/check_film_standalone.mjs` copies each build to an empty temporary
+  directory before opening it, because testing it in place would pass even if the
+  audio were still being fetched from the folder beside it — which is the only
+  failure worth testing for.
+
+- **The deep-dive film answers the questions a reviewer actually asked of it.**
+  Ten of them, and most were not polish.
+
+  *It claimed there was no machine learning anywhere, which is not true.*
+  `estimate_rul` fits an OLS regression, and `data_calibration.py` learns the
+  quality CPTs from the event log and the forecaster's rate and MTTR from
+  production tables. Those are parameters fitted from data. What is genuinely
+  absent is a *trained, registered, served* model, and that is now the claim —
+  drawn in chapter 10, with chapter 13 saying where one would go in a real
+  deployment (a degradation model on run-to-failure history, a classifier on
+  inspection records, learned changeover times) and why there is not one here: the
+  line is a simulator, so a model trained on it would learn the simulator.
+
+  *Only one of the seven solvers was labelled.* All seven now carry the method
+  they run — MILP, stochastic MILP, MILP, Monte Carlo, Bayesian, Pareto, least
+  squares — and the narration names them in panel order so each tag lands as it is
+  spoken. A stray `"method": "benders_master"` left in the multi-shift planner's
+  infeasible branch is now `"milp"` like the branch beside it.
+
+  *Chapter 2 asserted two destinations without ever saying why.* The why is
+  latency: Bronze is queryable in 5–30 s, which is fine for analytics and far too
+  slow for a screen someone is watching, so the producer also writes Lakebase
+  directly. The Lakebase step was tagged `SECONDS`, which was simply wrong — it is
+  sub-second written and read in milliseconds; seconds belongs to the streaming
+  job between the two.
+
+  *Chapter 5's reveals ran about ten seconds ahead of the voice the whole way
+  through*, left over from before that chapter was rewritten for the shipped
+  Knowledge Assistant — the "17 documents" card landed twelve seconds before the
+  narration said "seventeen". All eight are re-pinned. Its limits are also
+  countable now: the narration said "two", the panel drew four rows, and one of
+  them mixed a limit with a billing note. Two rows are tagged `LIMIT 1` and
+  `LIMIT 2`; the cost note is a separate footnote that says it is not a limit.
+
+  *Chapter 13 framed its own honesty as a defence* — "three answers worth having
+  ready, because a technical room will find all three anyway" — while counting
+  three and drawing five. The framing is gone, the count is gone rather than
+  restated so it cannot drift again, and the panel is reordered to run one-to-one
+  with the narration. Its write-back roadmap is also corrected: the first write is
+  a **ticket** raised in ServiceNow, Maximo or SAP PM and approved where the
+  approval trail already lives — not a set point on the plant floor.
+
+  *Chapter 11 said the same thing three times*, in the subtitle at second one, in
+  the voice at twenty-two seconds and in a footnote at twenty-three. It now says
+  it once, where it is spoken, and the sentence about narrowing what a space can
+  see finally has a visual of its own.
+
+  *The two-minute intro landed on chapter 1 cold.* A bridging line hands over
+  from the product film to the deep dive, and the runtime promise moved into it so
+  it is stated once rather than twice.
+
+  Fourteen chapter windows were re-fitted around 104 narration lines: 21.0 minutes
+  of speech over 22.7 minutes of film, 93% of the running time narrated, no reveal
+  landing in silence, and no layout collisions.
+
+- **The deep-dive film was rewritten to sound like a person, and re-cut so what
+  is on screen is what is being said.** Watching it back turned up four separate
+  problems, three of them mechanical.
+
+  Reveals were spread across each chapter on an even stride, which is wrong for
+  the usual shape of a chapter: it narrates its four boxes in the first twenty
+  seconds and then talks around them for another forty. Chapter 2 said "signals
+  arrive over Zerobus" a second and a half in and drew the Zerobus box sixteen
+  seconds later. Panel items now carry their own `at`, so a reveal is pinned to
+  the sentence that makes it, and every one of them across fourteen chapters was
+  placed against the measured narration rather than a timer.
+
+  Chapter 1's three closing notes were anchored to the foot of a frame whose
+  lower two-thirds is the line animation, so they were printed over the machines
+  and the bottles. `Footnote` takes a `top`, and they sit in the band above the
+  line. `scripts/dev/check_film_layout.mjs` reported that frame as clean,
+  because it compared text against text and an illustration is not text; it now
+  treats a drawing larger than an icon as something you can collide with.
+
+  The narration claimed the agenda on the playback bar was clickable. It is —
+  in the HTML — but the bar is deliberately hidden when the film is captured, so
+  in the video that sentence pointed at nothing. It is gone.
+
+  And the prose read as machine-written, because it was: across 183 sentences it
+  used "rather than" fifteen times, ran a quarter of its sentences to six words
+  or fewer, and reached for an idiom whenever a plain verb would do. All 85
+  lines were rewritten for someone presenting in a second language — plain word
+  order, no inversions, a steadier sentence length, and the technical terms left
+  exactly as they were.
+
+  Three claims were also wrong. The film said about 120 bronze rows a second; the
+  producer emits 102, because the estimate it came from assumes all 34 materials
+  report and only 16 are tracked. It said six source systems as though six
+  systems were feeding it, when there is no `source_system` column anywhere and
+  one simulator writes all six streams. And chapter 5 called plant documents
+  roadmap — which they were when it was written, and stopped being when the
+  knowledge assistant shipped in this same release. That chapter now describes
+  what was actually built, including that retrieval belongs to the managed
+  service and the P&ID in the corpus is a written narrative rather than the
+  drawing.
+
+  Two things were added because a technical room asks for them. Chapter 8 says
+  why each model holds its role: five of the ten run on open weights, the
+  frontier models are kept for the two roles that argue, capability constraints
+  ruled some endpoints out, and exactly one head-to-head comparison was measured
+  — the shift briefing — which the film says out loud rather than implying a
+  bake-off nobody ran. And the two-minute film now plays first as chapter 0, so
+  the business case arrives before the architecture. Its scenes and its narration
+  are reused whole; the deep dive's own chapters are still authored from zero and
+  shifted by `INTRO`, so the script and the film stay editable against the same
+  clock. Twenty minutes, 92% narrated, fifteen chapters in the agenda.
+
+  A test now fails if a reveal lands while nothing is being said, which is the
+  mechanical half of the Zerobus bug. The semantic half — whether the voice is
+  discussing *that* box — is not checkable, and the test says so.
+
+- **The deep-dive film's timings are computed, not authored, and it stopped
+  running out of things to say.** Chapter lengths were round numbers and the
+  narration was written to taste, which is a combination that only works by
+  luck. It did not: the film was 56% narrated against the two-minute film's 95%,
+  and the silence was not spread thinly — it pooled at the end of every chapter,
+  up to thirty-two seconds of it in one. The visuals had the same shape, with
+  every chapter revealing its whole layout inside eleven seconds and then
+  holding a still frame. Seven minutes of a fifteen-minute film was a static
+  image in silence.
+
+  Lines now declare only the chapter they belong to. `scripts/build_film_vo.py`
+  renders each one, measures it, and packs the chapter end to end, writing the
+  resulting start back into the script; chapter windows are then sized to what
+  the packing needs. A chapter that cannot hold its narration, or that runs dry
+  before its end, fails the build rather than shipping. The film is 92% narrated
+  — the remainder is a deliberate beat before a chapter speaks and after it
+  stops — and no gap anywhere exceeds six seconds.
+
+  The panels take a `step` so a scene can spread its reveals across the lines
+  spoken over it, and `Footnote` takes a `bottom` so a chapter with more spoken
+  beats than panels can stack its closing notes. All fourteen chapters now
+  reveal something until the voice stops. Four tests pin this: narration
+  density, per-chapter silence, reveal spread, and that every line files under a
+  chapter that exists. `scripts/dev/check_film_layout.mjs` samples the last
+  frame of each chapter and measures the rendered boxes for collisions, because
+  hand-placed stacking against panels of data-dependent height is right when it
+  is written and wrong two edits later.
+
+- **Four things the deep dive should have covered and did not.** Agent memory is
+  shipped — conversations persist in Lakebase Postgres and a follow-up carries
+  the last few turns — but all five mentions of Lakebase were about the serving
+  layer, so the film implied every question starts from nothing. MCP and Unity
+  Catalog functions were absent entirely despite being the "can it act rather
+  than answer" question, and are now named in the limits chapter under the same
+  ROADMAP badge the short film uses. The technical answers that were already
+  sitting in the code went in: the one-second server-sent event cadence, and the
+  connection breaker that opens after three failures and backs off rather than
+  hanging. Deployment is stated as one asset bundle and one command.
+
+  Governance gained the honest version rather than the requested one. The ask
+  was lineage, audit, and row and column controls; the accelerator implements
+  none of them, so the film says which grants it does use and then says plainly
+  that it uses no row filters, no column masks, and no audit beyond what Unity
+  Catalog records on its own. Classical ML was on the plan as "shipped, briefly"
+  and is not shipped — `estimate_rul` is trend extrapolation to a threshold and
+  there is no trained model in the repository — so the solvers chapter now says
+  that out loud instead of leaving the impression open.
+
+- **The line schematic is drawn on the page's own colours.** It was rendered on
+  a fixed near-black canvas, on the argument that a control room is dark and
+  emissive colour on black is how a status reads from across a room. True of a
+  control room, false of this app: the schematic is embedded in a white tab, so
+  the effect was a hole in the middle of Line Status with its own contrast rules
+  and its own idea of what grey means. It now uses the slate ramp the rest of
+  the app is built from.
+
+  Machine states went one step darker with it. The mid-tone tints were chosen to
+  glow on black; on white, yellow-500 is under 2:1, and a degraded machine's
+  rate was legible only if you already knew what it said. The 600 weights hold
+  up as small text and as a 2px border without changing which colour means what.
+
+- **The schematic takes 16% less height** — 807 px to 680 px at the width it
+  renders at. The vertical bands were round numbers; they are now derived from
+  the two things that actually sit outside a station, the supply chip hanging
+  above it and the two lines of instrument text below, plus breathing room. The
+  card also stacked two headers and two borders to say "Production Line" above
+  "Live line schematic", which is the same sentence twice for about fifty
+  pixels, so there is one header now and the data-source badge moved into it.
+
+- **The film is a build output now, not the master copy.** Its JSX lived only as
+  a gzipped, base64-encoded blob inside the bundled HTML, so the only way to
+  change anything was string replacement against decompressed JavaScript —
+  workable for retitling a panel, hopeless for writing a scene, and it meant
+  nobody who cloned the accelerator could rebuild the film at all. The source
+  moved to `film/src/movie.jsx` and `scripts/build_film.py` puts it back into the
+  bundle. Verified by rebuilding the committed film byte-for-byte from the
+  extracted source before changing a line of it.
+
+  Gzip is pinned to a fixed mtime so an unchanged source does not produce a new
+  checksum on every run, and the build rewrites only the film entry — the
+  generated runtime and two dozen embedded fonts are copied through untouched.
+
+  Freshness is judged on the film the bundle carries rather than on the bytes
+  that encode it, because CPython changed the OS byte gzip stamps into its header
+  between 3.9 and 3.11: the same source compressed by each differs by exactly one
+  byte with identical contents. Comparing bytes made `--check` call a
+  just-built film stale depending on which interpreter ran it, and had two
+  developers rewriting the same 750 KB artefact back and forth forever.
+
+- **`scripts/mirror_public.sh` builds the public release commit.** The public
+  repository is a chain of squashed commits, each a copy of this tree, so
+  everything tracked here is published unless something withholds it — and that
+  something was a person remembering to delete files before pushing. Now
+  `scripts/public-exclude.txt` names what stays internal and the script refuses
+  to publish a tree that still contains one of those paths, that has a document
+  linking a file it no longer ships, or that cannot build and pass its own checks
+  without them. It verifies by default and pushes only when asked.
+
+- **`scripts/dev/smoke_film.mjs`** opens a film in a real browser and checks the
+  stage mounts, the clock advances, the agenda lists what it should and clicking
+  a chapter seeks to it. A JSX mistake survives the Python round-trip intact and
+  fails at Babel time in the page, leaving a black canvas and a console error
+  nobody reads; this is what catches that.
+
+- **`scripts/dev/capture_film.mjs`** records a film to MP4 by stepping the clock
+  frame by frame and piping screenshots into ffmpeg, then lays the narration onto
+  its cues and muxes. Deterministic rather than a real-time screen capture, so
+  the output does not depend on how busy the machine was, and no frames are
+  dropped on a slow reveal.
+
+- **`scripts/build_film_vo.py`** renders narration from a script in `film/vo`,
+  measures what came back, and fails rather than shipping a film that talks over
+  itself when a line outlasts its slot.
+
+### Fixed
+
+- **`build_film.py` credited the wrong source when it rebuilt the deep dive.** It
+  reported building "from `film/src/movie.jsx`" whichever film it had written,
+  which is half true — the deep dive's bundle is the short film's source with its
+  own scenes appended — and misleading for exactly the person reading the line to
+  work out which file to edit. It now names both.
+
+- **Pausing a film looped the last word of narration forever.** The films
+  publish their clock to `localStorage` and the voice player infers the rest,
+  because there is no pause event for it to listen to — so "paused" means the
+  clock has not moved for a moment. It was measuring that moment from the
+  *previous frame* rather than from the last time the clock actually moved, and
+  `tick()` runs on `requestAnimationFrame`: the gap is always about 16ms, so the
+  `> 0.12s` test could never fire and `playing` latched true the first time the
+  film advanced.
+
+  What that produced is the bug as reported. With `playing` stuck true the
+  player kept running against a frozen offset while the `<audio>` element
+  carried on, and the moment the element drifted more than 0.25s past that
+  offset the resync yanked it back — replaying the same quarter second for as
+  long as the film sat paused. A browser probe counts eight of those rewinds in
+  two and a half seconds against the old code, and none against the new.
+
+  Fixed in the generator (`scripts/build_film_vo.py`) and in the short film's
+  hand-maintained copy, which carries the same player. `scripts/dev/check_film_pause.mjs`
+  drives a real browser and asserts both films go silent on pause; a cheaper
+  test in the gate pins all three files to measuring from the last advance,
+  since the two player copies can otherwise drift apart. The captured MP4s are
+  unaffected — they mux their own audio and never run this code.
+
+- **Five releases linked to tags that were never published.** From 0.3.5 the
+  public repository stopped being a remote of this one and started receiving
+  squashed commits tagged `vX.Y.Z-public`, but the changelog kept writing
+  `vX.Y.Z`. Every release link from 0.3.5 to 0.3.9 was a 404 — on the one page a
+  reader uses to find the code behind a version. The markdown was well-formed
+  and the headings read correctly, so nothing here could see it; only GitHub
+  knew the tag was missing. The links now carry the suffix, and a test derives
+  the expected tag from the `TAG=` assignment in `scripts/mirror_public.sh`
+  rather than restating it, so renaming the convention moves the test with it.
+  The existing check only asked whether a link existed, which these all did.
+
+- **A timed-out specialist kept running, holding a worker nobody was waiting
+  for.** `future.result(timeout=…)` releases the caller, not the thread, and the
+  synchronous path ran one blocking `agent.invoke` with no seam to check — so a
+  question that was already answered with "the analysis timed out" went on
+  occupying one of six pool slots until its model and tools finished on their
+  own. Six of those and the pool is starved for everyone, which is the failure
+  widening it to six was meant to prevent. The path now drives the graph with
+  `stream(stream_mode="values")`, whose last emission is what `invoke` returned
+  anyway, and checks a cancellation flag between super-steps — the mechanism the
+  streaming path already used. The overrun is bounded to the one call in flight
+  rather than the whole run.
+
+- **The synthesis pass was skipped on the answers that most needed it.** Two
+  heuristics decided whether to reformat a specialist's prose into the `## Root
+  Cause` cards the UI folds, and both failed in the same direction. Length stood
+  in for structure — anything over 800 characters was assumed "likely already in
+  the right shape", when a long ReAct answer with no headings is exactly the one
+  worth folding. And the failure test was a substring search for "timed out"
+  anywhere in the text, so a real downtime analysis of a PLC that timed out
+  skipped its own formatting. The gate now asks the question it was approximating:
+  does the answer already carry the headings `ChatPanel` parses? A test holds that
+  section list against the TypeScript one, since it is now written in two places.
+  Timeouts and errors are matched against the exact sentences this module builds,
+  anchored at the start, and a much higher ceiling remains for answers long enough
+  that a second pass would truncate rather than restructure.
+
+- **The multi-shift planner described an algorithm it has never run.** Three
+  places said three different things: the class docstring said Benders
+  decomposition, the `@tool` description said "sequential optimization" that
+  "calls schedule_recovery per shift", and the result was branded
+  `"method": "benders_master"`. What runs is one monolithic SCIP MILP that
+  decides every shift together — the decomposition failed to build, which is why
+  it was replaced. The numbers were never wrong, but a tool description is
+  prompt text and the result is in the model's context, so an operator asking
+  how the plan was produced could be told in fluent prose about a method that
+  has never executed. All three now describe the model that runs, the label
+  matches what `schedule_recovery` calls its own solver path, and a test holds
+  the description to it.
+
+- **The slow-scan Lakebase path sat outside the circuit breaker.**
+  `new_readonly_connection` opens its own socket per call and had neither the
+  entry check nor the failure recording that `get_connection` has, so during an
+  outage it paid the full ten-second connect timeout every time — and an outage
+  that only it noticed never tripped the breaker for anyone. It was the worst
+  path to leave outside: the slow scans are the ones most likely to be running
+  while Lakebase is already struggling. It now checks on the way in and records
+  both outcomes, successes included, because the cooldown doubles on every trip
+  and only a success resets it.
+
+- **A SQL keyword could hide behind punctuation.** The guard split on
+  whitespace, so `SELECT 1; DROP TABLE t` was caught and `SELECT 1;DROP TABLE t`
+  was not — `1;DROP` is one token and matches no keyword. It now tokenises on
+  word boundaries, and strips quoted spans first, which also stops a machine
+  note reading `'PENDING UPDATE'` from being rejected as a forbidden keyword.
+  The prefix gate and the read-only warehouse permissions were always the real
+  controls; this is the belt-and-braces layer working as intended.
+
+- **A Genie space was created and granted on every deploy that nothing could
+  call.** Alongside the four per-domain governed spaces, `deploy.sh` built a
+  combined one over all twelve MVM tables — but no env var ever carried its id
+  into the app, and `governed_domain_query` never referenced it, so it answered
+  nobody while costing a space and a `CAN_RUN` grant per deploy. It was the
+  predecessor of the per-domain split, which covers the same tables and which
+  `genie_space_config_mvm.py` itself argues is the more accurate shape: "a space
+  holding two well-described tables answers far more reliably than one holding
+  twelve." Removed from `deploy.sh` and the settings template; `cleanup.sh` still
+  reads the old key so an environment provisioned before this collects its
+  orphan instead of leaking it. A test asserts every invocation is
+  domain-scoped. This also settles the "five Genie spaces" count that read
+  differently in each document — it is now four governed domains plus line ops,
+  on every surface.
+
+- **Documentation that had drifted from the code.** `ARCHITECTURE.md` claimed a
+  90-second specialist timeout after the default was raised to 150, and the
+  doc-claims guard pinned the recursion limit but not the timeout, which is why
+  it drifted uncaught — the guard now pins both. The Tools table omitted the
+  `governed_*_query` tool every governed specialist binds. The source tree
+  listed a `hitl/` package that had held no sources since the approval flow was
+  removed, and the layer table still credited the orchestrator with
+  "human-in-the-loop approval" that does not exist. The README said two
+  specialists read line ops where the code binds three. The About tab's Model
+  Serving row named GPT-5-mini for routing and GPT-5 for strategy long after
+  those became Gemma 3 12B and Claude Opus 5; it no longer names models at all,
+  because the live per-role roster is rendered from `/ops/models` further down
+  the same page and the second copy could only ever go stale. `constraint_loader`
+  read a catalog and a schema from the environment and used neither, since
+  `sql_query` sets both on the connection; the anomaly detector named a table
+  it does not query; and `_ops_user` now states the trust boundary it depends
+  on — the forwarded identity headers are only meaningful because Databricks
+  Apps overwrites what the client sent.
+
+### Security
+
+- **Fifteen of the nineteen advisories in the dependency trees are closed, and
+  the four that remain are two findings counted twice.** On the npm side
+  `js-yaml` 4.3.1, `dompurify` 3.4.13 and `nanoid` 3.3.18 are pinned forward
+  through `overrides` — quadratic CPU on `!!omap`, a detached subtree left
+  executable after an `IN_PLACE` hook removal, and an infinite loop on a zero
+  size. All 938 npm packages are now clean.
+
+  On the Python side `cryptography` moved 48.0.1 → 49.0.0, closing an
+  exponential certificate path-building denial of service and a wildcard-DNS
+  escape from `permittedSubtrees`, which also pulls `mlflow` to 3.15.1 because
+  that is the release that relaxed its `cryptography<49` pin. That floor is
+  recorded as a `[tool.uv] constraint-dependencies` entry rather than applied by
+  hand: an ad-hoc `uv lock --upgrade-package` does not survive the next
+  `uv sync`, which silently put 48.0.1 back the first time. It is a constraint
+  and not a dependency because nothing here imports `cryptography` — the project
+  only cares which version arrives.
+
+  Six more advisories against `gitpython` and two against
+  `langgraph-checkpoint-postgres` turned out to be scanning artefacts rather
+  than shipped code: the lockfile was already past the `gitpython` fix and the
+  local environment was behind it, and the checkpointer was a stray install that
+  no import in the repository references. Both are gone now that the environment
+  is synced to the lock. `SECURITY.md` records what is left — one `cryptography`
+  and one `protobuf` advisory, each held below its fix by an upstream pin and
+  neither on a code path this application exercises.
+
 ## [0.3.9] - 2026-08-10
 
 ### Security
@@ -2264,11 +3013,12 @@ GenAI copilot for production-line operations, real-time streaming
 simulator (Zerobus → Lakebase), one-command `deploy.sh`, Data Quality
 dashboard, and a baseline MLflow eval harness.
 
-[0.3.9]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.3.9
-[0.3.8]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.3.8
-[0.3.7]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.3.7
-[0.3.6]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.3.6
-[0.3.5]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.3.5
+[0.4.0]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.4.0-public
+[0.3.9]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.3.9-public
+[0.3.8]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.3.8-public
+[0.3.7]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.3.7-public
+[0.3.6]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.3.6-public
+[0.3.5]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.3.5-public
 [0.3.4]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.3.4
 [0.3.3]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.3.3
 [0.3.2]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.3.2

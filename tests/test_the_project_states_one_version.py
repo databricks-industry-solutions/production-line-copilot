@@ -74,3 +74,45 @@ def test_every_released_version_links_to_its_tag():
         f"CHANGELOG.md has sections with no link definition: {missing}. "
         "Add a '[x.y.z]: <release url>' line at the foot of the file."
     )
+
+
+# The release before the public mirror existed. From 0.3.5 the public repository
+# stopped being a remote of this one and started receiving squashed commits
+# tagged by scripts/mirror_public.sh, which suffixes them. Anything older was
+# pushed directly and carries a bare tag.
+FIRST_MIRRORED_RELEASE = (0, 3, 5)
+
+
+def test_every_link_points_at_the_tag_the_mirror_actually_publishes():
+    """A link to a tag that was never pushed is a 404, and it renders fine here.
+
+    Five releases shipped pointing at `v0.3.5` through `v0.3.9`, none of which
+    exist: the mirror publishes `v0.3.9-public`. The changelog is the one page a
+    reader uses to find the code for a version, so every one of those was a dead
+    end, and the failure is invisible from inside the repository — the markdown
+    is well-formed and only GitHub knows the tag is missing.
+    """
+    mirror = (ROOT / "scripts" / "mirror_public.sh").read_text(encoding="utf-8")
+    template = re.search(r'^TAG="([^"]+)"', mirror, re.M)
+    assert template, "scripts/mirror_public.sh no longer assigns TAG; update this test."
+    # v${VERSION}-public -> the suffix the published tag carries.
+    suffix = template.group(1).replace("v${VERSION}", "")
+
+    changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    links = re.findall(r"^\[(\d+\.\d+\.\d+)\]:\s*(\S+)$", changelog, re.M)
+    assert links, "CHANGELOG.md has no release link definitions at all."
+
+    wrong: list[str] = []
+    for version, url in links:
+        mirrored = tuple(int(p) for p in version.split(".")) >= FIRST_MIRRORED_RELEASE
+        expected = f"v{version}{suffix}" if mirrored else f"v{version}"
+        actual = url.rsplit("/", 1)[-1]
+        if actual != expected:
+            wrong.append(f"  [{version}] points at {actual!r}, expected {expected!r}")
+
+    assert not wrong, (
+        "CHANGELOG.md links to tags that were never published:\n"
+        + "\n".join(wrong)
+        + f"\n\nReleases from {'.'.join(str(p) for p in FIRST_MIRRORED_RELEASE)} on are "
+        f"tagged {suffix!r} by scripts/mirror_public.sh."
+    )

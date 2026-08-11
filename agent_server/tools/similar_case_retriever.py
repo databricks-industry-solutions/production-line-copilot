@@ -3,13 +3,13 @@
 Specialists call this to ground their recommendations in past resolutions
 ("how did we recover the last time the FILLER seized?").
 
-Two retrieval paths. Vector Search runs when ``VS_ENDPOINT`` names a
+Two retrieval paths. AI Search runs when ``VS_ENDPOINT`` names a
 provisioned endpoint; otherwise a keyword match over ``gold_history_event_log``
 does. Which one answered is reported rather than assumed: every returned row
 carries a ``retrieval`` field of ``vector_search`` or ``keyword``, and
 ``match_score`` is 0 when nothing in the text matched.
 
-Vector Search is opt-in (an endpoint bills hourly, and the deploy that creates
+AI Search is opt-in (an endpoint bills hourly, and the deploy that creates
 one takes 15-40 minutes), so the keyword path is not a degraded mode — at tens
 of events per shift, token overlap is a fair substitute for embeddings. It is
 the default and it is expected to run.
@@ -78,7 +78,7 @@ def retrieve_similar_cases(
 ) -> list[dict]:
     """Find past events resembling the one described, with how they were resolved.
 
-    Matches semantically when a Vector Search index is provisioned, and by
+    Matches semantically when an AI Search index is provisioned, and by
     keyword overlap on the event narrative otherwise. Every returned row says
     which it was in a `retrieval` field, alongside `match_score` — check them
     before describing a result as a close match, because keyword overlap can
@@ -137,7 +137,7 @@ def retrieve_similar_cases(
         # by the hour whether or not anything successfully queries it. A
         # provisioned index that never gets used looks identical, from the
         # outside, to one that works.
-        logger.warning("Vector Search unavailable, falling back to keyword match: %s", e)
+        logger.warning("AI Search unavailable, falling back to keyword match: %s", e)
         return _keyword_search(description, machine_id, event_type, top_k)
 
 
@@ -149,7 +149,7 @@ def _parse_results(results: dict | None) -> list[dict]:
     KeyError on every response, which the caller's except caught and turned
     into a keyword-search fallback — so this path returned results that looked
     entirely reasonable and were never semantic. Between that and the auth bug
-    above, Vector Search had never once run in the deployed app.
+    above, AI Search had never once run in the deployed app.
     """
     if not results:
         return []
@@ -160,7 +160,7 @@ def _parse_results(results: dict | None) -> list[dict]:
         columns = (results.get("result") or {}).get("columns")
     if not columns:
         raise ValueError(
-            f"no column manifest in the Vector Search response (keys: {sorted(results)})"
+            f"no column manifest in the AI Search response (keys: {sorted(results)})"
         )
 
     names = [c["name"] if isinstance(c, dict) else str(c) for c in columns]

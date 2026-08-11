@@ -1,0 +1,30 @@
+# Paths that live in this repository but must never reach the public mirror.
+#
+# The public repository is not a remote of this one in the usual sense: each
+# release is a single squashed commit whose tree is a copy of this tree,
+# parented on the previous public commit. A copy of the whole tree is the
+# default, so anything tracked here is published unless it is named below.
+#
+# `scripts/mirror_public.sh` reads this file, strips these paths from the tree
+# it publishes, and refuses to build a mirror that still contains them. Keeping
+# the list here rather than in the script means the tests can read it too, and
+# that adding an internal-only asset is a one-line change rather than an edit to
+# a shell script nobody remembers to look at.
+#
+# A path listed here still has to leave the *published tree coherent*: the
+# public copy has to build and its checks have to pass without it. For the deep
+# dive that is why its scenes live in their own source file and its build target
+# is optional — see the header of scripts/build_film.py.
+#
+# Directories may be listed without a trailing slash; they are stripped
+# recursively.
+
+# The deep-dive film: a twenty-minute internal walkthrough of how the system is
+# built. Recorded for one customer conversation, it names things the public
+# accelerator does not promise and shows roadmap features beside shipped ones.
+# The two-minute film in docs/media/prodline_copilot_film.html is the public one.
+film/src/deep_dive.jsx
+film/vo/deep_dive.json
+docs/media/prodline_copilot_deep_dive.html
+docs/media/prodline_copilot_deep_dive.mp4
+docs/media/prodline_copilot_deep_dive_vo
