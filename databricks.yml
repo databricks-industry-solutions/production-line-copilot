@@ -132,22 +132,27 @@ resources:
       display_name: '${var.app_name} — Data Quality'
       file_path: ./dashboards/data_quality.lvdash.json
       warehouse_id: ${var.sql_warehouse_id}
-      # Publish with the deploy identity's credentials so the app's embedded
-      # iframe renders widgets for viewers (otherwise every widget shows
-      # "Unable to render visualization."). Whether `bundle deploy` also
-      # *publishes* depends on the CLI version, and this comment used to claim
-      # it made the embed self-sufficient — it did not, in at least one
-      # workspace, where the tab showed "The resource is not available".
-      # scripts/ensure_dashboard_embed.py now verifies publish state after the
-      # deploy and repairs it, so this field sets the credential mode and
-      # nothing depends on it having published anything.
+      # Published on the credentials of whoever opens it. This was `true` while
+      # the app embedded the dashboard in an iframe, which only renders widgets
+      # if the queries run as the publisher — a privilege elevation for every
+      # viewer, and the reason the embed needed propping up at all. The app now
+      # draws those figures itself from /ops/quality-metrics and merely links
+      # here, so nothing needs the publisher's credentials.
+      #
+      # This field states the intent; it does not enforce it. `bundle deploy`
+      # publishes the dashboard itself and, on the CLI versions seen here, does
+      # so with embedded credentials regardless of what this says — verified on
+      # a dev deploy that turned them back on. scripts/ensure_dashboard_access.py
+      # reads the publish state back afterwards and republishes without them,
+      # which is also what upgrades an environment deployed from an older
+      # version of this repo.
       #
       # The App SP CAN_READ grant needed to *resolve* the dashboard
       # (/ops/dashboard-info) is added per-target in config/bundle-targets.yaml
       # once the App SP client id is known (see scripts/sync_project_settings.py
       # :: _data_quality_dashboard_permissions_block). Human viewers are granted
-      # by ensure_dashboard_embed.py — the bundle grants no one but the SP.
-      embed_credentials: true
+      # by ensure_dashboard_access.py — the bundle grants no one but the SP.
+      embed_credentials: false
 
   apps:
     app:

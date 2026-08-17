@@ -1,14 +1,22 @@
 /**
  * Data Integrity: the single "can I trust these numbers?" surface.
- * Used by `App`. Combines the two halves of that question — the quality-gate
- * dashboard (what the gate caught) and reconciliation (whether anything slipped
- * past unnoticed) — because either one alone answers it only partially.
- * Treats dashboard metadata lookup as optional so the tab remains useful when
- * bundle resources are missing.
+ * Used by `App`. Combines the two halves of that question — what the quality
+ * gate caught, and whether anything slipped past it — because either one alone
+ * answers it only partially.
+ *
+ * The gate half used to be an embedded AI/BI dashboard. The iframe needed the
+ * dashboard published with `embed_credentials`, which runs its queries as the
+ * publisher rather than as the viewer, plus CAN_READ for the app service
+ * principal on both the dashboard and its parent folder — and it still failed
+ * on browsers that decline third-party cookies. It is drawn here instead, from
+ * the same SQL, and the dashboard stays one click away for anyone who wants to
+ * explore rather than glance.
  */
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState } from 'react';
 
+import { useQualityMetrics } from '../lib/useQualityMetrics';
 import { useReconciliation } from '../lib/useReconciliation';
+import QualityGatePanel from './QualityGatePanel';
 import { ReconciliationRail, ReconciliationVerdict } from './Reconciliation';
 
 type DashboardInfo = {
@@ -18,69 +26,27 @@ type DashboardInfo = {
   embed_url: string | null;
 };
 
-type DashboardInfoResponse = DashboardInfo & {
-  error?: string;
-};
-
-type LoadState = 'loading' | 'ready' | 'error';
-
 export default function DataQualityTab() {
-  const [info, setInfo] = useState<DashboardInfo | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [state, setState] = useState<LoadState>('loading');
+  const [dashboardUrl, setDashboardUrl] = useState<string | null>(null);
   const reconciliation = useReconciliation();
+  const quality = useQualityMetrics();
 
-  const load = useCallback(async (options?: { showLoading?: boolean }) => {
-    const showLoading = options?.showLoading ?? true;
-    if (showLoading) {
-      setState('loading');
-    }
-    setError(null);
-    try {
-      const res = await fetch('/api/ops/dashboard-info');
-      const json = (await res.json()) as DashboardInfoResponse;
-      if (!res.ok || json.error) {
-        setError(typeof json.error === 'string' ? json.error : `HTTP ${res.status}`);
-        setInfo(null);
-        setState('error');
-        return;
-      }
-      setInfo(json);
-      setState('ready');
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : 'Unknown error';
-      setError(msg);
-      setInfo(null);
-      setState('error');
-    }
-  }, []);
-
+  // Only to offer the link. The tab no longer depends on the dashboard being
+  // reachable, published or readable, so a failure here is silent by design:
+  // the deep link disappears and every figure on the page still renders.
   useEffect(() => {
     let cancelled = false;
-
     void (async () => {
-      setError(null);
       try {
         const res = await fetch('/api/ops/dashboard-info');
-        const json = (await res.json()) as DashboardInfoResponse;
-        if (cancelled) return;
-        if (!res.ok || json.error) {
-          setError(typeof json.error === 'string' ? json.error : `HTTP ${res.status}`);
-          setInfo(null);
-          setState('error');
-          return;
-        }
-        setInfo(json);
-        setState('ready');
-      } catch (e: unknown) {
-        if (cancelled) return;
-        const msg = e instanceof Error ? e.message : 'Unknown error';
-        setError(msg);
-        setInfo(null);
-        setState('error');
+        if (!res.ok) return;
+        const json = (await res.json()) as DashboardInfo;
+        if (cancelled || !json.embed_url) return;
+        setDashboardUrl(json.embed_url.replace('/embed/dashboardsv3/', '/dashboardsv3/'));
+      } catch {
+        // No link, no problem.
       }
     })();
-
     return () => {
       cancelled = true;
     };
@@ -91,9 +57,10 @@ export default function DataQualityTab() {
       <div>
         <h2 className="text-lg font-semibold">Data Integrity</h2>
         <p className="mt-0.5 max-w-4xl text-xs text-muted-foreground">
-          Two independent checks on the same question. The dashboard shows what the streaming quality gate caught —
-          pass rate, per-table freshness, reject reasons. The panel beside it checks the live and analytics planes
-          against each other, so anything that slipped past the gate unnoticed still shows up.
+          Two independent checks on the same question. The left shows what the streaming quality
+          gate caught — pass rate, per-table freshness, reject reasons. The panel beside it checks
+          the live and analytics planes against each other, so anything that slipped past the gate
+          unnoticed still shows up.
         </p>
       </div>
 
@@ -104,91 +71,41 @@ export default function DataQualityTab() {
         onReload={reconciliation.reload}
       />
 
-      {/* The embedded Lakeview dashboard doesn't reflow into a narrow column —
-          it keeps the wider side, and the reconciliation detail is laid out for
-          the rail rather than being the full-width table squeezed in. Splitting
-          only at xl: below ~1280px the dashboard's share drops under ~700px,
-          where its own widgets start scrolling internally, so stacking at full
-          width beats two cramped columns. */}
+      {/* Split only at xl: the gate panel carries four counters and two charts
+          side by side, and below ~1280px they stack into a column too narrow to
+          read next to the reconciliation rail. */}
       <div className="grid grid-cols-1 gap-4 xl:grid-cols-5">
         <section className="xl:col-span-3">
           <div className="mb-2 flex items-center justify-between gap-2">
             <h3 className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-              Quality gate — AI/BI dashboard
+              Quality gate — last {quality.data?.window_hours ?? 24} hours
             </h3>
             <div className="flex items-center gap-2">
-              {info?.embed_url && (
+              {dashboardUrl && (
                 <a
                   className="text-xs underline text-muted-foreground hover:text-foreground"
-                  href={info.embed_url.replace('/embed/dashboardsv3/', '/dashboardsv3/')}
+                  href={dashboardUrl}
                   target="_blank"
                   rel="noreferrer"
                 >
-                  Open in Databricks
+                  Explore in Databricks
                 </a>
               )}
               <button
                 type="button"
                 className="rounded border border-border bg-background px-2 py-1 text-xs hover:bg-accent"
-                onClick={() => {
-                  void load();
-                }}
+                onClick={quality.reload}
               >
                 Reload
               </button>
             </div>
           </div>
 
-          {state === 'loading' && (
-            <div className="flex h-[calc(100vh-365px)] min-h-[460px] items-center justify-center rounded-md border border-border text-sm text-muted-foreground">
-              Loading dashboard…
-            </div>
-          )}
-
-          {state === 'error' && (
-            <div className="rounded-md border border-destructive/40 bg-destructive/5 p-3 text-xs text-destructive">
-              <div className="font-medium">Dashboard not available.</div>
-              {/* pre-wrap: the server returns a copy-pasteable CLI command on
-                  its own line when the dashboard exists but is unpublished. */}
-              <div className="mt-1 whitespace-pre-wrap break-words font-mono opacity-80">{error}</div>
-              <div className="mt-2 text-foreground opacity-70">
-                <div className="mb-1">
-                  Most common cause after a fresh deploy: the app SP lacks CAN_READ on the Lakeview dashboard (or its
-                  parent folder), or the dashboard was not published with <code>embed_credentials=true</code>. Both are
-                  non-DAB steps run by <code>scripts/grant_app_jobs_view.sh</code>.
-                </div>
-                <div>
-                  Fix: re-run <code>./scripts/deploy.sh prod</code> (it now invokes the grant script post-deploy), or run{' '}
-                  <code>scripts/grant_app_jobs_view.sh</code> manually with <code>DASHBOARD_ID</code> +{' '}
-                  <code>WAREHOUSE_ID</code> set, then click <strong>Reload</strong>.
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* Height is sized to the fold: the app chrome, tab bar, page header
-              and verdict strip take ~365px above this. */}
-          {state === 'ready' && info?.embed_url && (
-            <div className="h-[calc(100vh-365px)] min-h-[460px] overflow-hidden rounded-md border border-border">
-              {/* If widgets render "Unable to render visualization." inside this iframe,
-                  the dashboard isn't published with embed_credentials=true. Run
-                  scripts/grant_app_jobs_view.sh (or ./scripts/deploy.sh prod which now
-                  invokes it post-deploy) to publish + grant CAN_READ to the app SP. */}
-              <iframe
-                title="Data Quality dashboard"
-                src={info.embed_url}
-                className="h-full w-full"
-                allow="clipboard-write"
-              />
-            </div>
-          )}
-
-          {state === 'ready' && !info?.embed_url && (
-            <div className="rounded-md border border-amber-500/40 bg-amber-500/5 p-3 text-xs">
-              Dashboard found (id <code>{info?.id}</code>) but no host configured. Set
-              <code className="ml-1">DATABRICKS_HOST</code> on the app and reload.
-            </div>
-          )}
+          <QualityGatePanel
+            data={quality.data}
+            loading={quality.loading}
+            error={quality.error}
+          />
         </section>
 
         <aside className="xl:col-span-2">

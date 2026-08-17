@@ -1,30 +1,31 @@
 #!/usr/bin/env python3
-"""Make the Data Quality dashboard actually embeddable, and prove it.
+"""Make the Data Quality dashboard openable, and prove it.
 
-The Data Quality tab embeds ``/embed/dashboardsv3/<id>``, which resolves only
-for a *published* dashboard that the viewer can read. Three things have to be
-true and each of them used to be assumed rather than checked:
+The app no longer embeds this dashboard — the Data Integrity tab draws those
+figures itself from ``/ops/quality-metrics`` — but the dashboard is still
+deployed and still linked from that tab as the place to explore rather than
+glance. So two things have to be true, and each of them used to be assumed
+rather than checked:
 
-  1. the dashboard exists in this workspace
-  2. it is published, with embed_credentials so its queries run as the
-     publisher instead of as the iframe viewer
-  3. the app service principal can read it, and so can the humans opening the
-     tab
+  1. the dashboard exists in this workspace and is published, so the link opens
+     a dashboard rather than an editor
+  2. the app service principal can read it (that is how the tab resolves the
+     link at all, via ``/ops/dashboard-info``), and so can the humans clicking
+     it
 
-The bundle declares ``embed_credentials: true``, and recent CLI versions do
-publish on deploy — but that is a version-dependent behaviour we cannot rely on
-in a repo other people deploy, and the grants were only ever applied by a bash
-script that ran under scripts/deploy.sh and warned-and-continued on failure.
-Anyone running ``databricks bundle deploy`` directly got a dashboard that
-existed, resolved by name, and rendered Databricks' bare "The resource is not
-available" page inside the iframe, with nothing anywhere explaining why.
+Published WITHOUT embedded credentials, deliberately. Embedding required them —
+they make the dashboard's queries run as whoever published it rather than as
+whoever is looking — and that is a privilege elevation nothing needs now that
+the iframe is gone. Anyone opening the link sees it through their own Unity
+Catalog permissions. This script actively republishes a dashboard it finds
+carrying embedded credentials, so environments set up for the old embed lose
+them on the next deploy.
 
-So this does not assume: it reads the state back after every change and exits
-non-zero if the dashboard would not embed. Idempotent — a second run makes no
-calls beyond the checks.
+Nothing here is load-bearing for the tab: if it all fails, the figures still
+render and only the "Explore in Databricks" link disappears.
 
 Usage:
-  python3 scripts/ensure_dashboard_embed.py --warehouse-id W [--dashboard-id D]
+  python3 scripts/ensure_dashboard_access.py --warehouse-id W [--dashboard-id D]
       [--app-name N] [--dashboard-name "…"] [--viewer user@example.com]
       [--viewer-group "data-team"] [--profile P] [--dry-run]
 """
@@ -71,12 +72,14 @@ def _grantees(
 ) -> list[AccessControlRequest]:
     acl: list[AccessControlRequest] = []
     if app_sp and app_sp != "SET_ME":
-        # The app backend resolves the dashboard as itself, via /ops/dashboard-info.
+        # Metadata only: the app resolves the dashboard's id as itself, via
+        # /ops/dashboard-info, to build the link. It reads none of the data.
         acl.append(AccessControlRequest(
             service_principal_name=app_sp, permission_level=PermissionLevel.CAN_READ))
     for v in viewers:
-        # Humans. The old script granted the app SP only, so the tab worked for
-        # the person who deployed it and 404'd for everyone they showed it to.
+        # Humans, who now open the dashboard directly and see it through their
+        # own permissions. An earlier version granted the app SP only, so the
+        # link worked for whoever deployed and 404'd for everyone they showed.
         acl.append(AccessControlRequest(user_name=v, permission_level=PermissionLevel.CAN_READ))
     for g in groups:
         acl.append(AccessControlRequest(group_name=g, permission_level=PermissionLevel.CAN_READ))
@@ -119,7 +122,11 @@ def main() -> int:
             pass
 
     published = _is_published(w, dashboard_id)
-    needs_publish = published is None or not getattr(published, "embed_credentials", False)
+    # Republishing an embed-credentialed dashboard is the point, not a side
+    # effect: that is how an environment built for the old iframe stops running
+    # these queries as its publisher.
+    carries_embed_credentials = bool(getattr(published, "embed_credentials", False))
+    needs_publish = published is None or carries_embed_credentials
 
     if args.dry_run:
         print(f"  would {'publish' if needs_publish else 'leave published'} "
@@ -129,15 +136,19 @@ def main() -> int:
         return 0
 
     if needs_publish:
-        why = "not published" if published is None else "published without embedded credentials"
-        print(f"  {why} — publishing with embed_credentials on warehouse {args.warehouse_id}")
+        why = (
+            "published with embedded credentials, which nothing needs any more"
+            if carries_embed_credentials
+            else "not published"
+        )
+        print(f"  {why} — publishing on warehouse {args.warehouse_id}")
         w.lakeview.publish(
             dashboard_id=dashboard_id,
-            embed_credentials=True,
+            embed_credentials=False,
             warehouse_id=args.warehouse_id,
         )
     else:
-        print("  already published with embedded credentials")
+        print("  already published, on the viewer's own credentials")
 
     acl = _grantees(w, args.app_sp, viewers, args.viewer_group)
     if acl:
@@ -152,21 +163,21 @@ def main() -> int:
         who = [a.service_principal_name or a.user_name or a.group_name for a in acl]
         print(f"  CAN_READ granted to: {', '.join(who)}")
     else:
-        print("  WARN: no principals to grant — the tab will only work for the dashboard owner")
+        print("  WARN: no principals to grant — the link will only open for the owner")
 
-    # Read it back. Publishing can succeed and still leave the dashboard
-    # unembeddable if the warehouse is wrong, and a grant can silently no-op.
+    # Read it back: publishing can succeed and still land on the wrong
+    # warehouse, and a grant can silently no-op.
     confirmed = _is_published(w, dashboard_id)
     if confirmed is None:
         print("\nERROR: the dashboard still reports as unpublished after publishing it.")
-        print("       The Data Quality tab will show 'The resource is not available'.")
+        print("       The tab's 'Explore in Databricks' link will open an empty draft.")
         return 1
-    if not getattr(confirmed, "embed_credentials", False):
-        print("\nERROR: published, but without embedded credentials — every widget in the")
-        print("       iframe will render 'Unable to render visualization.'")
+    if getattr(confirmed, "embed_credentials", False):
+        print("\nERROR: still published with embedded credentials, so its queries run as")
+        print("       the publisher rather than as whoever opens it.")
         return 1
 
-    print(f"  verified: published, embed_credentials=True, warehouse="
+    print(f"  verified: published on the viewer's credentials, warehouse="
           f"{getattr(confirmed, 'warehouse_id', args.warehouse_id)}")
     return 0
 

@@ -137,7 +137,7 @@ export const DEMO_STEPS: DemoStep[] = [
     seconds: 40,
     script:
       'Last thing, and it is the one a data team cares most about. This tab reconciles what the app is showing against what is in the tables, and it will tell you when a table has gone empty rather than quietly rendering zeros. An empty table returning no rows instead of an error is how a confident dashboard ends up lying, so we made that visible on purpose.',
-    pointAt: ['The reconciliation between the app and the tables', 'The embedded quality dashboard'],
+    pointAt: ['The reconciliation between the app and the tables', 'The quality-gate pass rate and reject reasons'],
     products: ['Unity Catalog', 'Databricks SQL'],
   },
 ];

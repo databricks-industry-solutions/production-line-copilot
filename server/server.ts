@@ -189,6 +189,16 @@ createApp({
         });
       });
 
+      app.get('/api/ops/quality-metrics', async (_req, res) => {
+        await proxyToAgent(res, '/ops/quality-metrics', {
+          // Six warehouse aggregates behind a 60s server-side cache. Sized like
+          // reconciliation because the first call after an idle period is the
+          // one that has to wait for the warehouse to wake.
+          timeoutMs: 60000,
+          errorMessage: 'quality metrics unavailable',
+        });
+      });
+
       app.get('/api/ops/models', async (_req, res) => {
         await proxyToAgent(res, '/ops/models', {
           // First call may list the workspace's serving endpoints; the agent

@@ -1,12 +1,17 @@
-"""The Data Quality tab depends on three facts nobody was checking.
+"""The dashboard has to be openable, and open as the person opening it.
 
-A dashboard embeds only if it exists, is published with embedded credentials,
-and is readable by whoever opens the tab. All three were assumed: the bundle
-declares `embed_credentials`, and the grants lived in a bash script that ran
-under scripts/deploy.sh and warned-and-continued when it failed. A colleague
-running `databricks bundle deploy` in their own workspace got a dashboard that
-existed, resolved by name, and rendered Databricks' bare "The resource is not
-available" page inside the iframe.
+The app used to embed this dashboard, which only renders inside an iframe when
+it is published with embedded credentials — meaning its queries run as the
+publisher rather than as the viewer. The tab draws those figures itself now, so
+that elevation buys nothing and the script publishes without it. The case worth
+pinning is the upgrade: an environment deployed from an older version of this
+repo is still carrying embedded credentials, and a deploy has to take them away
+rather than leave them because the dashboard is "already published".
+
+The grants are still assumed by nobody: they lived in a bash script that ran
+under scripts/deploy.sh and warned-and-continued when it failed, so a colleague
+running `databricks bundle deploy` got a dashboard that existed, resolved by
+name, and 404'd for everyone but them.
 """
 from __future__ import annotations
 
@@ -19,10 +24,10 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 _spec = importlib.util.spec_from_file_location(
-    "ensure_dashboard_embed", ROOT / "scripts" / "ensure_dashboard_embed.py"
+    "ensure_dashboard_access", ROOT / "scripts" / "ensure_dashboard_access.py"
 )
 mod = importlib.util.module_from_spec(_spec)
-sys.modules["ensure_dashboard_embed"] = mod
+sys.modules["ensure_dashboard_access"] = mod
 _spec.loader.exec_module(mod)
 
 
@@ -33,7 +38,7 @@ def _dashboard(name: str, did: str) -> MagicMock:
     return d
 
 
-def _published(embed: bool = True) -> MagicMock:
+def _published(embed: bool = False) -> MagicMock:
     p = MagicMock()
     p.embed_credentials = embed
     p.warehouse_id = "wh-1"
@@ -72,7 +77,7 @@ class TestResolution:
 
 class TestPublishing:
     def _run(self, w, monkeypatch, extra: list[str] | None = None) -> int:
-        argv = ["ensure_dashboard_embed.py", "--warehouse-id", "wh-1", "--app-name", "App"]
+        argv = ["ensure_dashboard_access.py", "--warehouse-id", "wh-1", "--app-name", "App"]
         monkeypatch.setattr(sys, "argv", argv + (extra or []))
         monkeypatch.setattr(mod, "WorkspaceClient", lambda **kw: w)
         return mod.main()
@@ -81,26 +86,32 @@ class TestPublishing:
         w.lakeview.get_published.side_effect = [Exception("not found"), _published()]
         assert self._run(w, monkeypatch) == 0
         w.lakeview.publish.assert_called_once()
-        assert w.lakeview.publish.call_args.kwargs["embed_credentials"] is True
+
+    def test_it_never_publishes_with_embedded_credentials(self, w, monkeypatch):
+        """Those run the dashboard's queries as the publisher, not the viewer."""
+        w.lakeview.get_published.side_effect = [Exception("not found"), _published()]
+        assert self._run(w, monkeypatch) == 0
+        assert w.lakeview.publish.call_args.kwargs["embed_credentials"] is False
 
     def test_publishing_is_skipped_when_already_correct(self, w, monkeypatch):
         w.lakeview.get_published.return_value = _published()
         assert self._run(w, monkeypatch) == 0
         w.lakeview.publish.assert_not_called()
 
-    def test_published_without_embedded_credentials_is_republished(self, w, monkeypatch):
-        """Otherwise every widget renders 'Unable to render visualization.'"""
-        w.lakeview.get_published.side_effect = [_published(embed=False), _published(embed=True)]
+    def test_an_old_embed_credentialed_dashboard_is_republished_without_them(self, w, monkeypatch):
+        """The upgrade path. Leaving it published would leave the elevation in place."""
+        w.lakeview.get_published.side_effect = [_published(embed=True), _published(embed=False)]
         assert self._run(w, monkeypatch) == 0
         w.lakeview.publish.assert_called_once()
+        assert w.lakeview.publish.call_args.kwargs["embed_credentials"] is False
 
     def test_it_fails_when_the_dashboard_is_still_unpublished_afterwards(self, w, monkeypatch):
-        """Publishing can report success and leave nothing embeddable."""
+        """Publishing can report success and leave nothing to open."""
         w.lakeview.get_published.side_effect = [Exception("no"), Exception("still no")]
         assert self._run(w, monkeypatch) == 1
 
-    def test_it_fails_when_credentials_did_not_stick(self, w, monkeypatch):
-        w.lakeview.get_published.side_effect = [Exception("no"), _published(embed=False)]
+    def test_it_fails_when_the_credentials_were_not_removed(self, w, monkeypatch):
+        w.lakeview.get_published.side_effect = [_published(embed=True), _published(embed=True)]
         assert self._run(w, monkeypatch) == 1
 
 
@@ -109,16 +120,16 @@ class TestGrants:
         w.lakeview.get_published.return_value = _published()
         monkeypatch.setattr(
             sys, "argv",
-            ["ensure_dashboard_embed.py", "--warehouse-id", "wh-1", "--app-name", "App"] + extra,
+            ["ensure_dashboard_access.py", "--warehouse-id", "wh-1", "--app-name", "App"] + extra,
         )
         monkeypatch.setattr(mod, "WorkspaceClient", lambda **kw: w)
         assert mod.main() == 0
         return w.permissions.update.call_args.kwargs["access_control_list"]
 
     def test_humans_are_granted_not_just_the_service_principal(self, w, monkeypatch):
-        """The old script granted the app SP only.
+        """An earlier version granted the app SP only.
 
-        So the tab worked for the person who deployed it and 404'd for everyone
+        So the link worked for the person who deployed it and 404'd for everyone
         they showed it to — which is how this reached a colleague's workspace.
         """
         acl = self._acl(w, monkeypatch, ["--app-sp", "sp-123", "--viewer", "a@b.com"])

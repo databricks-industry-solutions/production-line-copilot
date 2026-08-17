@@ -6,6 +6,47 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-08-17
+
+### Changed
+
+- **The Data Integrity tab draws the quality gate itself instead of embedding a
+  dashboard.** The AI/BI dashboard was reaching the browser through an iframe,
+  which was the most fragile thing in the app and the only part with a
+  permissions story we would not have chosen: it renders only if the dashboard
+  is published with `embed_credentials`, meaning its queries run as the
+  *publisher* rather than as whoever opens the tab, and only if the app service
+  principal holds CAN_READ on both the dashboard and its parent folder, and only
+  if the browser will load a cross-origin frame with cookies. Any one of those
+  produced a bare "The resource is not available" page inside the tab.
+
+  The same six aggregates now come from `/ops/quality-metrics` — pass rate, rows
+  ingested and rejected, hourly throughput, ingested-vs-rejected per table,
+  current status mix, reject reasons and QC failures — drawn with AppKit's
+  charts, behind the same 60-second cache reconciliation uses. The SQL is the
+  dashboard's own, copied verbatim from `dashboards/data_quality.lvdash.json`,
+  and a test compares the two so the tab and the dashboard cannot answer the
+  same question differently. Datasets degrade one at a time: an unreadable table
+  costs its own figure and names it, because a zero on this tab would read as
+  "the gate caught nothing" rather than "we could not look".
+
+  The dashboard is still deployed and still one click away — it is the better
+  tool for cross-filtering, drilling and exporting, and the tab links to it.
+
+- **The dashboard is published on the viewer's own credentials.**
+  `embed_credentials` existed solely to make the iframe render, so with the
+  iframe gone it is off in `databricks.yml`, and the renamed
+  `scripts/ensure_dashboard_access.py` (was `ensure_dashboard_embed.py`)
+  republishes any dashboard still carrying them from an earlier deploy of this
+  repo. Anyone opening the link now sees it through their own Unity Catalog
+  permissions.
+
+- **A dashboard problem no longer fails a deploy.** That step could exit
+  non-zero, which was right when the tab was unusable without it. The tab now
+  queries the warehouse directly and renders every figure regardless, so the
+  worst a failure costs is the "Explore in Databricks" link, and the step warns
+  and continues. `SKIP_DASHBOARD_EMBED` is gone with the reason for it.
+
 ## [0.4.1] - 2026-08-12
 
 ### Added
@@ -3047,6 +3088,7 @@ GenAI copilot for production-line operations, real-time streaming
 simulator (Zerobus → Lakebase), one-command `deploy.sh`, Data Quality
 dashboard, and a baseline MLflow eval harness.
 
+[0.4.2]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.4.2-public
 [0.4.1]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.4.1-public
 [0.4.0]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.4.0-public
 [0.3.9]: https://github.com/databricks-industry-solutions/production-line-copilot/releases/tag/v0.3.9-public

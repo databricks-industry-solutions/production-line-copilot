@@ -289,13 +289,13 @@ def _app_sp_permissions_block(app_sp: str) -> list[str]:
 def _data_quality_dashboard_permissions_block(app_sp: str) -> list[str]:
     """Emit a per-target ``dashboards:`` override granting the App SP CAN_READ.
 
-    The Data Quality dashboard is defined in ``databricks.yml`` with
-    ``embed_credentials: true`` (published with the deploy identity's creds so
-    the app's embedded iframe renders widgets). The App backend also RESOLVES
-    the dashboard by id/name AS the App SP (``/ops/dashboard-info``), which
-    needs CAN_READ. Declaring the grant here makes ``databricks bundle deploy``
-    self-sufficient for the embed — no post-deploy grant_app_jobs_view.sh
-    required.
+    The app resolves the Data Quality dashboard by id/name AS the App SP
+    (``/ops/dashboard-info``) to build the "Explore in Databricks" link on the
+    Data Integrity tab, and that needs CAN_READ. Declaring the grant here makes
+    ``databricks bundle deploy`` self-sufficient for it — no post-deploy
+    grant_app_jobs_view.sh required. Metadata only: the app reads none of the
+    dashboard's data, having queried the warehouse for those figures itself
+    since the iframe was removed.
 
     Empty / SET_ME ``app_sp`` (first-ever deploy, before the App SP exists) →
     returns [], so the initial rollout still deploys; deploy.sh captures the

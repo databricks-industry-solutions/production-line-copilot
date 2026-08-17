@@ -169,7 +169,7 @@ High-level flow inside `deploy.sh`:
 7. **Refresh** `OPS_*` IDs into app env (`refresh_app_yaml_ids.py`)
 8. **Re-deploy bundle** only if SP or IDs changed on the first pass
 9. **`databricks apps deploy`**
-10. **Grant + publish** Data Quality dashboard: folder-chain grants for the app SP (`grant_app_jobs_view.sh`), then `ensure_dashboard_embed.py`, which publishes it with embedded credentials, grants `CAN_READ` to the app SP and to human viewers, and verifies the result. This step **fails the deploy** if the dashboard would not embed — set `DASHBOARD_VIEWER_GROUPS="team-a,team-b"` to grant a group, or `SKIP_DASHBOARD_EMBED=1` to deploy without the tab.
+10. **Grant + publish** Data Quality dashboard: folder-chain grants for the app SP (`grant_app_jobs_view.sh`), then `ensure_dashboard_access.py`, which publishes it on the *viewer's* credentials, grants `CAN_READ` to the app SP and to human viewers, and verifies the result. Set `DASHBOARD_VIEWER_GROUPS="team-a,team-b"` to grant a group. This step only warns on failure: the Data Integrity tab queries the warehouse directly and renders every figure without it — all that is lost is the tab's "Explore in Databricks" link.
 11. **Fresh-env auto-provision**: if the schema is empty, run the setup job **and** create the curated Genie space (app SP granted `CAN_RUN`, id written back), then rewire + redeploy the app
 
 Optional: `RUN_PREFLIGHT=1 ./scripts/deploy.sh dev` runs preflight first; `RUN_EVAL_GATE=1` runs the MLflow eval gate.

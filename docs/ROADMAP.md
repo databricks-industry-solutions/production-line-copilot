@@ -325,14 +325,18 @@ only until someone cleans the working tree; re-capture rather than assume.
   the capper has 40 seconds left" a thing the app can say. Impact: Med-High.
   Effort: S-M.
 
-- **Time-series charts.** We render none. Not one: no OEE across the shift, no
-  sensor history on the machine detail card, no trend behind an incident. The
-  only charts anywhere are inside the embedded Lakeview dashboard on the Data
-  Quality tab. For a real-time monitoring product with sub-second telemetry
-  that is the conspicuous gap, and the data is already in `telemetry_bronze`
-  and `line_kpi_bronze`. (The EOR app has the same gap and it is just as
-  noticeable there, which is how it got onto this list.) Impact: High.
-  Effort: M. AppKit charts are already a dependency.
+- **Time-series charts.** Partly closed. The Data Integrity tab now draws its
+  own charts from `/ops/quality-metrics` — hourly throughput, ingested vs
+  rejected per table, status mix — which replaced the embedded Lakeview
+  dashboard that used to be the only charts in the product. The operational
+  ones are still missing: no OEE across the shift, no sensor history on the
+  machine detail card, no trend behind an incident. For a real-time monitoring
+  product with sub-second telemetry that remains the conspicuous gap, and the
+  data is already in `telemetry_bronze` and `line_kpi_bronze`. (The EOR app has
+  the same gap and it is just as noticeable there, which is how it got onto
+  this list.) Impact: High. Effort: M — AppKit's `LineChart` / `BarChart` /
+  `DonutChart` are now in use, so the pattern to copy exists in
+  `client/src/components/QualityGatePanel.tsx`.
 
 - **Scenario / what-if surface over the existing optimizers.** Their Scenario
   tab loads one AI recommendation, exposes three sliders, and returns a

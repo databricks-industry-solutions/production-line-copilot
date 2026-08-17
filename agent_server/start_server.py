@@ -49,7 +49,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from agent_server.serving import reconciliation
+from agent_server.serving import quality_metrics, reconciliation
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -2191,6 +2191,65 @@ async def ops_reconciliation(
             status_code=504,
         )
     except Exception as e:  # noqa: BLE001
+        return JSONResponse({"error": str(e)[:400]}, status_code=500)
+
+
+# Same TTL as reconciliation, and for the same reason: the tab fires both on
+# open, and six aggregates over 24 hours do not change meaningfully inside a
+# minute. Repeated Reloads and tab switches then cost nothing on the warehouse.
+_QUALITY_METRICS_CACHE: dict[str, Any] = {}
+_QUALITY_METRICS_TTL_S = 60.0
+_QUALITY_METRICS_LOCK = threading.Lock()
+
+
+def _run_quality_metrics(catalog: str, schema: str) -> dict:
+    """Blocking quality-gate read with a TTL cache. Runs on a worker thread."""
+    key = f"{catalog}.{schema}"
+    now = time.time()
+    with _QUALITY_METRICS_LOCK:
+        hit = _QUALITY_METRICS_CACHE.get(key)
+        if hit and (now - hit["at"]) < _QUALITY_METRICS_TTL_S:
+            return {**hit["payload"], "cached": True}
+
+    payload = quality_metrics.collect(_reconciliation_uc_query, catalog, schema)
+
+    # Cached even when some datasets failed: a warehouse that just refused one
+    # table will refuse it again a second later, and hammering it on every
+    # re-render is how a degraded tab becomes a degraded warehouse.
+    with _QUALITY_METRICS_LOCK:
+        _QUALITY_METRICS_CACHE[key] = {"at": now, "payload": payload}
+    return {**payload, "cached": False}
+
+
+@app.get("/ops/quality-metrics")
+async def ops_quality_metrics():
+    """The quality-gate figures the Data Integrity tab draws.
+
+    Six fixed read-only aggregates, run as the app service principal. This
+    replaced an embedded AI/BI dashboard whose queries ran with the publisher's
+    credentials; the dashboard is still deployed and linked from the tab for
+    anyone who wants to explore rather than glance.
+    """
+    catalog = os.environ.get("UC_CATALOG", "")
+    schema = os.environ.get("UC_SCHEMA", "")
+    if not catalog or not schema:
+        return JSONResponse(
+            {"error": "UC_CATALOG / UC_SCHEMA not configured"}, status_code=503
+        )
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_run_quality_metrics, catalog, schema),
+            # Matches reconciliation: long enough for a cold warehouse to wake,
+            # short enough that the tab says so instead of hanging.
+            timeout=90,
+        )
+    except asyncio.TimeoutError:
+        return JSONResponse(
+            {"error": "quality metrics timed out — the SQL warehouse may be starting"},
+            status_code=504,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.exception("ops/quality-metrics failed")
         return JSONResponse({"error": str(e)[:400]}, status_code=500)
 
 

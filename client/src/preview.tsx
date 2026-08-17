@@ -15,6 +15,11 @@
  *                 what the view is for. The fixture is a stopped filler and the
  *                 damage either side of it, which is the same moment the demo
  *                 script walks an audience through.
+ *   quality-gate  `QualityGatePanel`, the charts that replaced the embedded
+ *                 AI/BI dashboard. Fixture rather than capture for the same
+ *                 reason as the schematic: a healthy environment rejects
+ *                 nothing, so a captured payload renders three empty tables and
+ *                 shows none of the work. This one has the gate catching things.
  *
  * Not part of the app bundle: reachable only through `client/preview.html`,
  * which `client/vite.config.ts` never builds.
@@ -24,8 +29,10 @@ import { createRoot } from 'react-dom/client';
 import './index.css';
 import SystemMap from './components/SystemMap';
 import ProcessFlowSchematic from './components/ProcessFlowSchematic';
+import QualityGatePanel from './components/QualityGatePanel';
 import { MACHINE_FLOW_ORDER } from './lib/machineMeta';
 import type { LiveStation } from './lib/processFlowState';
+import type { QualityMetricsPayload } from './lib/useQualityMetrics';
 import type { InventoryItem } from './lib/useSSELiveData';
 
 /**
@@ -140,6 +147,53 @@ const INVENTORY: InventoryItem[] = [
 
 const KPI = { total_throughput: 11.4, cumulative_cases: 8412, oee_to_now: 61.8 };
 
+/**
+ * A day on which the gate earned its keep.
+ *
+ * Row counts and the ingest/reject split are dev's real proportions; the
+ * rejects and QC failures are the ones dev has not produced. `event_log`
+ * carries no rows and therefore no timestamp, which is the null the table has
+ * to render as an em dash rather than as a zero-minute lag.
+ */
+const QUALITY: QualityMetricsPayload = {
+  window_hours: 24,
+  summary: {
+    bronze_rows_24h: 3096540,
+    dropped_rows_24h: 1834,
+    pass_rate: 0.999408,
+    latest_gold_ts: '2026-08-17T14:48:03.559774+00:00',
+  },
+  tables: [
+    { table_name: 'event_log', label: 'Events', bronze_rows: 0, dropped_rows: 0, pass_rate: 1, latest_ts: null, lag_minutes: null },
+    { table_name: 'inventory_status', label: 'Inventory', bronze_rows: 1378016, dropped_rows: 402, pass_rate: 0.999708, latest_ts: '2026-08-17T14:48:06.257Z', lag_minutes: 0.05 },
+    { table_name: 'line_kpi', label: 'Line KPI', bronze_rows: 86125, dropped_rows: 31, pass_rate: 0.99964, latest_ts: '2026-08-17T14:48:05.257Z', lag_minutes: 0.07 },
+    { table_name: 'machine_state', label: 'Machine state', bronze_rows: 1632399, dropped_rows: 1401, pass_rate: 0.999142, latest_ts: '2026-08-17T14:48:03.559Z', lag_minutes: 0.09 },
+  ],
+  throughput: Array.from({ length: 24 }, (_, i) => ({
+    hour: `2026-08-16T${String((14 + i) % 24).padStart(2, '0')}:00:00.000Z`,
+    // A dip through the small hours, the way a real shift pattern shows up.
+    row_count: i >= 9 && i <= 14 ? 41000 + i * 300 : 68000 + (i % 5) * 400,
+  })),
+  status_distribution: [
+    { status: 'running', machines: 15 },
+    { status: 'starved', machines: 2 },
+    { status: 'blocked', machines: 1 },
+    { status: 'stopped', machines: 1 },
+  ],
+  rejects_by_reason: [
+    { bronze_table: 'machine_state', label: 'Machine state', rejected_reason: 'speed_pct outside 0-120', rejected_rows: 1288 },
+    { bronze_table: 'inventory_status', label: 'Inventory', rejected_reason: 'on_hand_qty negative', rejected_rows: 402 },
+    { bronze_table: 'machine_state', label: 'Machine state', rejected_reason: 'unknown machine_id', rejected_rows: 113 },
+    { bronze_table: 'line_kpi', label: 'Line KPI', rejected_reason: 'ts older than the window', rejected_rows: 31 },
+  ],
+  qc_failures: [
+    { ts: '2026-08-17T14:41:12.000Z', machine_id: 'FILLER', parameter: 'fill_volume_ml', value: 486.2, spec_min: 495, spec_max: 505, result: 'FAIL' },
+    { ts: '2026-08-17T14:22:50.000Z', machine_id: 'CAPPER', parameter: 'torque_nm', value: 2.31, spec_min: 2.4, spec_max: 3.2, result: 'FAIL' },
+    { ts: '2026-08-17T13:58:04.000Z', machine_id: 'PASTEURIZER', parameter: 'temp_c', value: 74.8, spec_min: 71, spec_max: 74, result: 'FAIL' },
+  ],
+  warnings: [],
+};
+
 const view = new URLSearchParams(window.location.search).get('view') ?? 'system-map';
 
 createRoot(document.getElementById('root')!).render(
@@ -156,6 +210,8 @@ createRoot(document.getElementById('root')!).render(
         selectedMachine={null}
         onMachineClick={() => {}}
       />
+    ) : view === 'quality-gate' ? (
+      <QualityGatePanel data={QUALITY} loading={false} error={null} />
     ) : (
       <SystemMap />
     )}

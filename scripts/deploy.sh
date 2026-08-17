@@ -1079,9 +1079,8 @@ else
 fi
 
 # The step above grants the workspace folder chain the app SP needs to traverse.
-# This one owns what the tab actually depends on — published, with embedded
-# credentials, readable by the app AND by the humans opening it — and reads the
-# state back instead of assuming.
+# This one publishes the dashboard and grants CAN_READ to the app and to the
+# humans who will open it, reading the state back instead of assuming.
 #
 # It deliberately sits OUTSIDE the block above. That block needs an id from
 # app.yaml, and the case that produced a 404 in a colleague's workspace was
@@ -1089,10 +1088,10 @@ fi
 # skipped over a warning. This resolves the dashboard by display name on its
 # own, so a missing id is no longer a reason to do nothing.
 #
-# It is also the only step here that fails the deploy. An unpublished dashboard
-# renders as a bare Databricks "The resource is not available" page with nothing
-# anywhere to explain it, and a warning this far into a long deploy log is a
-# warning nobody reads.
+# It used to fail the deploy, back when the tab embedded this dashboard and an
+# unpublished one turned the tab into a bare "The resource is not available"
+# page. The tab now draws those figures itself, so the worst this can cost is
+# the "Explore in Databricks" link — not worth failing a deploy over.
 if [[ -n "$WAREHOUSE_ID" ]]; then
   echo
   echo "=== Data Quality dashboard: publish + grants ==="
@@ -1107,7 +1106,7 @@ if [[ -n "$WAREHOUSE_ID" ]]; then
     done
   fi
   if ! DATABRICKS_CONFIG_PROFILE="$PROFILE" \
-      "${PROJECT_PY[@]}" scripts/ensure_dashboard_embed.py \
+      "${PROJECT_PY[@]}" scripts/ensure_dashboard_access.py \
         --profile "$PROFILE" \
         --warehouse-id "$WAREHOUSE_ID" \
         --dashboard-id "$DASHBOARD_ID" \
@@ -1115,15 +1114,14 @@ if [[ -n "$WAREHOUSE_ID" ]]; then
         --app-sp "${APP_SP_ID:-}" \
         "${DASHBOARD_VIEWER_ARGS[@]}"; then
     echo >&2
-    echo "ERROR: the Data Quality dashboard is not embeddable." >&2
-    echo "       The tab will show Databricks' 'The resource is not available' page." >&2
-    echo "       Fix the cause above and re-run, or set SKIP_DASHBOARD_EMBED=1 to" >&2
-    echo "       deploy without it." >&2
-    [[ "${SKIP_DASHBOARD_EMBED:-0}" == "1" ]] || exit 1
+    echo "WARN: the Data Quality dashboard is not published or not readable." >&2
+    echo "      The Data Integrity tab still renders every figure — it queries the" >&2
+    echo "      warehouse directly — but its 'Explore in Databricks' link will be" >&2
+    echo "      missing. Fix the cause above and re-run to restore it." >&2
   fi
 else
   echo "WARN: no SQL warehouse resolved — skipping the dashboard publish step." >&2
-  echo "      The Data Quality tab will not embed until you set sql_warehouse_id." >&2
+  echo "      The Data Integrity tab is unaffected; only its dashboard link is." >&2
 fi
 
 # ── 6b. Auto-detect a fresh environment ─────────────────────────────────

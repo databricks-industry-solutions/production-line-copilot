@@ -3,7 +3,7 @@
  * Used as the root screen mounted from `main.tsx`, with data sourced from SSE + incident APIs.
  * Prioritizes operator-trust safeguards (status overrides, sticky reconciliation, pending banners) over UI minimalism.
  */
-import { useState, useMemo, useCallback, useRef, useEffect } from 'react';
+import { useState, useMemo, useCallback, useRef, useEffect, lazy, Suspense } from 'react';
 import { cn, toNumber, isoToEpoch } from './lib/utils';
 import { MACHINE_LAYOUT } from './lib/constants';
 import { deriveMachineReadings, flowNeighbors, getMachineMeta } from './lib/machineMeta';
@@ -24,7 +24,10 @@ import DemoGuideTab from './components/DemoGuideTab';
 import MultiAITab from './components/MultiAITab';
 import MachineDetailCard from './components/MachineDetailCard';
 import CostObservabilityTab from './components/CostObservabilityTab';
-import DataQualityTab from './components/DataQualityTab';
+// Split out: this is the only tab that draws charts, and the charting engine
+// behind them more than doubles the main bundle. An operator watching the line
+// should not download it to do that.
+const DataQualityTab = lazy(() => import('./components/DataQualityTab'));
 import AdminJobControls from './components/AdminJobControls';
 import { DEFAULT_TAB, searchWithTab, tabFromSearch, type TabId } from './lib/tabRouting';
 
@@ -852,7 +855,13 @@ function App() {
 
           {path !== '/admin' && activeTab === 'quality' && (
             <ErrorBoundary>
-              <DataQualityTab />
+              <Suspense
+                fallback={
+                  <div className="p-6 text-sm text-muted-foreground">Loading Data Integrity…</div>
+                }
+              >
+                <DataQualityTab />
+              </Suspense>
             </ErrorBoundary>
           )}
 
