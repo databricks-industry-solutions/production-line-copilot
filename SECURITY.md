@@ -28,33 +28,28 @@ your own deployment. It ships with placeholder configuration and synthetic data
 
 ## Known advisories in dependencies
 
-Checked at the v0.4.0 release against [OSV](https://osv.dev), across both
-locked trees. Three npm packages had moved into an advisory since v0.3.9 and
-each had a fix available, so each is pinned forward through `overrides` in
-`package.json`: `js-yaml` 4.3.1 (quadratic CPU on `!!omap`), `dompurify` 3.4.13
-(a detached subtree left executable by `IN_PLACE` hook removal), and `nanoid`
-3.3.18 (an infinite loop on a zero size, fixed in 3.3.17). All three reach us transitively; with
-those overrides the npm tree is clean.
+Checked against GitHub Dependabot and [OSV](https://osv.dev), across both locked
+trees. Transitive Python floors live in `[tool.uv] constraint-dependencies`;
+transitive npm floors live in `overrides` in `package.json`.
 
-On the Python side `cryptography` moved 48.0.1 → 49.0.0, which closes an
-exponential path-building denial of service and a wildcard-DNS escape from
-`permittedSubtrees`. That upgrade only became reachable because `mlflow` relaxed
-its pin in 3.15.1, which this release also takes.
+The following remain, all pulled in transitively and all held below their fix by
+an upstream pin, so they cannot be resolved from this repository:
 
-Two advisories remain, both pulled in transitively and both held below their fix
-by an upstream pin, so neither can be resolved from this repository:
-
-| Package | Version | Advisory | Fixed in | Held back by |
+| Package | Locked | Advisory | Fixed in | Held back by |
 |---|---|---|---|---|
 | `cryptography` | 49.0.0 | GHSA-g6cj-pr64-35w5 (high) | 50.0.0 | `mlflow` requires `cryptography<50` |
-| `protobuf` | 6.31.1 | GHSA-7gcm-g887-7qv7 (high) | 6.33.5 | `ortools` requires `protobuf<6.32` |
+| `protobuf` | 6.31.1 (Python &lt; 3.12) | GHSA-7gcm-g887-7qv7 (high) | 6.33.5 | `ortools` requires `protobuf<6.32` |
+| `oauthlib` | 3.3.1 | GHSA-xpv3-w29h-x7cv / GHSA-hj66-6f7g-4r5v (medium) | 4.0.0 | `databricks-sql-connector` requires `oauthlib<4` |
+| `thrift` | 0.20.0 | GHSA for compressed-data / infinite-loop / host mismatch (high/medium) | 0.24.0 | `databricks-sql-connector` requires `thrift<0.21` |
 
-The accelerator does not exercise either affected code path — it does no PKCS#7
-decryption and parses no untrusted protobuf JSON — so the practical exposure
-here is low. That is a statement about this
-application, not about the advisories: if you build on this and add any of
-those, re-run the check. Both resolve on their own once mlflow and ortools relax
-their pins, so re-running `uv lock --upgrade` periodically is worthwhile.
+The accelerator does not exercise the affected code paths — it does no PKCS#7
+decryption, parses no untrusted protobuf JSON, does not host an OAuth
+authorization server, and does not accept untrusted Thrift payloads — so the
+practical exposure here is low. That is a statement about this application, not
+about the advisories: if you build on this and add any of those, re-run the
+check. They resolve on their own once mlflow, ortools, and
+databricks-sql-connector relax their pins, so re-running `uv lock --upgrade`
+periodically is worthwhile.
 
 To reproduce the check:
 

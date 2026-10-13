@@ -9,7 +9,7 @@ dependencies = [
     "databricks-agents>=1.9",
     "databricks-sdk>=0.81.0",
     "langgraph>=1.0",
-    "mlflow>=3.9",
+    "mlflow>=3.17",
     "databricks-sql-connector>=4.2",
     "databricks-zerobus-ingest-sdk>=1.0.0",
     "databricks-vectorsearch<0.74",
@@ -52,10 +52,21 @@ start-server = "agent_server.start_server:main"
 # (GHSA-jwv3-5hgf-82ww) and a wildcard-DNS escape from permittedSubtrees
 # (GHSA-m2h6-j472-rp4c). It reaches us through databricks-sdk and mlflow, and it
 # pulls mlflow to >=3.15.1 with it, because that is the release that relaxed
-# mlflow's `cryptography<49` pin. Drop this line once mlflow's own floor is
-# past 49. See SECURITY.md for what remains and why.
+# mlflow's `cryptography<49` pin.
+#
+# oauthlib 4, thrift 0.24, cryptography 50, and protobuf 6.33.5 remain blocked
+# by upstream pins (databricks-sql-connector, mlflow, ortools). See SECURITY.md.
 [tool.uv]
-constraint-dependencies = ["cryptography>=49"]
+constraint-dependencies = [
+    "cryptography>=49",
+    "langgraph-sdk>=0.4.4",
+    "gitpython>=3.1.62,<3.2",
+    "pyjwt>=2.15.0",
+    "anyio>=4.14.2",
+    "urllib3>=2.8.0",
+    "litellm>=1.92.2,<1.93",
+    "sqlparse>=0.6.0",
+]
 
 [tool.ruff]
 line-length = 120

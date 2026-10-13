@@ -85,24 +85,32 @@
     "eslint-plugin-react-hooks": "^7.0.1",
     "eslint-plugin-react-refresh": "^0.4.24",
     "prettier": "^3.6.2",
-    "sharp": "^0.35.0",
+    "sharp": "^0.35.4",
     "tailwindcss": "^4.0.14",
     "typescript": "~5.9.3",
     "typescript-eslint": "^8.48.0",
     "vite": "^7.3.5",
-    "vitest": "^4.0.14"
+    "vitest": "^4.1.11"
   },
   "overrides": {
     "vite": "^7.3.5",
     "fast-uri": "^3.1.4",
-    "brace-expansion": "^5.0.9",
+    "brace-expansion": "^5.0.12",
     "uuid": "^11.1.1",
     "drizzle-orm": "^0.45.2",
-    "js-yaml": "^4.3.1",
-    "dompurify": "^3.4.13",
+    "js-yaml": "^4.3.2",
+    "dompurify": "^3.4.16",
     "nanoid": "^3.3.17",
     "echarts": "$echarts",
     "@opentelemetry/propagator-jaeger": "^2.9.0",
+    "@opentelemetry/instrumentation-cassandra-driver": "^0.66.0",
+    "@opentelemetry/instrumentation-oracledb": "^0.46.0",
+    "@grpc/grpc-js": "^1.14.5",
+    "@humanfs/node": "^0.16.8",
+    "@vitest/mocker": "^4.1.11",
+    "baseline-browser-mapping": "^2.11.0",
+    "browserslist": "^4.28.7",
+    "qs": "^6.16.0",
     "minimatch": "^10.0.0"
   }
 }

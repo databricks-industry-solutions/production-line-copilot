@@ -6,6 +6,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- Raised lockfile floors for Dependabot alerts that this repo can actually
+  close: `langgraph-sdk` 0.4.6, `gitpython` 3.1.62, `pyjwt` 2.15.1, `anyio`
+  4.15.1, `urllib3` 2.8.0, `litellm` 1.92.2, `sqlparse` 0.6.0, and `mlflow`
+  3.17.0 (AI Gateway `api_base` SSRF). npm overrides now pin `js-yaml` 4.3.2,
+  `dompurify` 3.4.16, `brace-expansion` 5.0.12, `qs` 6.16.0, `sharp` 0.35.5,
+  `vitest` / `@vitest/mocker` 4.1.11, `@grpc/grpc-js` 1.14.6, `@humanfs/node`
+  0.16.8, `browserslist` 4.29.3, `baseline-browser-mapping` 2.11.x, and the
+  OpenTelemetry cassandra/oracledb instrumentations. `cryptography` 50,
+  `protobuf` 6.33.5 on Python 3.11, `oauthlib` 4, and `thrift` 0.24 remain
+  blocked by upstream pins; see `SECURITY.md`.
+
 ## [0.4.2] - 2026-08-17
 
 ### Changed
